@@ -36,6 +36,7 @@ class TransformerConfig(TrainConfig, EmbedConfig, PosEmbedConfig):
     d_head: int 
     n_heads: int
     d_type : str
+    tokenizer_name : str
 
     @field_validator('d_type')
     def check_d_type(cls, value):
@@ -54,10 +55,10 @@ class Embed(nn.Module):
         nn.init.normal_(self.W_E.weight, std=self.cfg.init_range)
 
     def forward(self, tokens : torch.Tensor):
-        print("Tokens:", tokens.shape)
-        print("Max token index:", tokens.max().item())
-        print("max token in weights:", self.W_E.weight.max().item())
-        if self.cfg.debug: print("Tokens:", tokens.shape)
+        if self.cfg.debug:
+            print("Tokens:", tokens.shape)
+            print("Max token index:", tokens.max().item())
+            print("max token in weights:", self.W_E.weight.max().item())
         embed = self.W_E(tokens)  # [batch, position, d_model]
         if self.cfg.debug: print("Embeddings:", embed.shape)
         return embed
@@ -95,24 +96,21 @@ class PosEmbed(nn.Module):
         if self.cfg.debug: 
             print("pos_embed:", pos_embed.shape)
         return pos_embed
+    
 
 class LayerNorm(nn.Module):
     def __init__(self, cfg : TransformerConfig):
         super().__init__()
         self.cfg = cfg
-        self.w = nn.Parameter(torch.ones(cfg.d_model, dtype=cfg.get_dtype()))
-        self.b = nn.Parameter(torch.zeros(cfg.d_model, dtype=cfg.get_dtype()))
-
+        self.w = nn.Parameter(torch.ones(cfg.d_model))
+        self.b = nn.Parameter(torch.zeros(cfg.d_model))
+    
     def forward(self, residual):
         # residual: [batch, position, d_model]
-        if self.cfg.debug: print("Residual:", residual.shape, "dtype:", residual.dtype)
-        mean = torch.mean(residual, dim=0, keepdim=True) # mean over dataset
-        print("Mean:", mean.shape)
-        residual = residual - mean
+        if self.cfg.debug: print("Residual:", residual.shape)
+        residual = residual - einops.reduce(residual, "batch position d_model -> batch position 1", "mean")
         # Calculate the variance, square root it. Add in an epsilon to prevent divide by zero.
-        scale = (torch.mean(residual.pow(2), dim = 0) + self.cfg.layer_norm_eps).sqrt()
-        print("Scale:", scale.shape)
-        print("resiual shape:", residual.shape)
+        scale = (einops.reduce(residual.pow(2), "batch position d_model -> batch position 1", "mean") + self.cfg.layer_norm_eps).sqrt()
         normalized = residual / scale
         normalized = normalized * self.w + self.b
         if self.cfg.debug: print("Normalized:", residual.shape)
@@ -143,12 +141,20 @@ class Attention(nn.Module):
         V = self.proj_V(normalized_resid_pre)
 
         attn_scores = torch.bmm(Q, K.transpose(1, 2)) / math.sqrt(self.cfg.d_head)
+        attn_scores = self.apply_causal_mask(attn_scores)
+
         attn_weights = attn_scores.softmax(dim=-1)
         attn_output = torch.bmm(attn_weights, V)
         output = self.proj_O(attn_output)
 
         if self.cfg.debug: print("attn_out:", output.shape)
         return output
+    
+    def apply_causal_mask(self, attn_scores):
+        # attn_scores: [batch, n_heads, query_pos, key_pos]
+        mask = torch.triu(torch.ones(attn_scores.size(-2), attn_scores.size(-1), device=attn_scores.device), diagonal=1).bool()
+        attn_scores.masked_fill_(mask, float('-inf'))
+        return attn_scores
 
 class MLP(nn.Module):
     def __init__(self, cfg : TransformerConfig):
@@ -156,6 +162,8 @@ class MLP(nn.Module):
         self.cfg = cfg
         self.W_in = nn.Linear(cfg.d_model, cfg.d_mlp, dtype=cfg.get_dtype())
         self.W_out = nn.Linear(cfg.d_mlp, cfg.d_model, dtype=cfg.get_dtype())
+        print("mlp max, min W_in", self.W_in.weight.max(), self.W_in.weight.min())
+        print("mlp max, min W_out", self.W_out.weight.max(), self.W_out.weight.min())
 
         #init
         for module in [self.W_in, self.W_out]:
@@ -163,7 +171,8 @@ class MLP(nn.Module):
 
     def forward(self, normalized_resid_mid, return_hidden : bool) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # normalized_resid_mid: [batch, position, d_model]
-        if self.cfg.debug: print("Normalized_resid_mid:", normalized_resid_mid.shape)
+        if self.cfg.debug: 
+            print("Normalized_resid_mid:", normalized_resid_mid.shape)
         mlp_inner = self.W_in(normalized_resid_mid)
         mlp_out = F.gelu(mlp_inner)
         mlp_out = self.W_out(mlp_out)
@@ -183,6 +192,7 @@ class TransformerBlock(nn.Module):
 
     def forward(self, residual, return_hidden : bool)-> tuple[torch.Tensor, Optional[torch.Tensor]]:
         normalized_resid_pre = self.ln1(residual)
+        print()
         attn_out = self.attn(normalized_resid_pre)
         normalized_resid_mid = normalized_resid_pre + attn_out
         normalized_resid_post = self.ln2(normalized_resid_mid)
@@ -200,6 +210,19 @@ class Transformer(nn.Module):
         self.blocks = nn.ModuleList([TransformerBlock(cfg) for _ in range(cfg.n_layers)])
         self.ln_final = LayerNorm(cfg)
 
+    @torch.no_grad()
+    def generate(self, tokens: torch.Tensor, n_tokens: int) -> torch.Tensor:
+        i = 0
+        while i < n_tokens:
+            logits, _ = self.forward(tokens, return_hidden=False)
+            # Clipping logits to a reasonable range before softmax to prevent underflow
+            logits_clipped = torch.clamp(logits, min=-10, max=10)
+            distb = logits_clipped.log_softmax(dim=-1)
+            next_token = torch.multinomial(distb[:, -1].exp(), 1)  # Using exp to convert log probabilities to probabilities
+            tokens = torch.cat((tokens, next_token), dim=-1)  # Concatenate [batch, seq_len + 1]
+            i += 1
+        return tokens
+
     def forward(self, tokens, return_hidden : bool) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         #[batch, position]
         embed = self.embed(tokens)
@@ -208,7 +231,6 @@ class Transformer(nn.Module):
         for block in self.blocks:
             (residual, mlp_hidden_acts) = block(residual, return_hidden)
         normalized_resid_final = self.ln_final(residual)
-        print("Normalized_resid_final:", normalized_resid_final.shape, "dtype:", normalized_resid_final.dtype)
         logits = self.unembed(normalized_resid_final)
         return (logits, mlp_hidden_acts) # type: ignore
 
