@@ -7,17 +7,22 @@ def get_model_memory_usage(numbers, dtype) -> float:
     memory_bytes = numbers * torch.finfo(dtype).bits // 8
     return memory_bytes / 1024**2
 
-
-def original_lm_cross_entropy_loss(logits, tokens):
+def lm_cross_entropy_loss(logits, tokens):
     log_probs = logits.log_softmax(dim=-1)
     pred_log_probs = log_probs[:, :-1].gather(dim=-1, index=tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
     return -pred_log_probs.mean()
+
 
 def modified_lm_cross_entropy_loss(logits, tokens):
     loss_fn = CrossEntropyLoss()
     logits = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
     tokens = tokens[:, 1:].contiguous().view(-1)
     return loss_fn(logits, tokens)
+
+def get_gpu_memory_usage() -> float:
+    '''returns the percentage of GPU memory used'''
+    return torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
+
 
 def test_loss_fn():
     # Test the functions
@@ -33,7 +38,7 @@ def test_loss_fn():
     tokens_for_modified_loss = torch.cat((tokens[:, 1:], torch.zeros(batch_size, 1).long()), dim=1)
 
     # Calculate losses
-    original_loss = original_lm_cross_entropy_loss(logits, tokens)
+    original_loss = lm_cross_entropy_loss(logits, tokens)
     modified_loss = modified_lm_cross_entropy_loss(logits, tokens_for_modified_loss)
 
     print("Original Loss:", original_loss.item())

@@ -4,6 +4,7 @@ from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, field_validator
 from torch.nn import functional as F
+from typing import Tuple, Union
 
 class AutoencoderConfig(BaseModel):
     seed: int
@@ -56,14 +57,17 @@ class AutoEncoder(nn.Module):
         self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
 
-    def forward(self, x):
+    def forward(self, x, method : str = 'with_loss')-> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
         x_cent = x - self.b_dec
         acts = F.relu(x_cent @ self.W_enc + self.b_enc)
         x_reconstruct = acts @ self.W_dec + self.b_dec
-        l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-        l1_loss = self.l1_coeff * (acts.float().abs().sum())
-        loss = l2_loss + l1_loss
-        return loss, x_reconstruct, acts, l2_loss, l1_loss
+        if method == 'with_loss':
+            l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
+            l1_loss = self.l1_coeff * (acts.float().abs().sum())
+            loss = l2_loss + l1_loss
+            return loss, x_reconstruct, acts, l2_loss, l1_loss
+        else:
+            return x_reconstruct  
 
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):

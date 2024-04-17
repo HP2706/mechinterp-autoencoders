@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import einops
 import math
 from pydantic import BaseModel, field_validator
-
+from autoencoder import AutoEncoder
 class EmbedConfig(BaseModel):
     d_model: int
     d_vocab: int
@@ -25,6 +25,7 @@ class TrainConfig(BaseModel):
     beta1: float
     beta2: float
     device: str
+    n_tokens : Optional[int] = None
 
 class TransformerConfig(TrainConfig, EmbedConfig, PosEmbedConfig):
     d_model: int
@@ -37,6 +38,7 @@ class TransformerConfig(TrainConfig, EmbedConfig, PosEmbedConfig):
     n_heads: int
     d_type : str
     tokenizer_name : str
+
 
     @field_validator('d_type')
     def check_d_type(cls, value):
@@ -235,3 +237,16 @@ class Transformer(nn.Module):
         return (logits, mlp_hidden_acts) # type: ignore
 
 
+    def forward_feature_ablate(self, tokens, auto_encoder : AutoEncoder, ablate_feature : int):
+        #[batch, position]
+        embed = self.embed(tokens)
+        pos_embed = self.pos_embed(tokens)
+        residual = embed + pos_embed
+        for block in self.blocks:
+            (residual, mlp_hidden_acts) = block(residual, return_hidden = True)
+            reconstructed_x = auto_encoder.forward(mlp_hidden_acts, method = 'reconstructed')
+            residual[:, :, ablate_feature] = reconstructed_x[:, :, ablate_feature] #type: ignore
+        normalized_resid_final = self.ln_final(residual)
+        logits = self.unembed(normalized_resid_final)
+        #compute p(s)
+        p_s = torch.prod(logits, dim=-1)
