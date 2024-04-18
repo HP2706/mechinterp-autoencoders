@@ -7,29 +7,12 @@ from datamodels import RunMetaData
 from typing import List
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
 import torch
-from common import stub, PATH, vol
+from common import stub, PATH, vol, DATASET_NAME, image
 from modal import Image, Volume, gpu
 import modal
 import wandb 
 import json
 import re
-DATASET_NAME = "roneneldan/TinyStories"
-
-image = Image.from_registry(
-    "nvidia/cuda:12.1.0-base-ubuntu22.04", add_python="3.11"
-).pip_install(
-    "torch",
-    "transformer_lens",
-    "transformers",
-    "datasets",
-    "einops",
-    "pandas",
-    "pydantic>=2.0",
-    "huggingface_hub",
-    "wandb",
-    "tqdm",
-    "pytest"
-)
 
 with image.imports():
     import os
@@ -38,63 +21,6 @@ with image.imports():
     from multiprocessing import Pool
     from tqdm import tqdm
     from functools import partial
-
-def process_batch(batch, seq_len : int):
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-    return tokenizer.batch_encode_plus(
-        batch, 
-        add_special_tokens=True, 
-        max_length=seq_len, 
-        padding="max_length", 
-        truncation=True
-    ).input_ids
-
-def batch_tokenize(data):
-    batch_size = 512
-    results = []
-    batches = [data[i:i + batch_size] for i in range(0, len(data), batch_size)]
-    
-    process_fn_partial = partial(process_batch, seq_len=512)
-    with Pool(processes=os.cpu_count()) as pool:
-        i = 0
-        for result in tqdm(pool.imap(process_fn_partial, batches), total=len(batches)):
-            if i == 256:
-                print("check if max length enforced", torch.tensor(result).shape)
-            i += 1
-            results.extend(result)
-    return results
-
-@stub.function(
-    image = image, 
-    volumes={PATH: vol},       
-    timeout=10*60, #5 minutes
-    cpu=10 #10 cores
-)
-def download_dataset():
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-
-    if not os.path.exists(f"{PATH}/{DATASET_NAME}"):
-        os.makedirs(f"{PATH}/{DATASET_NAME}")
-        dataset = load_dataset(DATASET_NAME, num_proc=os.cpu_count())
-        dataset.save_to_disk(f"{PATH}/{DATASET_NAME}") # type: ignore
-        vol.commit()
-    else:
-        dataset = load_from_disk(f"{PATH}/{DATASET_NAME}")
-
-    for split in dataset.keys():
-        inner_dataset = dataset[split].to_pandas() # type: ignore
-        print(inner_dataset.head())
-
-        # Apply tokenization in parallel
-        inner_dataset['tokenized_text'] = batch_tokenize(inner_dataset['text'].tolist())
-
-        print(inner_dataset.head(1))
-        path = f"{PATH}/{DATASET_NAME}/{split}"
-        os.makedirs(path, exist_ok=True)
-        Dataset.from_pandas(inner_dataset, split=split).save_to_disk(path)
-    vol.commit()
 
 #import wandb 
 def lm_cross_entropy_loss(logits, tokens):

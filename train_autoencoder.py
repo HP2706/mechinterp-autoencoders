@@ -1,157 +1,207 @@
-import time
-from datasets import load_dataset
-from models import Transformer, TransformerConfig
+import asyncio
+from threading import local
 from transformers import AutoTokenizer
 import pandas as pd
 from torch.optim import AdamW
-from datamodels import RunMetaData
-from typing import List, Type
+from datamodels import ActivationData
+from typing import Dict, List, Type, Union, Generator
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
 import torch
-from common import stub, PATH, vol
+from common import (
+    stub, vol, image, 
+    MODELS_DIR,PATH, DATASET_NAME
+)
 from modal import gpu
 import modal
-from datamodels import ActivationData
+from datamodels import ActivationData, ActivationMetaData
+import pandas as pd
 
-from train_transformer import image, DATASET_NAME
 
+MODEL_PATH = f"{MODELS_DIR}/thesephist-contra-bottleneck-t5-small-wikipedia"
 
 with image.imports():
-    import os
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
     from datasets import load_from_disk, Dataset
     from huggingface_hub import snapshot_download
     from tqdm import tqdm
-    from jaxtyping import Float, Int
-    from transformer_lens.utils import download_file_from_hf  
-    from transformer_lens.hook_points import HookPoint
-    from transformer_lens import EasyTransformer, EasyTransformerConfig
-    
+    import pandas as pd
+    import psutil
+    import time
+    import os
+    import numpy as np
+    import json
 
-
+version = "small"
+model_name = f"thesephist/contra-bottleneck-t5-{version}-wikipedia"
 
 @stub.cls(
     image = image,
     volumes={PATH: vol},    
     gpu=gpu.A10G(),
     concurrency_limit=10,   
+    allow_concurrent_inputs=True,
+    container_idle_timeout=20, # seconds
 )
-class Model:
+class BottleneckT5Autoencoder:
     @modal.build()
-    def download(self):
-        os.makedirs("SoLU_1L256W_C4_Width_Scan", exist_ok=True)
-        download_file_from_hf("NeelNanda/SoLU_1L256W_C4_Width_Scan", "config.json", cache_dir="SoLU_1L256W_C4_Width_Scan")
-        download_file_from_hf("NeelNanda/SoLU_1L256W_C4_Width_Scan", "model_final.pth", cache_dir="SoLU_1L256W_C4_Width_Scan")
+    def download_model(self):
+        snapshot_download(model_name)
 
     @modal.enter()
     def load(self):
-        os.makedirs("SoLU_1L256W_C4_Width_Scan", exist_ok=True)
-        json : dict = download_file_from_hf("NeelNanda/SoLU_1L256W_C4_Width_Scan", "config.json", cache_dir="SoLU_1L256W_C4_Width_Scan")#type: ignore
-        state_dict : dict = download_file_from_hf("NeelNanda/SoLU_1L256W_C4_Width_Scan", "model_final.pth", cache_dir="SoLU_1L256W_C4_Width_Scan")#type: ignore
-        self.tokenizer = AutoTokenizer.from_pretrained("NeelNanda/gpt-neox-tokenizer-digits")
-
-        config = EasyTransformerConfig(
-            n_layers=json['n_layers'],
-            d_model=json['d_model'],
-            n_ctx=json['n_ctx'],
-            d_head=json['d_head'],
-            n_heads=json['n_heads'],
-            d_mlp=json['d_mlp'],
-            act_fn=json['act_fn'],
-            d_vocab=json['d_vocab'],
-            eps=json['ln_eps'],
-            model_name='NeelNanda/SoLU_1L256W_C4_Width_Scan',
-            tokenizer_name=json['tokenizer_name'],
-            n_devices=1,
-            normalization_type=json['normalization'],
-            seed=json['seed'],
-            init_weights=True,  # Assuming we want to initialize weights
-            attn_only=json['attn_only'],
-            n_params=json['n_params']  # Optional, provide default None if not present
-        )
-        model = EasyTransformer(config, move_to_device=False)#.load_state_dict(output)
-        state_dict['unembed.b_U'] = torch.zeros(size=(json['d_vocab'],)) # we add an unembed bias of shape (d_vocab,) of zeros
-        #since it is added, we do not change the model output, it is just so the keys match
-        model.load_state_dict(state_dict)
-        self.model = model
+        self.device = "cuda"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=512)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(self.device)
+        self.model.eval()
 
     @modal.method()
-    def forward(self, inp : tuple[torch.Tensor, List[str]])->List[dict]:
-        tokens, texts = inp
-        tokens = tokens.to("cuda")
-        datas = []
-        print("forward called")
+    async def get_embeddings(self, kwargs : Dict[str, torch.Tensor]) -> List[ActivationData]:
+        token_ids = kwargs['token_ids']
+        attn_mask  = kwargs['attn_masks']
+        print(f"token_ids shape: {token_ids.shape}, attn_mask shape: {attn_mask.shape}")
 
-        def get_activation_hook(
-            pattern: Float[torch.Tensor, "batch seq_len d_model"],
-            hook: HookPoint,
-        ):  
-          
-            print(f"hooked shape {pattern.shape} hook name {hook.name}")
-            t0 = time.time()
-            cloned_activation = pattern.clone().detach().cpu().numpy()  # Convert to NumPy array instead of list
-            for text, act in zip(texts, cloned_activation):
-                datas.append(ActivationData(text=text, activations=act).model_dump())
+        embeddings = await self.embed(token_ids, attn_mask)
+        
+        return [
+            ActivationData(text=None, activations=emb, token_ids=tokens.tolist()) 
+            for (tokens, emb) in zip(token_ids, embeddings.numpy())
+        ]
 
-            print(f"hook time {time.time() - t0}")
+    async def embed(self, token_ids: torch.Tensor, attn_mask : torch.Tensor) -> torch.Tensor:
+        decoder_inputs = self.tokenizer('', return_tensors='pt').to(self.device)
+        token_ids = token_ids.to(self.device)
+        attn_mask = attn_mask.to(self.device)
+        with torch.no_grad():
+            reserved_memory_gb = torch.cuda.memory_reserved(0) / (1024 ** 3)
+            allocated_memory_gb = torch.cuda.memory_allocated(0) / (1024 ** 3)
+            utilization_ratio = allocated_memory_gb / reserved_memory_gb if reserved_memory_gb > 0 else 0
+            print(f"Memory reserved: {reserved_memory_gb:.2f} GB, Memory allocated: {allocated_memory_gb:.2f} GB, Utilization ratio: {utilization_ratio:.2f}")
+            return self.model(
+                input_ids=token_ids,
+                attention_mask=attn_mask,
+                decoder_input_ids=decoder_inputs['input_ids'],
+                encode_only=True,
+            ).detach().cpu()
+        
+    @modal.method()
+    async def embed_endpoint(self, texts: List[str]) -> torch.Tensor:
+        '''a wrapper around embed that returns the embeddings as a tensor'''
+        inputs = self.tokenizer(texts, return_tensors='pt',truncation=True, padding='max_length')
+        return await self.embed(**inputs) #type: ignore
+    
+    @modal.method()
+    @torch.no_grad()
+    def generate_from_latent(self, latents: torch.Tensor, max_length=512, temperature=1.0) -> List[str]:
+        '''
+        Args:
+            latents: a tensor of shape (N, D_model) where N is the number of texts and D_model is the dimension of the model
+        Returns:
+            List[str]: a list of strings of text generated from the latents
+        '''
+        batch_size = latents.shape[0] # N
+        dummy_text = '.'
+        tokens = self.tokenizer(dummy_text, return_tensors='pt')
+        dummy_emb = self.embed(**tokens)  # This should be of shape [1, D_model] #type: ignore
+        perturb_vector = latents - dummy_emb  # shape [batch_size, D_model]
+       
+        input_ids = self.tokenizer(
+            [dummy_text] * batch_size, return_tensors='pt', padding=True
+        ).to(self.device).input_ids #(batch_size, seq_len)
+        perturb_vector = perturb_vector.unsqueeze(1).repeat(1, batch_size, input_ids.shape[1], 1).squeeze(0)
+        self.model.perturb_vector = perturb_vector
 
-
-        self.model.eval()
-        self.model.remove_all_hook_fns() 
-
-        out = self.model.run_with_hooks(
-            tokens,
-            return_type=None, # For efficiency, we don't need to calculate the logits
-            fwd_hooks=[
-                (
-                    lambda name: name == "blocks.10.mlp.hook_post",
-                    get_activation_hook
-                ),
-            ],   
+        # Generate text from the model
+        output = self.model.generate(
+            input_ids=input_ids,
+            max_length=max_length,
+            do_sample=True,
+            temperature=temperature,
+            top_p=0.9,
+            num_return_sequences=batch_size,
         )
-        print("output run with hooks", out)
-        return datas
+        tokens = self.tokenizer.batch_decode(output, skip_special_tokens=True)
+        return tokens[:batch_size] # TODO this is a hacky workaround, and should be fixed in the model
+
+def yield_batches(dataset, batch_size) -> Generator[dict, None, None]:
+    for i in range(0, len(dataset), batch_size):
+        batch = dataset[i:i+batch_size]
+        t0 = time.time()
+        data= {
+            'token_ids': torch.tensor(list(batch['token_ids'])),
+            'attn_masks': torch.tensor(list(batch['attn_masks']))
+        } 
+        print(f"yielding batch of size {len(batch)} in {time.time() - t0} seconds")
+        yield data
+
+def save_accumulated_batches(accumulated_batches, activations_path, metadata, name):
+    path = f"{activations_path}/v_{metadata.n_saved}_{name}.parquet"
+    df = pd.DataFrame(accumulated_batches)
+    df.to_parquet(path)  # Save DataFrame
+    accumulated_batches.clear()  # Clear the list for new data
+    with open(f"{activations_path}/metadata_{name}", "w") as f:
+        f.write(metadata.model_dump_json())
+    vol.commit()
+
+
 
 @stub.function(
     image = image,
     volumes={PATH: vol},   
-    timeout=10*60, #5 minutes  
+    timeout=60*60, 
 )
 def create_activations_dataset():
-    print("\n\nLoading datasets")
-    DATASET_PATH = f"{PATH}/{DATASET_NAME}"
-    train_set : Dataset = load_from_disk(f"{DATASET_PATH}/train", keep_in_memory=False) # type: ignore
-    val_set : Dataset = load_from_disk(f"{DATASET_PATH}/validation", keep_in_memory=False) # type: ignore
-
-    batch_size = 256
-
-    print("\n\nCreating model")
-    model = Model()
+    batch_size = 512
+    model = BottleneckT5Autoencoder()
     
-    tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    for (name, dataset) in zip(["train", "val"], [train_set, val_set]):
-        token_batches = []
-        text_batches = []
-        print(f"Processing {name} dataset with {len(dataset.to_pandas())} samples") #type: ignore
+    activations_name = f"activations_{model_name.replace('/', '-')}_{DATASET_NAME.replace('/', '_')}"
+    activations_path = f"{PATH}/{activations_name}"
+    os.makedirs(activations_path, exist_ok=True)
+    print(f"Creating activations dataset at {activations_path}")
+
+    for name in ["train", "validation"]:
+        DATASET_PATH = f"{PATH}/processed_{DATASET_NAME}"
+        dataset : pd.DataFrame= load_from_disk(f"{DATASET_PATH}_{name}", keep_in_memory=False).to_pandas() # type: ignore
         
-        for i in tqdm(range(0, len(dataset), batch_size)):
-            if i > batch_size*100:
-                break
-            texts = dataset[i:i+batch_size]["text"]
-            tokens = tokenizer.batch_encode_plus(
-                texts, truncation=True, padding='max_length', max_length=256, return_tensors='pt'
-            ).input_ids
-            token_batches.append(tokens)
-            text_batches.append(texts)
-            
-            #yield dataset[i:i+batch_size]["text"]
-        datas = list(model.forward.map(tqdm(zip(token_batches, text_batches)), return_exceptions=True))
-        print("datas", datas)
-        df = pd.DataFrame([elm for sublist in datas for elm in sublist])
-        print(df.head(10))
-        df.to_parquet(f"{PATH}/{name}_activations_10_mlp_hook_pre_{DATASET_NAME.replace('/', '_')}.parquet")
+        if not os.path.exists(f"{activations_path}/metadata_{name}"):
+            metadata = ActivationMetaData(n_saved=0, last_idx=0)
+        else:
+            metadata = ActivationMetaData.model_validate_json(json.loads(open(file=f"{activations_path}/metadata_{name}").read()))
 
-        vol.commit()
+
+
+        lower = metadata.last_idx
+        upper = len(dataset)
+        print("upper", upper, "lower", lower)
+        dataset_chunk = dataset[lower:upper]
+        t0 = time.time()
+
+
+        print(f"Processing {name} dataset with {len(dataset)} samples") #type: ignore
+        orig_size = len(dataset)
+        
+        accumulated_batches = []
+    
+        _interval_len = int(len(dataset_chunk) / batch_size)
+        for (i, batch) in enumerate(model.get_embeddings.map(
+                tqdm(yield_batches(dataset_chunk, batch_size), total=_interval_len), 
+                return_exceptions=True
+            )):
+            if not isinstance(batch, Union[list, tuple]):
+                print("exception", batch)
+            else:
+                accumulated_batches.extend(batch)
+                
+                memory = psutil.virtual_memory()
+                used_memory_percentage = (memory.used / memory.total) * 100
+                metadata.last_idx = i*batch_size
+                if used_memory_percentage >= 90:
+                    save_accumulated_batches(accumulated_batches, activations_path, metadata, name)
+                    metadata.n_saved += 1 
+        
+        metadata.last_idx = upper
+        save_accumulated_batches(accumulated_batches, activations_path, metadata, name)
+        
+
+        time_taken = time.time() - t0
+        print(f"Finished processing {name} dataset in {time_taken / 60} minutes for {orig_size} samples")
 
