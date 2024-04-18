@@ -1,7 +1,8 @@
 from common import stub, PATH, vol
 from autoencoder import AutoEncoder, AutoencoderConfig
 from models import Transformer, TransformerConfig
-from train import train_model, download_dataset, image
+from train_transformer import download_dataset, image
+from train_autoencoder import create_activations_dataset, Model
 
 
 @stub.function(
@@ -17,11 +18,14 @@ def checkdir():
         dataset = load_from_disk(path)
         print(dataset.to_pandas().head(1))
 
+    print(os.listdir(PATH))
+
 
 @stub.local_entrypoint()
 def main():
     #download_dataset.remote()
     #checkdir.remote()
-    train_model.remote()
+    create_activations_dataset.remote()
+  
 
 

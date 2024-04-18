@@ -19,13 +19,16 @@ image = Image.from_registry(
     "nvidia/cuda:12.1.0-base-ubuntu22.04", add_python="3.11"
 ).pip_install(
     "torch",
+    "transformer_lens",
     "transformers",
     "datasets",
     "einops",
     "pandas",
     "pydantic>=2.0",
+    "huggingface_hub",
     "wandb",
     "tqdm",
+    "pytest"
 )
 
 with image.imports():
@@ -106,7 +109,7 @@ def lm_cross_entropy_loss(logits, tokens):
     secrets=[modal.Secret.from_name("my-wandb-secret")],
     timeout=120*60, #60 minutes
 )
-def train_model():
+def train_transformer_model():
     DATASET_PATH = f"{PATH}/{DATASET_NAME}"
     # start a new wandb run to track this script
     wandb.login(key=os.getenv("WANDB_API_KEY"))

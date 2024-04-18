@@ -1,3 +1,4 @@
+from typing import Optional
 from statistics import geometric_mean
 import torch
 from torch import Tensor
@@ -11,7 +12,7 @@ class AutoencoderConfig(BaseModel):
     batch_size: int
     buffer_mult: int
     lr: float
-    num_tokens: int
+    num_tokens: Optional[int] = None
     l1_coeff: float
     beta1: float
     beta2: float
@@ -20,7 +21,7 @@ class AutoencoderConfig(BaseModel):
     d_mlp: int
     enc_dtype: str = 'float32'
     remove_rare_dir: bool
-    model_batch_size: int
+    batch_size: int
     buffer_size: int
     buffer_batches: int
     device : str 
