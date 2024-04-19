@@ -1,16 +1,17 @@
-import asyncio
-from threading import local
 from transformers import AutoTokenizer
 import pandas as pd
 from torch.optim import AdamW
 from datamodels import ActivationData
-from typing import Dict, List, Type, Union, Generator
+from typing import Any, Dict, List, Type, Union, Generator
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
 import torch
 from common import (
     stub, vol, image, 
     MODELS_DIR,PATH, DATASET_NAME
 )
+from autoencoder import AutoencoderConfig, AutoEncoder
+from mechninterp_utils import get_recons_loss
+from utils import load_activations
 from modal import gpu
 import modal
 from datamodels import ActivationData, ActivationMetaData
@@ -38,9 +39,9 @@ model_name = f"thesephist/contra-bottleneck-t5-{version}-wikipedia"
     image = image,
     volumes={PATH: vol},    
     gpu=gpu.A10G(),
-    concurrency_limit=10,   
+    concurrency_limit=100,   
     allow_concurrent_inputs=True,
-    container_idle_timeout=20, # seconds
+    container_idle_timeout=40, # seconds
 )
 class BottleneckT5Autoencoder:
     @modal.build()
@@ -52,19 +53,20 @@ class BottleneckT5Autoencoder:
         self.device = "cuda"
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, model_max_length=512)
         self.model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True).to(self.device)
+        #TODO self.model = torch.compile(self.model) # we use torch.compile for potential speedup 
+        # requires compiler installed 
         self.model.eval()
 
     @modal.method()
-    async def get_embeddings(self, kwargs : Dict[str, torch.Tensor]) -> List[ActivationData]:
+    async def get_embeddings(self, kwargs : Dict[str, torch.Tensor]) -> List[dict[str, Any]]:
         token_ids = kwargs['token_ids']
         attn_mask  = kwargs['attn_masks']
-        print(f"token_ids shape: {token_ids.shape}, attn_mask shape: {attn_mask.shape}")
 
         embeddings = await self.embed(token_ids, attn_mask)
-        
+                
         return [
-            ActivationData(text=None, activations=emb, token_ids=tokens.tolist()) 
-            for (tokens, emb) in zip(token_ids, embeddings.numpy())
+            ActivationData(text=None, activations=emb, token_ids=tokens).model_dump() 
+            for (tokens, emb) in zip(token_ids.numpy().tolist(), embeddings.numpy().tolist())
         ]
 
     async def embed(self, token_ids: torch.Tensor, attn_mask : torch.Tensor) -> torch.Tensor:
@@ -125,24 +127,22 @@ class BottleneckT5Autoencoder:
 def yield_batches(dataset, batch_size) -> Generator[dict, None, None]:
     for i in range(0, len(dataset), batch_size):
         batch = dataset[i:i+batch_size]
-        t0 = time.time()
-        data= {
+
+        yield {
             'token_ids': torch.tensor(list(batch['token_ids'])),
             'attn_masks': torch.tensor(list(batch['attn_masks']))
         } 
-        print(f"yielding batch of size {len(batch)} in {time.time() - t0} seconds")
-        yield data
 
 def save_accumulated_batches(accumulated_batches, activations_path, metadata, name):
     path = f"{activations_path}/v_{metadata.n_saved}_{name}.parquet"
+    print("saving batches", len(accumulated_batches), accumulated_batches)
     df = pd.DataFrame(accumulated_batches)
+    print("df", df.head())
+    print("df activations", type(df['activations'][0]))
     df.to_parquet(path)  # Save DataFrame
-    accumulated_batches.clear()  # Clear the list for new data
     with open(f"{activations_path}/metadata_{name}", "w") as f:
         f.write(metadata.model_dump_json())
     vol.commit()
-
-
 
 @stub.function(
     image = image,
@@ -156,34 +156,26 @@ def create_activations_dataset():
     activations_name = f"activations_{model_name.replace('/', '-')}_{DATASET_NAME.replace('/', '_')}"
     activations_path = f"{PATH}/{activations_name}"
     os.makedirs(activations_path, exist_ok=True)
-    print(f"Creating activations dataset at {activations_path}")
 
     for name in ["train", "validation"]:
         DATASET_PATH = f"{PATH}/processed_{DATASET_NAME}"
         dataset : pd.DataFrame= load_from_disk(f"{DATASET_PATH}_{name}", keep_in_memory=False).to_pandas() # type: ignore
-        
+        print("dataset", name , dataset.head(), len(dataset))
         if not os.path.exists(f"{activations_path}/metadata_{name}"):
             metadata = ActivationMetaData(n_saved=0, last_idx=0)
         else:
-            metadata = ActivationMetaData.model_validate_json(json.loads(open(file=f"{activations_path}/metadata_{name}").read()))
-
-
-
-        lower = metadata.last_idx
-        upper = len(dataset)
-        print("upper", upper, "lower", lower)
-        dataset_chunk = dataset[lower:upper]
+            with open(f"{activations_path}/metadata_{name}", "r") as file:
+                metadata_json = file.read()
+            metadata = ActivationMetaData.model_validate_json(metadata_json)
+        
         t0 = time.time()
 
-
-        print(f"Processing {name} dataset with {len(dataset)} samples") #type: ignore
         orig_size = len(dataset)
         
         accumulated_batches = []
-    
-        _interval_len = int(len(dataset_chunk) / batch_size)
+        _interval_len = int(len(dataset) / batch_size)
         for (i, batch) in enumerate(model.get_embeddings.map(
-                tqdm(yield_batches(dataset_chunk, batch_size), total=_interval_len), 
+                tqdm(yield_batches(dataset, batch_size), total=_interval_len), 
                 return_exceptions=True
             )):
             if not isinstance(batch, Union[list, tuple]):
@@ -193,15 +185,85 @@ def create_activations_dataset():
                 
                 memory = psutil.virtual_memory()
                 used_memory_percentage = (memory.used / memory.total) * 100
+                print(f"Used memory: {used_memory_percentage:.2f}% total memory: {memory.total / 1024**3:.2f} GB")
                 metadata.last_idx = i*batch_size
                 if used_memory_percentage >= 90:
                     save_accumulated_batches(accumulated_batches, activations_path, metadata, name)
+                    accumulated_batches = []
                     metadata.n_saved += 1 
         
-        metadata.last_idx = upper
+        metadata.last_idx = len(dataset)
         save_accumulated_batches(accumulated_batches, activations_path, metadata, name)
         
 
         time_taken = time.time() - t0
         print(f"Finished processing {name} dataset in {time_taken / 60} minutes for {orig_size} samples")
 
+
+@stub.function(
+    image = image,
+    volumes={PATH: vol},   
+    timeout=60*60, 
+    gpu=gpu.A10G(),    
+)
+def train_autoencoder():
+    activations_name = f"activations_{model_name.replace('/', '-')}_{DATASET_NAME.replace('/', '_')}"
+
+    if not os.path.exists(f"{PATH}/{activations_name}"):
+        create_activations_dataset()
+
+    model_dir = f"{PATH}/1L_autoencoder"
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+    
+    d_mlp = 512 #TODO this should not be hardcoded
+    model = AutoEncoder(AutoencoderConfig(
+        seed=42,
+        batch_size=512,
+        buffer_mult=10,
+        lr=1e-3,
+        l1_coeff=0.01,
+        beta1=0.9,
+        beta2=0.999,
+        dict_mult=4,
+        seq_len=512,
+        d_mlp=d_mlp,
+        remove_rare_dir=True,
+        buffer_size=1000000,
+        buffer_batches=25,
+        device="cuda",
+        n_epochs=1
+    ))
+
+    model.to(model.cfg.device)
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    for train_file in [ file for file in os.listdir(f"{PATH}/{activations_name}") if "train" in file]:
+        if not train_file.endswith(".parquet"):
+            continue
+
+        df = pd.read_parquet(f"{PATH}/{activations_name}/{train_file}")
+        activations_batched = load_activations(df, model.cfg.batch_size)
+
+        for activations in activations_batched:
+            loss, x_reconstruct, acts, l2_loss, l1_loss = model.forward(
+                activations.to(model.cfg.device), method='with_loss'
+            )
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            print(f"loss {loss.item()}")
+
+    for eval_file in [file for file in os.listdir(f"{PATH}/{activations_name}") if "validation" in file]:
+        if not eval_file.endswith(".parquet"):
+            continue
+        df = pd.read_parquet(f"{PATH}/{activations_name}/{eval_file}")
+        activations_batched = load_activations(df, model.cfg.batch_size)
+        for activations in activations_batched:
+            loss, x_reconstruct, acts, l2_loss, l1_loss = model.forward(
+                activations.to(model.cfg.device), method='with_loss'
+            )
+            print(f"validation loss {loss.item()}")
+
+
+
+        

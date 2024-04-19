@@ -1,5 +1,8 @@
 import torch
 from torch.nn import CrossEntropyLoss
+import numpy as np
+from typing import List
+
 
 def get_model_memory_usage(numbers, dtype) -> float:
     '''returns memory in GB for n numbers of dtype'''
@@ -22,6 +25,16 @@ def modified_lm_cross_entropy_loss(logits, tokens):
 def get_gpu_memory_usage() -> float:
     '''returns the percentage of GPU memory used'''
     return torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
+
+def load_activations(df, batch_size)-> List[torch.Tensor]:
+    loaded_array = np.array(list(df['activations']), dtype=np.float32)
+    elms = []
+    for i in range(0, len(loaded_array), batch_size):
+        elms.append(torch.tensor(loaded_array[i:i+batch_size]))
+
+    sum_batches = sum([len(elm) for elm in elms])
+    assert len(df) == sum_batches, f"expected {len(elms)} should be equal to sum_batches: {sum_batches}"
+    return elms
 
 
 def test_loss_fn():

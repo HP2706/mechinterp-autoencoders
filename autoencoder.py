@@ -1,11 +1,13 @@
 from typing import Optional
-from statistics import geometric_mean
 import torch
 from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, field_validator
 from torch.nn import functional as F
 from typing import Tuple, Union
+#internal imports
+from mechninterp_utils import replacement_hook, zero_ablate_hook, mean_ablate_hook
+
 
 class AutoencoderConfig(BaseModel):
     seed: int
@@ -25,6 +27,8 @@ class AutoencoderConfig(BaseModel):
     buffer_size: int
     buffer_batches: int
     device : str 
+    n_epochs: int 
+
 
     @field_validator('enc_dtype')
     def check_d_type(cls, value):
@@ -75,5 +79,3 @@ class AutoEncoder(nn.Module):
         W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
-
-#from geom_median.torch import compute_geometric_median 
