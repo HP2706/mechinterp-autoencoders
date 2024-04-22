@@ -1,5 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
+import torch
+
 
 class RunMetaData(BaseModel):
     n_epoch: int
@@ -15,4 +17,9 @@ class ActivationData(BaseModel):
 class ActivationMetaData(BaseModel):
     n_saved: int 
     last_idx: int 
+
+class InterpretabilityExample(BaseModel):
+    text: str
+    token_ids: List[int]
+    activations: Any
 

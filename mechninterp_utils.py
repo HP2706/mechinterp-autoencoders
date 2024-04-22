@@ -1,9 +1,6 @@
-import tqdm
 import torch
-from jaxtyping import Float
-from transformer_lens import utils
 from functools import partial
-
+from transformer_lens import utils
 
 def compute_proxy(proba_distb : torch.Tensor, feature_tokens : torch.Tensor): #NOT finished
     # shape of proba_distb is [batch, seq_len, vocab_size]
@@ -74,35 +71,3 @@ def get_recons_loss(
     print(f"Reconstruction Score: {score:.2%}")
     # print(f"{((zero_abl_loss - mean_abl_loss)/(zero_abl_loss - loss)).item():.2%}")
     return score, loss, recons_loss, zero_abl_loss
-
-
-
-@torch.no_grad()
-def get_freqs(
-    tokens,
-    encoder, 
-    model,
-    num_batches=25,
-    device="cuda"
-):
-    
-    act_freq_scores = torch.zeros(encoder.d_hidden, dtype=torch.float32).to(device)
-    total = 0
-    for i in tqdm.trange(num_batches):
-
-        _, cache = model.run_with_cache(
-            tokens, stop_at_layer=1, names_filter=utils.get_act_name("post", 0)
-        )
-        mlp_acts = cache[utils.get_act_name("post", 0)]
-        mlp_acts = mlp_acts.reshape(-1, d_mlp)
-
-        hidden = encoder(mlp_acts)[2]
-
-        act_freq_scores += (hidden > 0).sum(0) 
-        #increments across the sequence dimension 
-        # each feature is incremented if its value is greater than 0
-        total+=hidden.shape[0]
-    act_freq_scores /= total
-    num_dead = (act_freq_scores==0).float().mean()
-    print("Num dead", num_dead)
-    return act_freq_scores
