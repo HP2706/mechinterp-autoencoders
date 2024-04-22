@@ -34,5 +34,6 @@ image = Image.from_registry(
     "pytest",
     "sentencepiece",
     "psutil",
+    "instructor",
 )
 #.run_function(download_model)
