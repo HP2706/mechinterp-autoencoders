@@ -40,7 +40,8 @@ async def explain_activation(
                     You are a machine learning scientist.
                     You job is to create an explanation of a {feature_or_neuron} based on emperical observations 
                     of in what contexts the {feature_or_neuron} is active and to what degree.
-                    You will base your answer on the following examples:
+                    You will base your answer on the following examples, where you will see the context, 
+                    the token and the associated activation for that token:
                     {examples}
                     return in the specified json format
                 """

@@ -1,13 +1,14 @@
-from gguf import Any
+from multiprocessing import context
 import tqdm
 import torch
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Any
 from torch.nn import functional as F
 from transformer_lens import HookedTransformer, utils
 from datasets import load_dataset, Dataset
 from autoencoder import AutoEncoder
 from pydantic import BaseModel, field_validator
 import plotly.express as px
+from datamodels import ActivationExample
 
 
 class PipelineConfig(BaseModel):
@@ -34,8 +35,8 @@ class MechInterpPipeline:
         model = HookedTransformer.from_pretrained(model_name, device=cfg.device).to(cfg.d_type)
 
         self.model = model
-        self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device)
-        data : Dataset = load_dataset(dataset_name, split="train") # type: ignore
+        self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device).to(cfg.device)
+        data : Dataset = load_dataset(dataset_name, split="train")# type: ignore
         tokenized_data = utils.tokenize_and_concatenate(data, model.tokenizer, max_length=128)
         self.all_tokens : torch.Tensor = tokenized_data["tokens"] # type: ignore
         self.cfg = cfg
@@ -46,10 +47,9 @@ class MechInterpPipeline:
         tokens, 
         d_mlp : int,
         num_batches=25,
-        device="cuda"
-    ):
+    ) -> torch.Tensor:
         
-        act_freq_scores = torch.zeros(self.encoder.d_hidden, dtype=torch.float32).to(device)
+        act_freq_scores = torch.zeros(self.encoder.d_hidden, dtype=torch.float32).to(self.cfg.device)
         total = 0
         for i in tqdm.trange(num_batches):
 
@@ -70,7 +70,11 @@ class MechInterpPipeline:
         print("Num dead", num_dead)
         return act_freq_scores.cpu()
 
-    def get_examples(self, batch_size : int, seq_len : int):
+    def get_tokens(
+        self, 
+        batch_size : int, 
+        seq_len : int
+    ) -> torch.Tensor:
         '''gets examples for individual feature with seq'''
         tokens = self.all_tokens[torch.randperm(len(self.all_tokens))[:self.cfg.batch_size]]
         max_seq_len = tokens.shape[1]
@@ -97,72 +101,138 @@ class MechInterpPipeline:
         feature_index : int
     ) -> torch.Tensor:
         '''gets the activation values for a feature index'''
+
+        if tokens.device != self.cfg.device:
+            tokens = tokens.to(self.cfg.device)
+
         _, cache = self.model.run_with_cache(tokens, stop_at_layer=1, names_filter=utils.get_act_name("post", 0))
         mlp_acts = cache[utils.get_act_name("post", 0)] # shape (batch, seq_len, d_mlp)
         feature_in = self.encoder.W_enc[:, feature_index]
         feature_bias = self.encoder.b_enc[feature_index]
         feature_acts = F.relu((mlp_acts - self.encoder.b_dec) @ feature_in + feature_bias) # shape (batch, seq_len)
         return feature_acts.cpu()
-
-    @torch.no_grad()
-    def match_activations_tokens(
-        self, 
-        tokens : torch.Tensor,
-        feature_index : int,
-    ) -> List[tuple[str, List[tuple[int, str, float]]]]:
         
-        activations = self.get_feature_acts(tokens, feature_index)
+    @torch.no_grad()
+    def get_non_threshold_activations_with_tokens(
+        self, 
+        feature_index: int,
+        context_window: int = 4, # on both sides of token from anthropic paper
+        tokens: Optional[torch.Tensor] = None,
+        threshold: float = 0.01,
+        entire_dataset: bool = False
+    ) -> List[tuple[str, List[ActivationExample]]]:
+        '''gets the non zero activations for a feature index and the corresponding text
+        Args:
+            tokens: (batch_size, seq_len) or (seq_len)
+            feature_index: int
+        Returns:
+            List[tuple[str, List[tuple[int, str, float]]]]: List of len batch_size of
+            tuples where each tuple contains the text in the batch and the list of activation pairs for the feature index
+        '''
+        
+        # Check inputs
+        if tokens is not None and entire_dataset:
+            raise ValueError("Cannot specify both tokens and entire_dataset, to use entire dataset, set tokens to None")
 
         batch_interp = []
-        for batch_idx in range(len(activations)):
-            non_zero_indices = torch.nonzero(activations[batch_idx], as_tuple=True)
-            token_activation_pairs = []
-            if non_zero_indices[0].nelement() == 0: # if all are zeros we skip
-                continue
-            else:
-                for tensor in non_zero_indices:
-                    print(tensor)
-                    all_indices = tensor.tolist()
-                    print(all_indices)
-                    for active_idx in all_indices:
-                        active_tokens = tokens[batch_idx,active_idx]
-                        non_zero_values = activations[batch_idx,active_idx]
 
-                        token_activation_pairs.append((active_idx , self.model.to_string(active_tokens), non_zero_values))
-                text = self.tokens_to_str(tokens[batch_idx])
-            if token_activation_pairs != []:
-                batch_interp.append((text, token_activation_pairs)) 
+        if tokens is None:
+            if entire_dataset:
+                print("Getting activations for entire dataset")
+                dataset_size = len(self.all_tokens)
+                print("Dataset size", dataset_size)
+
+                for batch_idx in tqdm.tqdm(range(0, dataset_size, self.cfg.batch_size)):
+                    batch_tokens = self.all_tokens[batch_idx:batch_idx + self.cfg.batch_size]
+                    batch_activations = self.get_feature_acts(batch_tokens, feature_index)
+                    batch_interp.extend(self.process_activations(batch_tokens, batch_activations, threshold, context_window))
+            else:
+                tokens = self.get_batch_w_repeated_tokens([feature_index], self.cfg.batch_size)
+                activations = self.get_feature_acts(tokens, feature_index)
+                batch_interp = self.process_activations(tokens, activations, threshold, context_window)
+        else:
+            activations = self.get_feature_acts(tokens, feature_index)
+            batch_interp = self.process_activations(tokens, activations, threshold, context_window)
+
         return batch_interp
 
-    def filter_non_zero(
+    def process_activations(self, tokens, activations, threshold, context_window):
+        batch_results = []
+        for batch_idx in range(len(activations)):
+            batch_tokens = tokens[batch_idx]
+            print("batch tokens shape", batch_tokens.shape)
+            non_zero_acts, non_zero_tokens = self.filter_non_zero_sequence(
+                batch_tokens, activations[batch_idx], threshold
+            ) #TODO fix the context problem, it doesnt produce 9 tokens each time.
+
+            token_activation_pairs = []
+            if non_zero_acts.numel() == 0:  # no non-zero activations, we skip
+                continue
+
+            token_activation_pairs = []
+            texts : List[str] = self.model.tokenizer.batch_decode(non_zero_tokens)
+            for idx, (token_str, act) in enumerate(zip(texts, non_zero_acts.tolist())):
+
+
+                start = max(0, idx - context_window)
+                end = min(len(batch_tokens), idx + context_window + 1)
+                
+                if abs(idx - start) < context_window:
+                    diff = abs(idx - start)
+                    end += context_window - diff
+                elif abs(idx - end) < context_window:
+                    diff = abs(idx - end)
+                    start -= context_window - diff
+                
+                start = max(0, start)
+                end = min(len(batch_tokens), end)
+                #part1 = self.model.tokenizer.batch_decode(batch_tokens[start:idx])
+                #part2 = self.model.tokenizer.batch_decode(batch_tokens[idx:end])
+                #context = part1 + [f"|{token_str}|"] + part2
+                context = self.model.tokenizer.batch_decode(batch_tokens[start:end])
+                #print("difference", end - start, "idx", idx, "n tokens sequence", len(batch_tokens), "text", ''.join(context) )
+
+                token_activation_pairs.append(
+                    ActivationExample(
+                        text=token_str, 
+                        token_id=idx, 
+                        activation=act,
+                        context= ''.join(context)
+                    )
+                )
+
+            text = self.tokens_to_str(tokens[batch_idx])  # we save the entire text
+            batch_results.append((text, token_activation_pairs))
+        return batch_results
+
+
+    def filter_non_zero_sequence(
         self,
         tokens : torch.Tensor,
-        activations: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        activations: torch.Tensor,
+        threshold : Optional[float] = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         '''filters out the non-zero activations
         activations shape is (batch_size, seq_len) or (seq_len)
         Args:
             tokens: (batch_size, seq_len) or (seq_len)
             activations: (batch_size, seq_len) or (seq_len)
         Returns:
-            non_zero_activations
-            non_zero_indices
-            non_zero_tokens
+            non_zero_activations : (n_non_zero_activations)
+            non_zero_tokens : (n_non_zero_activations)
         '''
         non_zero_indices = torch.nonzero(activations, as_tuple=True)
         non_zero_activations = activations[non_zero_indices]
         non_zero_tokens = tokens[non_zero_indices]
-        if len(non_zero_tokens.shape) == 1:
-            non_zero_indices = non_zero_indices[0]
-        else:
-            non_zero_indices = torch.vstack(non_zero_indices)
-
-        return non_zero_activations, non_zero_indices, non_zero_tokens
+        if threshold is not None:
+            condition = non_zero_activations > threshold
+            non_zero_activations = non_zero_activations[condition]
+            non_zero_tokens = non_zero_tokens[condition]
+        return non_zero_activations, non_zero_tokens
 
 
     def get_batch_w_repeated_tokens(
         self,
-        all_tokens: torch.Tensor, 
         target_tokens: List[int], 
         target_count: Optional[int] = None
     ) -> torch.Tensor:
@@ -170,9 +240,9 @@ class MechInterpPipeline:
         Gets a batch of tokens where each sequence contains all tokens specified in target_tokens.
         """
         # Create a mask where each sequence that contains all target_tokens is True
-        contains_targets = torch.stack([all_tokens == target_token for target_token in target_tokens]).all(dim=0).any(dim=1)
+        contains_targets = torch.stack([self.all_tokens == target_token for target_token in target_tokens]).all(dim=0).any(dim=1)
         # Filter sequences that contain all target_tokens
-        filtered_sequences = all_tokens[contains_targets]
+        filtered_sequences = self.all_tokens[contains_targets]
         
         # Limit the number of sequences to target_count
         if target_count is not None and len(filtered_sequences) > target_count:
@@ -186,7 +256,7 @@ class MechInterpPipeline:
         tokens: torch.Tensor,        
     ):
         #we remove zeros
-        non_zero_activations, idxs, flatten_tokens = self.filter_non_zero(tokens, activations)
+        non_zero_activations, flatten_tokens = self.filter_non_zero_sequence(tokens, activations)
         sorted_idxs = torch.argsort(non_zero_activations, descending=True)
         sorted_activations = non_zero_activations[sorted_idxs]
         sorted_tokens = flatten_tokens[sorted_idxs]

@@ -1,6 +1,11 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
-import torch
+
+class ActivationExample(BaseModel):
+    text: str
+    token_id: int
+    activation: float
+    context: Optional[str] = None
 
 
 class RunMetaData(BaseModel):
