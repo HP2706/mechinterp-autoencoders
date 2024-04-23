@@ -43,7 +43,6 @@ class AutomatedInterpretability:
             ]
         )
 
-
     def predict_activation(
         self,
         examples : List[ActivationExample], 
