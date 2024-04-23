@@ -1,7 +1,7 @@
 from multiprocessing import context
 import tqdm
 import torch
-from typing import List, Tuple, Optional, Any
+from typing import List, Tuple, Optional, Any, Union
 from torch.nn import functional as F
 from transformer_lens import HookedTransformer, utils
 from datasets import load_dataset, Dataset
@@ -9,6 +9,10 @@ from autoencoder import AutoEncoder
 from pydantic import BaseModel, field_validator
 import plotly.express as px
 from datamodels import ActivationExample
+
+
+FullData = List[tuple[str, List[ActivationExample]]]
+OnlyActivations = List[ActivationExample]
 
 
 class PipelineConfig(BaseModel):
@@ -37,9 +41,38 @@ class MechInterpPipeline:
         self.model = model
         self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device).to(cfg.device)
         data : Dataset = load_dataset(dataset_name, split="train")# type: ignore
+        data = data.select(range(int(0.1*len(data))))
         tokenized_data = utils.tokenize_and_concatenate(data, model.tokenizer, max_length=128)
         self.all_tokens : torch.Tensor = tokenized_data["tokens"] # type: ignore
         self.cfg = cfg
+
+    def get_tokens(
+        self,
+        target_tokens: Optional[List[int]] = None, 
+        shuffle: bool = True,
+        batch_size: int = 100,
+        seq_len: int = 100,
+    ) -> torch.Tensor:
+        """
+        Gets a batch of tokens where each sequence contains all tokens specified in target_tokens.
+        """
+        if seq_len > self.all_tokens.shape[1]:
+            raise ValueError(f"Sequence length {seq_len} cannot be longer than the maximum sequence length in the dataset {self.all_tokens.shape[1]}")
+
+        if shuffle:
+            tokens = self.all_tokens[torch.randperm(len(self.all_tokens))[:self.cfg.batch_size]]
+        else:
+            tokens = self.all_tokens
+
+        # Create a mask where each sequence that contains all target_tokens is True
+        if target_tokens:
+            contains_targets = torch.stack([tokens == target_token for target_token in target_tokens]).all(dim=0).any(dim=1)
+            # Filter sequences that contain all target_tokens
+            tokens = tokens[contains_targets]
+        if len(tokens) > batch_size:
+            tokens = tokens[:batch_size, :seq_len]
+        
+        return tokens
 
     @torch.no_grad()
     def get_freqs(
@@ -69,21 +102,6 @@ class MechInterpPipeline:
         num_dead = (act_freq_scores==0).float().mean()
         print("Num dead", num_dead)
         return act_freq_scores.cpu()
-
-    def get_tokens(
-        self, 
-        batch_size : int, 
-        seq_len : int
-    ) -> torch.Tensor:
-        '''gets examples for individual feature with seq'''
-        tokens = self.all_tokens[torch.randperm(len(self.all_tokens))[:self.cfg.batch_size]]
-        max_seq_len = tokens.shape[1]
-        start_index = torch.randint(0, max_seq_len - seq_len + 1, (1,)).item()
-
-        # Slice the tokens to get a continuous chunk of length seq_len
-        tokens = tokens[:, start_index:start_index + seq_len]
-        tokens = tokens[:batch_size, :seq_len]
-        return tokens
 
     def tokens_to_str(
         self,
@@ -119,8 +137,9 @@ class MechInterpPipeline:
         context_window: int = 4, # on both sides of token from anthropic paper
         tokens: Optional[torch.Tensor] = None,
         threshold: float = 0.01,
-        entire_dataset: bool = False
-    ) -> List[tuple[str, List[ActivationExample]]]:
+        entire_dataset: bool = False,
+        with_entire_context: bool = False
+    ) -> Union[FullData, OnlyActivations]:
         '''gets the non zero activations for a feature index and the corresponding text
         Args:
             tokens: (batch_size, seq_len) or (seq_len)
@@ -145,22 +164,39 @@ class MechInterpPipeline:
                 for batch_idx in tqdm.tqdm(range(0, dataset_size, self.cfg.batch_size)):
                     batch_tokens = self.all_tokens[batch_idx:batch_idx + self.cfg.batch_size]
                     batch_activations = self.get_feature_acts(batch_tokens, feature_index)
-                    batch_interp.extend(self.process_activations(batch_tokens, batch_activations, threshold, context_window))
+                    batch_interp.extend(
+                        self.process_activations(
+                            batch_tokens, batch_activations, threshold, context_window, with_entire_context
+                        )
+                    )
             else:
-                tokens = self.get_batch_w_repeated_tokens([feature_index], self.cfg.batch_size)
+                tokens = self.get_tokens(
+                    target_tokens = [feature_index], 
+                    batch_size = self.cfg.batch_size
+                )
                 activations = self.get_feature_acts(tokens, feature_index)
-                batch_interp = self.process_activations(tokens, activations, threshold, context_window)
+                batch_interp = self.process_activations(
+                    tokens, activations, threshold, context_window, with_entire_context
+                )
         else:
             activations = self.get_feature_acts(tokens, feature_index)
-            batch_interp = self.process_activations(tokens, activations, threshold, context_window)
+            batch_interp = self.process_activations(
+                tokens, activations, threshold, context_window, with_entire_context
+            )
 
         return batch_interp
 
-    def process_activations(self, tokens, activations, threshold, context_window):
+    def process_activations(
+        self, 
+        tokens, 
+        activations, 
+        threshold, 
+        context_window,
+        with_entire_context: bool
+    ) -> Union[FullData, OnlyActivations]:
         batch_results = []
         for batch_idx in range(len(activations)):
             batch_tokens = tokens[batch_idx]
-            print("batch tokens shape", batch_tokens.shape)
             non_zero_acts, non_zero_tokens = self.filter_non_zero_sequence(
                 batch_tokens, activations[batch_idx], threshold
             ) #TODO fix the context problem, it doesnt produce 9 tokens each time.
@@ -200,9 +236,11 @@ class MechInterpPipeline:
                         context= ''.join(context)
                     )
                 )
-
-            text = self.tokens_to_str(tokens[batch_idx])  # we save the entire text
-            batch_results.append((text, token_activation_pairs))
+            if with_entire_context:
+                text = self.tokens_to_str(tokens[batch_idx])  # we save the entire text
+                batch_results.append((text, token_activation_pairs))
+            else:
+                batch_results.append(token_activation_pairs)
         return batch_results
 
 
@@ -229,26 +267,6 @@ class MechInterpPipeline:
             non_zero_activations = non_zero_activations[condition]
             non_zero_tokens = non_zero_tokens[condition]
         return non_zero_activations, non_zero_tokens
-
-
-    def get_batch_w_repeated_tokens(
-        self,
-        target_tokens: List[int], 
-        target_count: Optional[int] = None
-    ) -> torch.Tensor:
-        """
-        Gets a batch of tokens where each sequence contains all tokens specified in target_tokens.
-        """
-        # Create a mask where each sequence that contains all target_tokens is True
-        contains_targets = torch.stack([self.all_tokens == target_token for target_token in target_tokens]).all(dim=0).any(dim=1)
-        # Filter sequences that contain all target_tokens
-        filtered_sequences = self.all_tokens[contains_targets]
-        
-        # Limit the number of sequences to target_count
-        if target_count is not None and len(filtered_sequences) > target_count:
-            filtered_sequences = filtered_sequences[:target_count]
-        
-        return filtered_sequences
 
     def get_activating_tokens_sorted(
         self,
