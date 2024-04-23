@@ -1,12 +1,25 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional
 
+class PredictActivation(BaseModel):
+    value : float = Field(..., description="""the predicted activation for the feature or neuron""")
+
+class ActivationHypothesis(BaseModel):
+    hypothesis : str = Field(..., description="""
+        an hypothesis for what the feature or neuron is doing based on when the feature or neuron is active.
+        This hypothesis should be based on the examples you are given.
+    """)
+
+class PredictNextLogit(BaseModel):
+    is_next: bool = Field(..., description="""
+        based on earlier history, guess if the next token is the next token or not given the context
+    """) 
+
 class ActivationExample(BaseModel):
     text: str
     token_id: int
     activation: float
     context: Optional[str] = None
-
 
 class RunMetaData(BaseModel):
     n_epoch: int
@@ -22,9 +35,4 @@ class ActivationData(BaseModel):
 class ActivationMetaData(BaseModel):
     n_saved: int 
     last_idx: int 
-
-class InterpretabilityExample(BaseModel):
-    text: str
-    token_ids: List[int]
-    activations: Any
 

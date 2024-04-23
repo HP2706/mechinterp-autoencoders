@@ -1,28 +1,13 @@
 from instructor import Instructor, AsyncInstructor
-from pydantic import BaseModel, Field
 from typing import Any, AsyncGenerator, List, Optional, Type, TypeVar, Any, Coroutine, Literal
-
-class PredictActivation(BaseModel):
-    value : float = Field(..., description="""the predicted activation for the feature or neuron""")
-
-class ActivationExplanation(BaseModel):
-    explanation : str = Field(..., description="""
-        an explanation for what the feature or neuron is doing based on when the feature or neuron is active.
-        This explanation should be based on the examples you are given.
-    """)
-
-class PredictNextLogit(BaseModel):
-    is_next: bool = Field(..., description="""
-        based on earlier history, guess if the next token is likely to be the next token, 
-        given the context
-    """) 
-
+from datamodels import PredictActivation, ActivationHypothesis, PredictNextLogit, ActivationExample
+    
 async def explain_activation(
     client : AsyncInstructor,
     model : str, 
-    examples : str, 
+    examples : List[ActivationExample], 
     feature_or_neuron : Literal["feature", "neuron"]
- ) -> Coroutine[Any, Any, ActivationExplanation]:
+ ) -> Coroutine[Any, Any, ActivationHypothesis]:
     '''predicts an explanation based on earlier examples
     Args:
         client : AsyncInstructor, the client to use to predict activations
@@ -31,7 +16,7 @@ async def explain_activation(
         feature_or_neuron : Literal["feature", "neuron"], whether to predict a feature or neuron
     '''
     return client.chat.create(
-        response_model=ActivationExplanation,
+        response_model=ActivationHypothesis,
         model=model,
         messages=[
             {
@@ -51,18 +36,19 @@ async def explain_activation(
 
 
 async def predict_activation(
-        client : AsyncInstructor,
-        earlier_explanation : ActivationExplanation,
-        model : str, 
-        examples : str, 
-        feature_or_neuron : Literal["feature", "neuron"]
-    ) -> Coroutine[Any, Any, PredictActivation]:
+    client : AsyncInstructor,
+    model : str, 
+    examples : List[ActivationExample], 
+    hypothesis : ActivationHypothesis,
+    feature_or_neuron : Literal["feature", "neuron"]
+) -> Coroutine[Any, Any, PredictActivation]:
     '''predicts activations for either a feature or neuron based on 9 token examples
     Args:
         client : AsyncInstructor, the client to use to predict activations
         model : str, the model to predict activations for
         examples : str, 9 token examples to predict activations for
     '''
+    examples_stringified = '\n'.join(example.model_dump_json() for example in examples)
     return client.chat.create(
         response_model=PredictActivation,
         model=model,
@@ -72,10 +58,10 @@ async def predict_activation(
                 "content":f"""
                     You are a machine learning scientist.
                     You job is to predict the activation of a {feature_or_neuron}. 
-                    You previously came up with the following hypothesis for what the {feature_or_neuron} does:
-                    {earlier_explanation.explanation}
+                    You previously came up with the following hypothesis for when the {feature_or_neuron} is active:
+                    {hypothesis.hypothesis}
                     with this in mind, predict the activation caused by the following context:
-                    {examples}
+                    {examples_stringified}
                     return in the specified json format
                 """
             }
@@ -83,22 +69,34 @@ async def predict_activation(
     )
 
 async def predict_next_logit(
-        model : str, 
-        client : AsyncInstructor,
-        history : Any
-    ) -> Coroutine[Any, Any, PredictNextLogit]:
-    '''Using the explanations of features generated in the previous 
-        analysis, we ask a language model to predict if a previously 
-        unseen logit token is something the feature should predict as 
-        likely to come next'''
+    model : str, 
+    client : AsyncInstructor,
+    examples : List[ActivationExample],
+    hypothesis : ActivationHypothesis
+) -> Coroutine[Any, Any, PredictNextLogit]:
+    '''
+    Using the explanations of features generated in the previous 
+    analysis, we ask a language model to predict if a previously 
+    unseen logit token is something the feature should predict as 
+    likely to come next
+    '''
     
+    examples_stringified = '\n'.join(example.model_dump_json() for example in examples)
     return client.chat.create(
         response_model=PredictNextLogit,
         model=model,
         messages=[
             {
                 "role": "system", 
-                "content": "You are an expert at predicting the next logit token"
+                "content": f"""
+                    You are a machine learning scientist.
+                    You study the behaviour of features or neurons in an ml model.
+                    You have previously come up with the following hypothesis for 
+                    what the feature does {hypothesis.hypothesis}:
+                    Your job is to, given the following examples, predict whether the 
+                    Now you observe the following examples:
+                    {examples_stringified}
+                """
             },
             {   "role": "user", 
                 "content": "What is the next token likely to be?"

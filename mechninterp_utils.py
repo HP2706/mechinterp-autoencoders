@@ -1,6 +1,8 @@
 import torch
 from functools import partial
 from transformer_lens import utils
+from torchmetrics.regression import SpearmanCorrCoef
+from jaxtyping import Float
 
 def compute_proxy(proba_distb : torch.Tensor, feature_tokens : torch.Tensor): #NOT finished
     # shape of proba_distb is [batch, seq_len, vocab_size]
@@ -14,12 +16,10 @@ def compute_proxy(proba_distb : torch.Tensor, feature_tokens : torch.Tensor): #N
     p_feature_given_s = p_feature_given_s.prod(dim=-1)  # [batch, seq_len]
     return p_s, p_feature_given_s  # [batch, seq_len]
 
-""" 
-from torchmetrics.regression import SpearmanCorrCoef
 def torch_spearman_correlation(
-        predicted : Float[torch.Tensor, "batch token_activations"], 
-        actual : Float[torch.Tensor, "batch token_activations"]
-    ) -> Float[torch.Tensor, "batch"]:
+    predicted : Float[torch.Tensor, "batch token_activations"], 
+    actual : Float[torch.Tensor, "batch token_activations"]
+) -> Float[torch.Tensor, "batch"]:
     '''computes the spearman correlation between predicted and actual activations.
     From the antrhopic auto encoder paper
     Args:
@@ -28,7 +28,7 @@ def torch_spearman_correlation(
     '''
     spearman = SpearmanCorrCoef(num_outputs=actual.shape[1])
     return spearman(predicted, actual) 
-"""
+
 
 def replacement_hook(mlp_post : torch.Tensor, hook, encoder):
     mlp_post_reconstr = encoder(mlp_post)[1]

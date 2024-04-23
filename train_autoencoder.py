@@ -236,7 +236,6 @@ def train_autoencoder():
         dict_mult=4,
         seq_len=512,
         d_mlp=d_mlp,
-        remove_rare_dir=True,
         buffer_size=1000000,
         buffer_batches=25,
         device="cuda",
@@ -258,7 +257,7 @@ def train_autoencoder():
 
     model.to(model.cfg.device)
     optimizer = AdamW(model.parameters(), lr=1e-3)
-    for epoch in range(model.cfg.n_epochs):
+    for epoch in range(model.cfg.n_epochs): # type: ignore
         for train_file in [ file for file in os.listdir(f"{PATH}/{activations_name}") if "train" in file]:
             if not train_file.endswith(".parquet"):
                 continue
