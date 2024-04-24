@@ -210,7 +210,6 @@ class MechInterpPipeline:
                 dataset, activations, threshold, context_window, with_entire_context, remove_zeros
             )
 
-        print("batch_interp", batch_interp)
         df = pd.DataFrame([example.model_dump() for example in batch_interp])
         if sort:
             df.sort_values("activation", ascending=False, inplace=True)
@@ -234,7 +233,7 @@ class MechInterpPipeline:
                 ) #TODO fix the context problem, it doesnt produce 9 tokens each time.
                 if acts.numel() == 0:  # no non-zero activations, we skip
                     continue
-
+                
                 token_activation_pairs = []
                 texts : List[str] = self.model.tokenizer.batch_decode(tokens)
                 for idx, (token_str, act) in enumerate(zip(texts, acts.tolist())):
@@ -254,18 +253,17 @@ class MechInterpPipeline:
                     part2 = self.model.tokenizer.batch_decode(batch_tokens[idx:end])
                     context = ''.join(part1 + [f"|{token_str}|"] + part2)
 
-                    if remove_zeros:
-                        token_activation_pairs.append(
-                            ActivationExample(
-                                token=token_str, 
-                                token_id=idx, 
-                                activation=act,
-                                intermediate_context=context,
-                                whole_context=
-                                self.tokens_to_str(tokens[batch_idx])[0] 
-                                if with_entire_context else None
-                            )
+                    batch_results.append(
+                        ActivationExample(
+                            token=token_str, 
+                            token_id=idx, 
+                            activation=act,
+                            intermediate_context=context,
+                            whole_context=
+                            self.tokens_to_str(tokens[batch_idx])[0] 
+                            if with_entire_context else None
                         )
+                    )
             else:
                 acts : torch.Tensor = activations[batch_idx]
                 tokens : torch.Tensor = batch_tokens.clone()
