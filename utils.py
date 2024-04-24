@@ -36,6 +36,13 @@ def load_activations(df, batch_size)-> List[torch.Tensor]:
     assert len(df) == sum_batches, f"expected {len(elms)} should be equal to sum_batches: {sum_batches}"
     return elms
 
+def find_token_pos(
+    token : int, 
+    tokens : torch.Tensor
+) -> List[int]:
+    idxs = torch.nonzero(tokens == token).squeeze().tolist() 
+    return [idxs] if isinstance(idxs, int) else idxs
+
 
 def test_loss_fn():
     # Test the functions

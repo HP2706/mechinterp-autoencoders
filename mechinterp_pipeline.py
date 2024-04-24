@@ -1,5 +1,4 @@
 import os
-from re import I
 import tqdm
 import pandas as pd
 import torch
@@ -13,6 +12,7 @@ from pydantic import BaseModel, field_validator
 import plotly.express as px
 from datamodels import MultiTokenActivationExample, ActivationExample
 from automated_interpretability import AutomatedInterpretability
+from utils import find_token_pos
 import instructor
 from openai import OpenAI
 
@@ -234,7 +234,7 @@ class MechInterpPipeline:
         all_activations = torch.cat(all_activations, dim=0)
 
         batch_interp = self.process_activations(
-            all_tokens, all_activations, threshold, context_window, with_entire_context, remove_zeros=remove_zeros
+            all_tokens, all_activations, threshold, remove_zeros=remove_zeros
         )
 
         df = pd.DataFrame([example.model_dump() for example in batch_interp])
@@ -253,69 +253,58 @@ class MechInterpPipeline:
         dataset, 
         activations, 
         threshold, 
-        context_window,
-        with_entire_context: bool,
         remove_zeros: bool
     ) -> Union[List[ActivationExample], List[MultiTokenActivationExample]]:
         batch_results = []
 
         for batch_idx in tqdm.trange(len(activations)):
             batch_tokens = dataset[batch_idx]
+            batch_activations = activations[batch_idx]
             if remove_zeros:
-                acts, tokens = self.filter_non_zero_sequence(
-                    batch_tokens, activations[batch_idx], threshold
-                ) #TODO fix the context problem, it doesnt produce 9 tokens each time.
+                acts, zero_tokens = self.filter_non_zero_sequence(
+                    batch_tokens, batch_activations, threshold
+                ) 
                 if acts.numel() == 0:  # no non-zero activations, we skip
                     continue   
-                
-                texts : List[str] = self.model.tokenizer.batch_decode(tokens)
-                for idx, (token_str, act) in enumerate(zip(texts, acts.tolist())):
-                    start = max(0, idx - context_window)
-                    end = min(len(batch_tokens), idx + context_window + 1)
+            
+                for (token_id, act) in zip(zero_tokens.tolist(), acts.tolist()):
+                    idxs = find_token_pos(token_id, batch_tokens)
+                    # find the position in the original sequence where the token appears
                     
-                    if abs(idx - start) < context_window:
-                        diff = abs(idx - start)
-                        end += context_window - diff
-                    elif abs(idx - end) < context_window:
-                        diff = abs(idx - end)
-                        start -= context_window - diff
-                    
-                    start = max(0, start)
-                    end = min(len(batch_tokens), end)
-                    part1 = self.model.tokenizer.batch_decode(batch_tokens[start:idx])
-                    part2 = self.model.tokenizer.batch_decode(batch_tokens[idx:end])
-                    context = ''.join(part1 + [f"|{token_str}|"] + part2)
+                    print("idxs", idxs)
+                    context = ''
+                    start_idx = 0
+                    token_str = self.model.tokenizer.decode([token_id])
+                    for idx in idxs:
+                        chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:idx]))
+                        print("chunk", chunk)
+                        context += chunk + f'|{token_str}|'
+                        start_idx = idx + 1
+
+                    chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:])) # get the last chunk
+                    context += chunk
+
+                    print("context", context)
 
                     batch_results.append(
                         ActivationExample(
                             token=token_str, 
-                            token_id=idx, 
+                            token_id=token_id, 
+                            positions = idxs,
                             activation=act,
-                            intermediate_context=context,
-                            whole_context=
-                            self.tokens_to_str(tokens[batch_idx])[0] 
-                            if with_entire_context else None
+                            context=context,
                         )
                     )
             else:
-                acts : torch.Tensor = activations[batch_idx]
-                tokens : torch.Tensor = batch_tokens.clone()
-                
-                step_size = (context_window*2)+1
-                for i in range(0, len(tokens), step_size):
-                    text_tokens = self.model.tokenizer.batch_decode(tokens[i:i+step_size])
-                    if len(text_tokens) < step_size:
-                        continue # filter out the too short sequences
-                    batch_results.append(
-                        MultiTokenActivationExample(
-                            tokens=text_tokens, 
-                            token_ids=tokens[i:i+step_size].tolist(), 
-                            activations=acts[i:i+step_size].tolist(),
-                            whole_context=
-                            self.tokens_to_str(tokens)[0] 
-                            if with_entire_context else None
-                        )
+                text_tokens = self.model.tokenizer.batch_decode(batch_tokens)
+                batch_results.append(
+                    MultiTokenActivationExample(
+                        tokens=text_tokens, 
+                        token_ids=batch_tokens.tolist(), 
+                        activation=batch_activations.tolist(),
+                        context=''.join(self.tokens_to_str(batch_tokens))
                     )
+                )
         return batch_results
 
     def filter_non_zero_sequence(

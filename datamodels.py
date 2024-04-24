@@ -18,15 +18,17 @@ class PredictNextLogit(BaseModel):
 class ActivationExample(BaseModel):
     token: str
     token_id: int
+    positions : List[int] = Field(..., description="""
+        the positions in the text where the token appears, this can be multiple places
+    """)
     activation: float
-    intermediate_context: str
-    whole_context: Optional[str] = None
+    context: str
 
 class MultiTokenActivationExample(BaseModel):
     tokens: List[str]
     token_ids: List[int]
-    activations: List[float]
-    whole_context: Optional[str] = None
+    activation: List[float]
+    context: str
 
 class RunMetaData(BaseModel):
     n_epoch: int
