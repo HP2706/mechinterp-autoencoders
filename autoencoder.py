@@ -65,12 +65,15 @@ class AutoEncoder(nn.Module):
     def forward(self, x, method : str = 'with_loss')-> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
         x_cent = x - self.b_dec
         acts = F.relu(x_cent @ self.W_enc + self.b_enc)
+        if method == 'with_acts':
+            return acts
         x_reconstruct = acts @ self.W_dec + self.b_dec
         if method == 'with_loss':
             l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
             l1_loss = self.l1_coeff * (acts.float().abs().sum())
             loss = l2_loss + l1_loss
             return loss, x_reconstruct, acts, l2_loss, l1_loss
+  
         else:
             return x_reconstruct  
 

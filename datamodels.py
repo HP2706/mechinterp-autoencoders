@@ -12,14 +12,21 @@ class ActivationHypothesis(BaseModel):
 
 class PredictNextLogit(BaseModel):
     is_next: bool = Field(..., description="""
-        based on earlier history, guess if the next token is the next token or not given the context
+        based on earlier history, guess if the next token is the suggested token or not, given the context
     """) 
 
 class ActivationExample(BaseModel):
-    text: str
+    token: str
     token_id: int
     activation: float
-    context: Optional[str] = None
+    intermediate_context: str
+    whole_context: Optional[str] = None
+
+class MultiTokenActivationExample(BaseModel):
+    tokens: List[str]
+    token_ids: List[int]
+    activations: List[float]
+    whole_context: Optional[str] = None
 
 class RunMetaData(BaseModel):
     n_epoch: int
