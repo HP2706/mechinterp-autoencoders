@@ -43,6 +43,17 @@ def find_token_pos(
     idxs = torch.nonzero(tokens == token).squeeze().tolist() 
     return [idxs] if isinstance(idxs, int) else idxs
 
+def filter_zeros(
+    a : torch.Tensor, 
+    threshold : float = 1e-4
+):
+    '''filters across batch dimension'''
+    # Step 1: Identify batches where all elements are zero in the sequence dimension
+    zero_batches = torch.all(torch.abs(a) < threshold, dim=1)
+
+    # Step 2: Filter out batches that are entirely zero
+    filtered_a = a[~zero_batches]
+    return filtered_a
 
 def test_loss_fn():
     # Test the functions

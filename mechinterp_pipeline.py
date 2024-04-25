@@ -1,3 +1,4 @@
+from functools import partial
 import os
 import time
 import tqdm
@@ -14,9 +15,10 @@ from pydantic import BaseModel, field_validator
 import plotly.express as px
 from datamodels import MultiTokenActivationExample, ActivationExample, InterpretabilityData
 from automated_interpretability import AutomatedInterpretability
-from utils import find_token_pos
+from utils import find_token_pos, filter_zeros
 from mechninterp_utils import torch_spearman_correlation
 import instructor
+import multiprocessing as mp
 from openai import OpenAI
 torch.manual_seed(42)
 np.random.seed(42)
@@ -296,6 +298,13 @@ class MechInterpPipeline:
     ) -> Union[List[ActivationExample], List[MultiTokenActivationExample]]:
         batch_results = []
 
+        #we build a massive in memory lookup table
+        decoded_tokens = [self.model.tokenizer.decode([token_id]) for token_id in dataset.view(-1).unique().tolist()]
+        token_to_str_map = dict(zip(dataset.view(-1).unique().tolist(), decoded_tokens))
+
+        if remove_zeros:
+            activations = filter_zeros(activations, threshold) 
+
         for batch_idx in tqdm.trange(len(activations), desc="Processing activations"):
             batch_tokens = dataset[batch_idx]
             batch_activations = activations[batch_idx]
@@ -312,7 +321,7 @@ class MechInterpPipeline:
                     
                     context = ''
                     start_idx = 0
-                    token_str = self.model.tokenizer.decode([token_id]) # type: ignore
+                    token_str = token_to_str_map[token_id]
                     for idx in idxs:
                         chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:idx])) # type: ignore
                         context += chunk + f'|{token_str}|'
