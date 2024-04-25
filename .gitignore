@@ -4,3 +4,5 @@ test_local.py
 /SoLU_1L256W_C4_Width_Scan
 /wandb
 main.py
+*.parquet
+*.pyc

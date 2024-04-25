@@ -1,3 +1,4 @@
+from altair import Iterable
 from instructor import Instructor, AsyncInstructor
 from typing import Any, AsyncGenerator, List, Optional, Type, TypeVar, Any, Coroutine, Literal
 from datamodels import PredictActivation, ActivationHypothesis, PredictNextLogit, ActivationExample
@@ -14,7 +15,7 @@ class AutomatedInterpretability:
 
     def explain_activation(
         self,
-        examples : List[ActivationExample], 
+        examples : dict[str, List[ActivationExample]], 
         feature_or_neuron : Literal["feature", "neuron"] = "feature"
     ) -> ActivationHypothesis:
         '''predicts an explanation based on earlier examples
@@ -24,6 +25,11 @@ class AutomatedInterpretability:
             examples : List[ActivationExample], the examples of different activations, and the immediate context in which they appear
             feature_or_neuron : Literal["feature", "neuron"], whether to predict a feature or neuron
         '''
+
+        formatted_examples = '\n'.join(
+            f"{key} : {','.join(example.model_dump_json() for example in value)}" for key, value in examples.items()
+        )
+        
         return self.client.chat.create(
             response_model=ActivationHypothesis,
             model=self.model,
@@ -36,7 +42,7 @@ class AutomatedInterpretability:
                         of in what contexts the {feature_or_neuron} is active and to what degree.
                         You will base your answer on the following examples, where you will see the context, 
                         the token and the associated activation for that token:
-                        {examples}
+                        {formatted_examples}
                         return in the specified json format
                     """
                 }
@@ -45,35 +51,69 @@ class AutomatedInterpretability:
 
     def predict_activation(
         self,
-        examples : List[ActivationExample], 
+        unseen_examples : List[ActivationExample], 
         hypothesis : ActivationHypothesis,
         feature_or_neuron : Literal["feature", "neuron"] = "feature"
-    ) -> PredictActivation:
-        '''predicts activations for either a feature or neuron based on 9 token examples
+    ) -> List[PredictActivation]:
+        '''
+        from anthropic_paper:
+        
+        
+        predicts activations for either a feature or neuron based on 9 token unseen_examples
         Args:
             client : AsyncInstructor, the client to use to predict activations
             model : str, the model to predict activations for
-            examples : str, 9 token examples to predict activations for
+            unseen_examples : str, 9 token unseen_examples to predict activations for
+        Returns:
+            List[PredictActivation], the predicted activations for the unseen_examples
         '''
-        examples_stringified = '\n'.join(example.model_dump_json() for example in examples)
-        return self.client.chat.create(
-            response_model=PredictActivation,
-            model=self.model,
-            messages=[
-                {
-                    "role": "system", 
-                    "content":f"""
-                        You are a machine learning scientist.
-                        You job is to predict the activation of a {feature_or_neuron}. 
-                        You previously came up with the following hypothesis for when the {feature_or_neuron} is active:
-                        {hypothesis.hypothesis}
-                        with this in mind, predict the activation caused by the following context:
-                        {examples_stringified}
-                        return in the specified json format
-                    """
-                }
-            ]
+
+        unseen_examples_stringified = '\n'.join(
+            f"Token: {example.token}, Token ID: {example.token_id}, Positions: {example.positions}, Context: {example.context}"
+            for example in unseen_examples
         )
+        
+        n_tries = 2
+        err_msg : Optional[str] = None
+        while n_tries > 0:
+            try:
+                out =  self.client.chat.create(
+                    response_model=List[PredictActivation],
+                    validation_context={"data": unseen_examples},
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system", 
+                            "content":f"""
+                                You are a machine learning scientist.
+                                You job is to predict the activation of a {feature_or_neuron}. 
+                                You previously came up with the following hypothesis for when the {feature_or_neuron} is active:
+                                {hypothesis.hypothesis}
+                                with this in mind, predict the activation caused by the following context:
+                                {unseen_examples_stringified}
+                                return in the specified json format. 
+                                You need to predict the activation for each example. 
+                                Return as many predictions as there are examples. 
+                                {err_msg if err_msg else ""}
+                            """
+                        }
+                    ]
+                )
+                if len(out) != len(unseen_examples):
+                    raise ValueError(f"Expected {len(unseen_examples)} predictions, got {len(out)}")
+                return out
+            
+            except Exception as e:
+                n_tries -= 1
+                if n_tries == 0:
+                    raise ValueError(f"Failed to predict activations after 2 tries")
+                else:
+                    if err_msg:
+                        err_msg += f"\nError: {e}"
+                    else:
+                        err_msg = f"Error: {e}"
+                    continue
+        return []
 
     def predict_next_logit(
         self,

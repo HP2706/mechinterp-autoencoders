@@ -1,5 +1,14 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Literal
+
+class InterpretabilityData(BaseModel):
+    feature_or_neuron : Literal["feature", "neuron"]
+    index : int
+    llm_explanation : str
+    spearman_corr : float
+    actual_data : Optional[List[float]] = None
+    llm_predictions : Optional[List[float]] = None
+
 
 class PredictActivation(BaseModel):
     value : float = Field(..., description="""the predicted activation for the feature or neuron""")
@@ -16,6 +25,8 @@ class PredictNextLogit(BaseModel):
     """) 
 
 class ActivationExample(BaseModel):
+    neuron_or_feature: Literal["neuron", "feature"] = "feature"
+    index: int
     token: str
     token_id: int
     positions : List[int] = Field(..., description="""
@@ -25,6 +36,8 @@ class ActivationExample(BaseModel):
     context: str
 
 class MultiTokenActivationExample(BaseModel):
+    neuron_or_feature: Literal["neuron", "feature"] = "feature"
+    index: int
     tokens: List[str]
     token_ids: List[int]
     activation: List[float]

@@ -1,6 +1,8 @@
 import os
+import time
 import tqdm
 import pandas as pd
+import numpy as np
 import torch
 from jaxtyping import Float
 from typing import List, Tuple, Optional, Any, Union, Literal
@@ -10,11 +12,14 @@ from datasets import load_dataset, Dataset
 from autoencoder import AutoEncoder
 from pydantic import BaseModel, field_validator
 import plotly.express as px
-from datamodels import MultiTokenActivationExample, ActivationExample
+from datamodels import MultiTokenActivationExample, ActivationExample, InterpretabilityData
 from automated_interpretability import AutomatedInterpretability
 from utils import find_token_pos
+from mechninterp_utils import torch_spearman_correlation
 import instructor
 from openai import OpenAI
+torch.manual_seed(42)
+np.random.seed(42)
 
 class PipelineConfig(BaseModel):
     device: str
@@ -46,11 +51,18 @@ class MechInterpPipeline:
         model = HookedTransformer.from_pretrained(model_name, device=cfg.device).to(cfg.d_type)
         
         self.dataset_name = dataset_name
-        self.model = model
+        self.model = model 
         self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device).to(cfg.device)
-    
+        self.all_tokens = None
         self.cfg = cfg
         self.save_path = save_path
+        self.interp_save_path = os.path.join(save_path, "interpretability_data.parquet")
+        if os.path.exists(self.interp_save_path):
+            self.interp_df = pd.read_parquet(self.interp_save_path)
+        else:
+            self.interp_df = None
+
+
         os.makedirs(save_path, exist_ok=True)
 
     def get_dataset(
@@ -66,14 +78,16 @@ class MechInterpPipeline:
         We return None if no such sequence is found.
         """
 
-        self.data : Dataset = load_dataset(self.dataset_name, split=split)# type: ignore
+        if self.all_tokens is None:
+            self.data : Dataset = load_dataset(self.dataset_name, split=split)# type: ignore
+            tokenized_data = utils.tokenize_and_concatenate(self.data, self.model.tokenizer, max_length=sequence_len) # type: ignore
+            tokens : torch.Tensor = tokenized_data["tokens"] # type: ignore
+            self.all_tokens = tokens
 
         if shuffle:
-            self.data : Dataset = self.data.shuffle(seed=42) #type: ignore
-
-        tokenized_data = utils.tokenize_and_concatenate(self.data, self.model.tokenizer, max_length=sequence_len) # type: ignore
-        tokens : torch.Tensor = tokenized_data["tokens"] # type: ignore
-
+            tokens = self.all_tokens[torch.randperm(len(self.all_tokens))]
+        
+        tokens = self.all_tokens.clone()
         # Create a mask where each sequence that contains all target_tokens is True
         if target_tokens:
             contains_targets = torch.stack(
@@ -103,7 +117,7 @@ class MechInterpPipeline:
         total = 0
         for i in tqdm.trange(num_batches):
 
-            _, cache = self.model.run_with_cache(
+            _ , cache = self.model.run_with_cache(
                 tokens, stop_at_layer=1, names_filter=utils.get_act_name("post", 0)
             )
             mlp_acts = cache[utils.get_act_name("post", 0)]
@@ -141,6 +155,23 @@ class MechInterpPipeline:
         return feature_acts
     
     @torch.no_grad()
+    def get_single_neuron_acts(
+        self,
+        tokens : torch.Tensor,
+        neuron_index : int,
+    ) -> torch.Tensor:
+        '''gets the activation values for a specific neuron index(index of the hidden layer)'''
+
+        if tokens.device != self.cfg.device:
+            tokens = tokens.to(self.cfg.device)
+
+        _, cache = self.model.run_with_cache(tokens, stop_at_layer=1, names_filter=utils.get_act_name("post", 0))
+        mlp_acts = cache[utils.get_act_name("post", 0)]
+        neuron_acts = mlp_acts[:, :, neuron_index] # shape (batch, seq_len)
+        return neuron_acts.cpu()
+
+
+    @torch.no_grad()
     def get_single_feature_acts(
         self,     
         tokens : torch.Tensor, 
@@ -177,15 +208,18 @@ class MechInterpPipeline:
     @torch.no_grad()
     def create_acts_dataset(
         self, 
-        feature_index: int,
+        neuron_or_feature : Literal["neuron", "feature"],
+        index: int,
+        target_tokens : Optional[List[int]] = None,
         context_window: int = 4, # on both sides of token from anthropic paper
         dataset: Optional[torch.Tensor] = None,
         threshold: float = 0.01,
         entire_dataset: bool = False,
-        with_entire_context: bool = False,
-        sort: bool = False,
+        sort: bool = True,
         remove_zeros: bool = True,
-        save_dataset: bool = False
+        save_dataset: bool = True,
+        n_sequences: Optional[int] = None,
+        seq_len: int = 9
     ) -> Optional[pd.DataFrame]:
         '''gets the non zero activations for a feature index and the corresponding text
         Args:
@@ -204,52 +238,57 @@ class MechInterpPipeline:
         if dataset is None:
             if entire_dataset:
                 dataset = self.get_dataset(
-                    target_tokens = [feature_index], 
+                    target_tokens = target_tokens, 
                     n_sequences = None, # get all sequences
                     sequence_len = (context_window*2)+1 
                 ) 
             else:
                 dataset = self.get_dataset(
-                    target_tokens = [feature_index], 
-                    n_sequences = self.cfg.batch_size
+                    target_tokens = target_tokens, 
+                    n_sequences = n_sequences,
+                    sequence_len = seq_len
                 )
         
         if dataset is None: # if no sequences contain the target token
             return None
 
         dataset_size = len(dataset)
+        print(f"Dataset size: {dataset_size} features: {index}")
         all_tokens = []
         all_activations = []
         tuned_batch_size = self.tune_batch_size(dataset)
-        print("tuned batch size", tuned_batch_size)
-
-        for batch_idx in tqdm.tqdm(range(0, dataset_size, tuned_batch_size)):
+        for batch_idx in tqdm.tqdm(range(0, dataset_size, tuned_batch_size), desc="getting activations"):
             batch_tokens = dataset[batch_idx:min(batch_idx + tuned_batch_size, dataset_size)]
-            batch_activations = self.get_single_feature_acts(batch_tokens, feature_index)
+            if neuron_or_feature == "neuron":
+                batch_activations = self.get_single_neuron_acts(batch_tokens, index)
+            else:   
+                batch_activations = self.get_single_feature_acts(batch_tokens, index)
             all_tokens.append(batch_tokens)
             all_activations.append(batch_activations)
-
 
         all_tokens = torch.cat(all_tokens, dim=0)
         all_activations = torch.cat(all_activations, dim=0)
 
         batch_interp = self.process_activations(
-            all_tokens, all_activations, threshold, remove_zeros=remove_zeros
+            neuron_or_feature, index, all_tokens, all_activations, threshold, remove_zeros=remove_zeros
         )
 
         df = pd.DataFrame([example.model_dump() for example in batch_interp])
         if sort:
+            t0 = time.time()
             df.sort_values("activation", ascending=False, inplace=True)
-
+            print(f"Sorting took {time.time() - t0:.2f} seconds")
         if save_dataset:
             df.to_parquet(
-                f"{self.save_path}/acts_feauture_{feature_index}_from_dataset_size_{dataset_size}.parquet"
+                f"{self.save_path}/acts_{neuron_or_feature}_{index}_from_dataset_size_{dataset_size}.parquet"
             )
         
         return df
 
-    def process_activations(
+    def process_activations( #TODO this has to be more performant!!
         self, 
+        neuron_or_feature : Literal["neuron", "feature"],
+        index : int,
         dataset, 
         activations, 
         threshold, 
@@ -257,7 +296,7 @@ class MechInterpPipeline:
     ) -> Union[List[ActivationExample], List[MultiTokenActivationExample]]:
         batch_results = []
 
-        for batch_idx in tqdm.trange(len(activations)):
+        for batch_idx in tqdm.trange(len(activations), desc="Processing activations"):
             batch_tokens = dataset[batch_idx]
             batch_activations = activations[batch_idx]
             if remove_zeros:
@@ -271,23 +310,21 @@ class MechInterpPipeline:
                     idxs = find_token_pos(token_id, batch_tokens)
                     # find the position in the original sequence where the token appears
                     
-                    print("idxs", idxs)
                     context = ''
                     start_idx = 0
-                    token_str = self.model.tokenizer.decode([token_id])
+                    token_str = self.model.tokenizer.decode([token_id]) # type: ignore
                     for idx in idxs:
-                        chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:idx]))
-                        print("chunk", chunk)
+                        chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:idx])) # type: ignore
                         context += chunk + f'|{token_str}|'
                         start_idx = idx + 1
 
-                    chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:])) # get the last chunk
+                    chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:])) #type: ignore get the last chunk
                     context += chunk
-
-                    print("context", context)
 
                     batch_results.append(
                         ActivationExample(
+                            neuron_or_feature=neuron_or_feature,
+                            index=index,
                             token=token_str, 
                             token_id=token_id, 
                             positions = idxs,
@@ -299,6 +336,8 @@ class MechInterpPipeline:
                 text_tokens = self.model.tokenizer.batch_decode(batch_tokens)
                 batch_results.append(
                     MultiTokenActivationExample(
+                        neuron_or_feature=neuron_or_feature,
+                        index=index,
                         tokens=text_tokens, 
                         token_ids=batch_tokens.tolist(), 
                         activation=batch_activations.tolist(),
@@ -331,5 +370,94 @@ class MechInterpPipeline:
             non_zero_tokens = non_zero_tokens[condition]
         return non_zero_activations, non_zero_tokens
 
+    def build_and_interpret(self, indices : List[int], kwargs):
+        for idx in tqdm.tqdm(indices, desc="Creating Datasets"):
+            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
+            
     
+    def get_interpretability_correlation(
+        self, 
+        feature_or_neuron : Literal['feature', 'neuron'],
+        index : int,
+        total_examples : int = 60
+    ):
+        path_start = f'acts_{feature_or_neuron}_{index}_from'
+        paths = [
+            path for path in os.listdir('mechinterp_pipeline')
+            if path.endswith('.parquet') and path.startswith(path_start)
+        ] 
+        
+        if len(paths) == 0:
+            raise ValueError(f"No dataset found for {feature_or_neuron} {index}")
 
+
+        df = pd.read_parquet(os.path.join('mechinterp_pipeline', paths[0]))
+        #filter duplicates
+
+        if len(df) < 100:
+            raise ValueError(f"Dataset for {feature_or_neuron} {index} is too small, need at least 100 examples")
+    
+        df['interval'] = pd.qcut(df['activation'], q=12, labels=False)
+        
+        dataset = {}
+
+        #we get 2 random examples for each interval and 10 for the last one(the biggest)
+        selected_indices = []
+
+        for i in range(12):
+            quantile_indices = df[df['interval'] == i].index
+            sample_size = min(10 if i == 11 else 2, len(quantile_indices))
+            sampled_indices = df.loc[quantile_indices].sample(n=sample_size, random_state=42).index
+            dataset[f'quantile_{i}'] = [
+                ActivationExample(**row) for row in df.loc[sampled_indices].to_dict(orient='records')
+            ]
+            selected_indices.extend(sampled_indices.tolist())
+
+        # Now, select random samples from the indices that were not picked
+        remaining_indices = list(set(df.index) - set(selected_indices))
+        random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
+        dataset['random'] = [
+            ActivationExample(**row) for row in random_samples.to_dict(orient='records')
+        ]
+        feature_hypothesis = self.automated_interp_pipeline.explain_activation(dataset)
+        print("feature hypothesis", feature_hypothesis.hypothesis)
+        print("selected indices", len(selected_indices))
+        left_out = df.drop(selected_indices)
+        print("left out", len(left_out))
+        #get random 30 examples or the max number under 30
+        left_out = left_out.sample(n=min(total_examples, len(left_out)), random_state=42)
+
+
+        predictions = []
+        labels = []
+        examples_per_pred = 8
+
+        for i in tqdm.tqdm(range(0, len(left_out), examples_per_pred), desc="llm predicting activations"):
+            batch = left_out.iloc[i:i+examples_per_pred]
+            lst = [ActivationExample(**row.to_dict()) for _ , row in batch.iterrows()]
+            llm_predictions = self.automated_interp_pipeline.predict_activation(
+                unseen_examples=lst,
+                hypothesis=feature_hypothesis,
+                feature_or_neuron=feature_or_neuron,    
+            )
+            predictions.extend([prediction.value for prediction in llm_predictions])
+            labels.extend([actual.activation for actual in lst])
+
+        spearman_corr = torch_spearman_correlation(
+            torch.tensor(predictions, dtype=torch.float), torch.tensor(labels, dtype=torch.float)
+        ).item()
+        print("feature hypothesis", feature_hypothesis)
+        print("predictions", predictions)
+        print("labels", labels)
+        print("spearman_corr", spearman_corr)
+    
+        data = InterpretabilityData(
+            feature_or_neuron=feature_or_neuron, 
+            index=index, 
+            llm_explanation=feature_hypothesis.hypothesis, 
+            llm_predictions=predictions,
+            actual_data=labels,
+            spearman_corr=spearman_corr
+        )
+        self.interp_df = pd.concat([self.interp_df, pd.DataFrame([data.model_dump()])]) #type: ignore
+        self.interp_df.to_parquet(self.interp_save_path)

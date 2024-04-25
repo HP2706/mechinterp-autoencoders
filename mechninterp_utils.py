@@ -17,16 +17,16 @@ def compute_proxy(proba_distb : torch.Tensor, feature_tokens : torch.Tensor): #N
     return p_s, p_feature_given_s  # [batch, seq_len]
 
 def torch_spearman_correlation(
-    predicted : Float[torch.Tensor, "batch token_activations"], 
-    actual : Float[torch.Tensor, "batch token_activations"]
+    predicted : Float[torch.Tensor, "batch"], 
+    actual : Float[torch.Tensor, "batch"]
 ) -> Float[torch.Tensor, "batch"]:
     '''computes the spearman correlation between predicted and actual activations.
     From the antrhopic auto encoder paper
     Args:
-        predicted : torch.Tensor of shape [batch=60, token_activations=9] 
-        actual : torch.Tensor of shape [batch=60, token_activations=9]
+        predicted : torch.Tensor of shape [batch=60] 
+        actual : torch.Tensor of shape [batch=60]
     '''
-    spearman = SpearmanCorrCoef(num_outputs=actual.shape[1])
+    spearman = SpearmanCorrCoef()
     return spearman(predicted, actual) 
 
 
