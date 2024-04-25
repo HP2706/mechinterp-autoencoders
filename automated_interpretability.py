@@ -12,10 +12,9 @@ class AutomatedInterpretability:
         self.client = client
         self.model = model
         
-
     def explain_activation(
         self,
-        examples : dict[str, List[ActivationExample]], 
+        examples : dict[str, List[dict]], 
         feature_or_neuron : Literal["feature", "neuron"] = "feature"
     ) -> ActivationHypothesis:
         '''predicts an explanation based on earlier examples
@@ -25,9 +24,8 @@ class AutomatedInterpretability:
             examples : List[ActivationExample], the examples of different activations, and the immediate context in which they appear
             feature_or_neuron : Literal["feature", "neuron"], whether to predict a feature or neuron
         '''
-
         formatted_examples = '\n'.join(
-            f"{key} : {','.join(example.model_dump_json() for example in value)}" for key, value in examples.items()
+            f"{key} : {value}" for key, value in examples.items()
         )
         
         return self.client.chat.create(
@@ -36,7 +34,7 @@ class AutomatedInterpretability:
             messages=[
                 {
                     "role": "system", 
-                    "content":f"""
+                    "content": f"""
                         You are a machine learning scientist.
                         You job is to create an explanation of a {feature_or_neuron} based on emperical observations 
                         of in what contexts the {feature_or_neuron} is active and to what degree.
@@ -51,7 +49,7 @@ class AutomatedInterpretability:
 
     def predict_activation(
         self,
-        unseen_examples : List[ActivationExample], 
+        unseen_examples : List[dict], 
         hypothesis : ActivationHypothesis,
         feature_or_neuron : Literal["feature", "neuron"] = "feature"
     ) -> List[PredictActivation]:
@@ -68,10 +66,10 @@ class AutomatedInterpretability:
             List[PredictActivation], the predicted activations for the unseen_examples
         '''
 
-        unseen_examples_stringified = '\n'.join(
-            f"Token: {example.token}, Token ID: {example.token_id}, Positions: {example.positions}, Context: {example.context}"
-            for example in unseen_examples
+        formatted_examples = '\n'.join(
+            f"{elm}" for elm in unseen_examples
         )
+        print(formatted_examples)
         
         n_tries = 2
         err_msg : Optional[str] = None
@@ -89,8 +87,8 @@ class AutomatedInterpretability:
                                 You job is to predict the activation of a {feature_or_neuron}. 
                                 You previously came up with the following hypothesis for when the {feature_or_neuron} is active:
                                 {hypothesis.hypothesis}
-                                with this in mind, predict the activation caused by the following context:
-                                {unseen_examples_stringified}
+                                with this in mind, predict the quantized activation(an integer) caused by the following context:
+                                {formatted_examples}
                                 return in the specified json format. 
                                 You need to predict the activation for each example. 
                                 Return as many predictions as there are examples. 

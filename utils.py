@@ -1,7 +1,7 @@
 import torch
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, TypeVar, Union
 
 
 def get_model_memory_usage(numbers, dtype) -> float:
@@ -14,7 +14,6 @@ def lm_cross_entropy_loss(logits, tokens):
     log_probs = logits.log_softmax(dim=-1)
     pred_log_probs = log_probs[:, :-1].gather(dim=-1, index=tokens[:, 1:].unsqueeze(-1)).squeeze(-1)
     return -pred_log_probs.mean()
-
 
 def modified_lm_cross_entropy_loss(logits, tokens):
     loss_fn = CrossEntropyLoss()
@@ -65,6 +64,16 @@ def filter_non_zero_sequence(
         non_zero_activations = non_zero_activations[condition]
         non_zero_tokens = non_zero_tokens[condition]
     return non_zero_activations, non_zero_tokens
+
+T = TypeVar("T")
+
+def remove_keys(d : Dict[T, Any], key : Union[List[T], T]):
+    if isinstance(key, list):
+        for k in key:
+            d.pop(k, None)
+    else:
+        d.pop(key, None)
+    return d
 
 def filter_zeros(
     a : torch.Tensor, 

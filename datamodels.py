@@ -6,12 +6,14 @@ class InterpretabilityData(BaseModel):
     index : int
     llm_explanation : str
     spearman_corr : float
-    actual_data : Optional[List[float]] = None
-    llm_predictions : Optional[List[float]] = None
+    actual_data : Optional[List[int]] = Field(None, description="""quantized activations""")
+    llm_predictions : Optional[List[int]] = Field(None, description="""guess on the quantized activation""")
 
 
 class PredictActivation(BaseModel):
-    value : float = Field(..., description="""the predicted activation for the feature or neuron""")
+    value : int = Field(..., description="""
+        the predicted activation for the feature or neuron in the specified quantized range"""
+    )
 
 class ActivationHypothesis(BaseModel):
     hypothesis : str = Field(..., description="""
@@ -34,6 +36,8 @@ class ActivationExample(BaseModel):
     """)
     activation: float
     context: str
+
+
 
 class MultiTokenActivationExample(BaseModel):
     neuron_or_feature: Literal["neuron", "feature"] = "feature"

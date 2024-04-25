@@ -1,4 +1,4 @@
-from common import stub, PATH, vol, image
+""" from common import stub, PATH, vol, image
 from autoencoder import AutoEncoder, AutoencoderConfig
 from models import Transformer, TransformerConfig
 from train_autoencoder import create_activations_dataset, train_autoencoder
@@ -31,3 +31,43 @@ def main():
     #create_activations_dataset.remote()
     #checkdir.remote()
     train_autoencoder.remote()
+"""
+
+
+from mechinterp_pipeline import MechInterpPipeline, PipelineConfig
+
+import pandas as pd
+import torch
+import tqdm
+from typing import List
+cfg = PipelineConfig(device="mps", batch_size = 1024)
+print(cfg)
+
+pipeline = MechInterpPipeline(
+    model_name="gelu-1l",
+    encoder_name="run1",
+    dataset_name="NeelNanda/c4-code-20k",
+    cfg=cfg,    
+)
+#output = pipeline.create_acts_dataset('neuron', 10)
+#print(output)
+
+pipeline.get_interpretability_correlation('neuron', 10)
+
+"""
+if __name__ == "__main__":
+    #pipeline.get_dataset(n_sequences=None, sequence_len = 9) 
+    dataset = pipeline.get_dataset(n_sequences=None, sequence_len = 9)
+    rand_activations = torch.randn(size=dataset.shape)
+    print("rand acts shape", rand_activations.shape)
+    pipeline.parallel_process_activations(
+        neuron_or_feature='neuron',
+        index=10,
+        dataset=dataset, #type: ignore
+        activations=rand_activations,
+        threshold=0.01,
+        remove_zeros=True    
+    ) 
+"""
+
+
