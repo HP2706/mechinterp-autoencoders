@@ -69,7 +69,6 @@ class AutomatedInterpretability:
         formatted_examples = '\n'.join(
             f"{elm}" for elm in unseen_examples
         )
-        print(formatted_examples)
         
         n_tries = 2
         err_msg : Optional[str] = None

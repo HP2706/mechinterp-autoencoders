@@ -52,7 +52,9 @@ class MechInterpPipeline:
         self.automated_interp_pipeline = AutomatedInterpretability(
             instructor.from_openai(OpenAI()), model=interpretability_model_name
         )
-        model = HookedTransformer.from_pretrained(model_name, device=cfg.device).to(cfg.d_type)
+        model : HookedTransformer = HookedTransformer.from_pretrained(
+            model_name, device=cfg.device
+        ).to(cfg.d_type) #type: ignore
         
         self.dataset_name = dataset_name
         self.model = model 
@@ -292,8 +294,7 @@ class MechInterpPipeline:
 
     def build_and_interpret(self, indices : List[int], kwargs):
         for idx in tqdm.tqdm(indices, desc="Creating Datasets"):
-            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
-            
+            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)        
     
     def get_interpretability_correlation(
         self, 
@@ -351,30 +352,53 @@ class MechInterpPipeline:
             for row in random_samples.to_dict(orient='records')
         ]
         feature_hypothesis = self.automated_interp_pipeline.explain_activation(dataset)
-        left_out = df.drop(selected_indices)
+        df = df.drop(selected_indices) # remove the selected indices from the dataframe
 
 
-        #get random 30 examples or the max number under 30
-        left_out = left_out.sample(n=min(total_examples, len(left_out)), random_state=42)
+        #we get:
+        #top 6 activating examples
+        #2 for each 12 quantiles
+        #10 completely random
+        #IGNORE 20 top activating tokens out of context TODO what is meant here??
 
+        top_6 = df.sort_values("activation", ascending=False).head(6)
+        top_6_indices = top_6.index.tolist()
+
+        # Select 2 examples from each of the 12 quantiles
+        quantile_indices = []
+        num_quantiles = 12
+        quantile_size = 2
+        for q in range(num_quantiles):
+            quantile = df[df['quantized_activation'] == q]
+            if len(quantile) >= quantile_size:
+                sampled = quantile.sample(n=quantile_size, random_state=42)
+                quantile_indices.extend(sampled.index.tolist())
+
+        # Select 10 completely random examples, excluding already selected indices
+
+        available_df = df.drop(index=top_6_indices + quantile_indices)
+        random_samples = available_df.sample(n=10, random_state=42)
+
+        examples_df = pd.concat([top_6, df.loc[quantile_indices], random_samples])
+        labels : List[int] = [row['quantized_activation'] for row in examples_df.to_dict(orient='records')]
+        lst = [
+            remove_keys(row, ['activation', 'quantized_activation']) 
+            for row in examples_df.to_dict(orient='records')
+        ]
+
+        # pre
+        batch_size = 8
         
-        predictions = []
-        labels = []
-        examples_per_pred = 8
-
-        for i in tqdm.tqdm(range(0, len(left_out), examples_per_pred), desc="llm predicting activations"):
-            batch = left_out.iloc[i:i+examples_per_pred]
-            labels.extend([row['quantized_activation'] for row in batch.to_dict(orient='records')])
-            lst = [
-                remove_keys(row, ['activation', 'quantized_activation']) 
-                for row in batch.to_dict(orient='records')
-            ]
+        predictions : List[int] = []
+        for i in range(0, len(lst), batch_size):
+            batch = lst[i:i+batch_size] 
+          
             llm_predictions = self.automated_interp_pipeline.predict_activation(
-                unseen_examples=lst,
+                    unseen_examples=batch,
                 hypothesis=feature_hypothesis,
                 feature_or_neuron=feature_or_neuron,    
             )
-            predictions.extend([prediction.value for prediction in llm_predictions])
+            predictions.extend([pred.value for pred in llm_predictions])
 
         spearman_corr = torch_spearman_correlation(
             torch.tensor(predictions, dtype=torch.float), torch.tensor(labels, dtype=torch.float)
