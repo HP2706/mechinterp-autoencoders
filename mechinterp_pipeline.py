@@ -1,4 +1,5 @@
 from functools import partial
+from copy import deepcopy
 import os
 import time
 import tqdm
@@ -6,7 +7,7 @@ import pandas as pd
 import numpy as np
 import torch
 from jaxtyping import Float
-from typing import List, Tuple, Optional, Any, Union, Literal
+from typing import Callable, List, Tuple, Optional, Any, Union, Literal, Dict
 from torch.nn import functional as F
 from transformer_lens import HookedTransformer, utils
 from datasets import load_dataset, Dataset
@@ -15,7 +16,7 @@ from pydantic import BaseModel, field_validator
 import plotly.express as px
 from datamodels import MultiTokenActivationExample, ActivationExample, InterpretabilityData
 from automated_interpretability import AutomatedInterpretability
-from utils import find_token_pos, filter_zeros
+from utils import find_token_pos, filter_zeros, filter_non_zero_sequence
 from mechninterp_utils import torch_spearman_correlation
 import instructor
 import multiprocessing as mp
@@ -54,6 +55,7 @@ class MechInterpPipeline:
         
         self.dataset_name = dataset_name
         self.model = model 
+        self.tokenizer = deepcopy(model.tokenizer)
         self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device).to(cfg.device)
         self.all_tokens = None
         self.cfg = cfg
@@ -82,7 +84,7 @@ class MechInterpPipeline:
 
         if self.all_tokens is None:
             self.data : Dataset = load_dataset(self.dataset_name, split=split)# type: ignore
-            tokenized_data = utils.tokenize_and_concatenate(self.data, self.model.tokenizer, max_length=sequence_len) # type: ignore
+            tokenized_data = utils.tokenize_and_concatenate(self.data, self.tokenizer, max_length=sequence_len) # type: ignore
             tokens : torch.Tensor = tokenized_data["tokens"] # type: ignore
             self.all_tokens = tokens
 
@@ -271,7 +273,7 @@ class MechInterpPipeline:
         all_tokens = torch.cat(all_tokens, dim=0)
         all_activations = torch.cat(all_activations, dim=0)
 
-        batch_interp = self.process_activations(
+        batch_interp = self.parallel_process_activations(
             neuron_or_feature, index, all_tokens, all_activations, threshold, remove_zeros=remove_zeros
         )
 
@@ -287,7 +289,9 @@ class MechInterpPipeline:
         
         return df
 
-    def process_activations( #TODO this has to be more performant!!
+
+
+    def process_activations( 
         self, 
         neuron_or_feature : Literal["neuron", "feature"],
         index : int,
@@ -299,7 +303,7 @@ class MechInterpPipeline:
         batch_results = []
 
         #we build a massive in memory lookup table
-        decoded_tokens = [self.model.tokenizer.decode([token_id]) for token_id in dataset.view(-1).unique().tolist()]
+        decoded_tokens = [self.tokenizer.decode([token_id]) for token_id in dataset.view(-1).unique().tolist()]
         token_to_str_map = dict(zip(dataset.view(-1).unique().tolist(), decoded_tokens))
 
         if remove_zeros:
@@ -309,7 +313,7 @@ class MechInterpPipeline:
             batch_tokens = dataset[batch_idx]
             batch_activations = activations[batch_idx]
             if remove_zeros:
-                acts, zero_tokens = self.filter_non_zero_sequence(
+                acts, zero_tokens = filter_non_zero_sequence(
                     batch_tokens, batch_activations, threshold
                 ) 
                 if acts.numel() == 0:  # no non-zero activations, we skip
@@ -323,11 +327,11 @@ class MechInterpPipeline:
                     start_idx = 0
                     token_str = token_to_str_map[token_id]
                     for idx in idxs:
-                        chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:idx])) # type: ignore
+                        chunk = ''.join(self.tokenizer.batch_decode(batch_tokens[start_idx:idx])) # type: ignore
                         context += chunk + f'|{token_str}|'
                         start_idx = idx + 1
 
-                    chunk = ''.join(self.model.tokenizer.batch_decode(batch_tokens[start_idx:])) #type: ignore get the last chunk
+                    chunk = ''.join(self.tokenizer.batch_decode(batch_tokens[start_idx:])) #type: ignore get the last chunk
                     context += chunk
 
                     batch_results.append(
@@ -342,7 +346,7 @@ class MechInterpPipeline:
                         )
                     )
             else:
-                text_tokens = self.model.tokenizer.batch_decode(batch_tokens)
+                text_tokens = self.tokenizer.batch_decode(batch_tokens)
                 batch_results.append(
                     MultiTokenActivationExample(
                         neuron_or_feature=neuron_or_feature,
@@ -354,30 +358,6 @@ class MechInterpPipeline:
                     )
                 )
         return batch_results
-
-    def filter_non_zero_sequence(
-        self,
-        tokens : torch.Tensor,
-        activations: torch.Tensor,
-        threshold : Optional[float] = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        '''filters out the non-zero activations
-        activations shape is (batch_size, seq_len) or (seq_len)
-        Args:
-            tokens: (batch_size, seq_len) or (seq_len)
-            activations: (batch_size, seq_len) or (seq_len)
-        Returns:
-            non_zero_activations : (n_non_zero_activations)
-            non_zero_tokens : (n_non_zero_activations)
-        '''
-        non_zero_indices = torch.nonzero(activations, as_tuple=True)
-        non_zero_activations = activations[non_zero_indices]
-        non_zero_tokens = tokens[non_zero_indices]
-        if threshold is not None:
-            condition = non_zero_activations > threshold
-            non_zero_activations = non_zero_activations[condition]
-            non_zero_tokens = non_zero_tokens[condition]
-        return non_zero_activations, non_zero_tokens
 
     def build_and_interpret(self, indices : List[int], kwargs):
         for idx in tqdm.tqdm(indices, desc="Creating Datasets"):
@@ -401,6 +381,7 @@ class MechInterpPipeline:
 
 
         df = pd.read_parquet(os.path.join('mechinterp_pipeline', paths[0]))
+
         #filter duplicates
 
         if len(df) < 100:
@@ -418,7 +399,7 @@ class MechInterpPipeline:
             sample_size = min(10 if i == 11 else 2, len(quantile_indices))
             sampled_indices = df.loc[quantile_indices].sample(n=sample_size, random_state=42).index
             dataset[f'quantile_{i}'] = [
-                ActivationExample(**row) for row in df.loc[sampled_indices].to_dict(orient='records')
+                ActivationExample(**row) for row in df.loc[sampled_indices].to_dict(orient='records') #type: ignore
             ]
             selected_indices.extend(sampled_indices.tolist())
 
@@ -426,13 +407,12 @@ class MechInterpPipeline:
         remaining_indices = list(set(df.index) - set(selected_indices))
         random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
         dataset['random'] = [
-            ActivationExample(**row) for row in random_samples.to_dict(orient='records')
+            ActivationExample(**row) for row in random_samples.to_dict(orient='records') #type: ignore
         ]
         feature_hypothesis = self.automated_interp_pipeline.explain_activation(dataset)
-        print("feature hypothesis", feature_hypothesis.hypothesis)
-        print("selected indices", len(selected_indices))
         left_out = df.drop(selected_indices)
-        print("left out", len(left_out))
+
+
         #get random 30 examples or the max number under 30
         left_out = left_out.sample(n=min(total_examples, len(left_out)), random_state=42)
 
@@ -455,10 +435,6 @@ class MechInterpPipeline:
         spearman_corr = torch_spearman_correlation(
             torch.tensor(predictions, dtype=torch.float), torch.tensor(labels, dtype=torch.float)
         ).item()
-        print("feature hypothesis", feature_hypothesis)
-        print("predictions", predictions)
-        print("labels", labels)
-        print("spearman_corr", spearman_corr)
     
         data = InterpretabilityData(
             feature_or_neuron=feature_or_neuron, 
@@ -470,3 +446,116 @@ class MechInterpPipeline:
         )
         self.interp_df = pd.concat([self.interp_df, pd.DataFrame([data.model_dump()])]) #type: ignore
         self.interp_df.to_parquet(self.interp_save_path)
+
+    def parallel_process_activations(
+        self, 
+        neuron_or_feature: Literal["neuron", "feature"],
+        index: int,
+        dataset: torch.Tensor, 
+        activations: torch.Tensor, 
+        threshold: float, 
+        remove_zeros: bool
+    ) -> List[Any]:
+        
+        n_processes = min(os.cpu_count(), 8)  #type: ignore
+        batch_size = len(dataset) // n_processes  # Define batch size based on number of processes
+        print(f"Batch size: {batch_size}")
+
+        tokenizer_copy = deepcopy(self.tokenizer) 
+        with mp.Pool(processes=n_processes) as pool:
+            results = pool.starmap(
+                process_batch,
+                tqdm.tqdm(
+                    [
+                        (
+                            neuron_or_feature, 
+                            index, 
+                            dataset[i:i + batch_size], 
+                            activations[i:i + batch_size], 
+                            threshold, 
+                            remove_zeros,
+                            filter_non_zero_sequence,
+                            tokenizer_copy,
+                        )
+                        for i in range(0, len(dataset), batch_size)
+                    ],
+                    desc="Processing batches"
+                )
+            )
+
+        batch_results = []
+        for sublist in results:
+            batch_results.extend(sublist)
+
+        return batch_results
+
+
+def process_batch(
+    neuron_or_feature: Literal["neuron", "feature"],
+    index: int, 
+    dataset: torch.Tensor, 
+    activations: torch.Tensor, 
+    threshold: float, 
+    remove_zeros: bool,
+    filter_non_zero_sequence : Callable[
+        [torch.Tensor, torch.Tensor, Optional[float]], tuple[torch.Tensor, torch.Tensor]
+    ], 
+    tokenizer : Any,
+) -> List[Any]:
+    assert len(dataset) == len(activations), f"expected dataset and activations to have the same length, got {len(dataset)} and {len(activations)}"
+    decoded_tokens = [tokenizer.decode([token_id]) for token_id in dataset.view(-1).unique().tolist()] #type: ignore
+    token_to_str_map = dict(zip(dataset.view(-1).unique().tolist(), decoded_tokens))
+
+    if remove_zeros:
+        activations = filter_zeros(activations, threshold) 
+
+    batch_results = []
+    for batch_idx in tqdm.trange(len(activations), desc="Processing activations"):
+        batch_tokens = dataset[batch_idx]
+        batch_activations = activations[batch_idx]
+        if remove_zeros:
+            acts, zero_tokens = filter_non_zero_sequence(
+                batch_tokens, batch_activations, threshold
+            ) 
+            if acts.numel() == 0:  # no non-zero activations, we skip
+                continue   
+        
+            for (token_id, act) in zip(zero_tokens.tolist(), acts.tolist()):
+                idxs = find_token_pos(token_id, batch_tokens)
+                # find the position in the original sequence where the token appears
+                
+                context = ''
+                start_idx = 0
+                token_str = token_to_str_map[token_id]
+                for idx in idxs:
+                    chunk = ''.join(tokenizer.batch_decode(batch_tokens[start_idx:idx])) # type: ignore
+                    context += chunk + f'|{token_str}|'
+                    start_idx = idx + 1
+
+                chunk = ''.join(tokenizer.batch_decode(batch_tokens[start_idx:])) #type: ignore get the last chunk
+                context += chunk
+
+                batch_results.append(
+                    ActivationExample(
+                        neuron_or_feature=neuron_or_feature,
+                        index=index,
+                        token=token_str, 
+                        token_id=token_id, 
+                        positions = idxs,
+                        activation=act,
+                        context=context,
+                    )
+                )
+        else:
+            text_tokens = tokenizer.batch_decode(batch_tokens)
+            batch_results.append(
+                MultiTokenActivationExample(
+                    neuron_or_feature=neuron_or_feature,
+                    index=index,
+                    tokens=text_tokens, 
+                    token_ids=batch_tokens.tolist(), 
+                    activation=batch_activations.tolist(),
+                    context=''.join(tokenizer.batch_decode(batch_tokens))
+                )
+            )
+    return batch_results

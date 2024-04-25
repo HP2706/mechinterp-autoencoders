@@ -1,7 +1,7 @@
 import torch
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from typing import List
+from typing import List, Optional
 
 
 def get_model_memory_usage(numbers, dtype) -> float:
@@ -42,6 +42,29 @@ def find_token_pos(
 ) -> List[int]:
     idxs = torch.nonzero(tokens == token).squeeze().tolist() 
     return [idxs] if isinstance(idxs, int) else idxs
+
+def filter_non_zero_sequence(   
+    tokens : torch.Tensor,
+    activations: torch.Tensor,
+    threshold : Optional[float] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    '''filters out the non-zero activations
+    activations shape is (batch_size, seq_len) or (seq_len)
+    Args:
+        tokens: (batch_size, seq_len) or (seq_len)
+        activations: (batch_size, seq_len) or (seq_len)
+    Returns:
+        non_zero_activations : (n_non_zero_activations)
+        non_zero_tokens : (n_non_zero_activations)
+    '''
+    non_zero_indices = torch.nonzero(activations, as_tuple=True)
+    non_zero_activations = activations[non_zero_indices]
+    non_zero_tokens = tokens[non_zero_indices]
+    if threshold is not None:
+        condition = non_zero_activations > threshold
+        non_zero_activations = non_zero_activations[condition]
+        non_zero_tokens = non_zero_tokens[condition]
+    return non_zero_activations, non_zero_tokens
 
 def filter_zeros(
     a : torch.Tensor, 
