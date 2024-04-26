@@ -2,6 +2,9 @@ import torch
 from torch.nn import CrossEntropyLoss
 import numpy as np
 from typing import List, Optional, Dict, Any, TypeVar, Union
+from pydantic import BaseModel
+import json
+from typing import Type
 
 
 def get_model_memory_usage(numbers, dtype) -> float:
@@ -74,6 +77,30 @@ def remove_keys(d : Dict[T, Any], key : Union[List[T], T]):
     else:
         d.pop(key, None)
     return d
+
+
+C = TypeVar("C", bound=BaseModel)
+
+def convert_to_pydantic_model(target : Type[C], data : dict) -> C:
+    '''converts a dictionary to a pydantic model, removes the keys that are not in the model already'''
+    model_keys = target.model_fields.keys()
+    filtered_data = {k: v for k, v in data.items() if k in model_keys}
+    return target(**filtered_data)
+
+B = TypeVar('B', bound=BaseModel)
+
+def write_models_to_json(models: List[B], filename: str) -> None:
+    '''Writes a list of BaseModel derived objects to a JSON file.'''
+    with open(filename, 'w') as file:
+        json_data = [model.model_dump() for model in models]
+        json.dump(json_data, file, indent=4)
+
+def load_models_from_json(model_class: Type[B], filename: str) -> List[B]:
+    '''Loads a list of BaseModel derived objects from a JSON file.'''
+    with open(filename, 'r') as file:
+        json_data = json.load(file)
+        models = [model_class(**data) for data in json_data]
+    return models
 
 def filter_zeros(
     a : torch.Tensor, 

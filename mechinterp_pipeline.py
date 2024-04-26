@@ -1,22 +1,35 @@
-from functools import partial
 from copy import deepcopy
+import json
 import os
 import time
 import tqdm
 import pandas as pd
 import numpy as np
 import torch
-from jaxtyping import Float
 from typing import Callable, List, Tuple, Optional, Any, Union, Literal, Dict
 from torch.nn import functional as F
 from transformer_lens import HookedTransformer, utils
 from datasets import load_dataset, Dataset
 from autoencoder import AutoEncoder
-from pydantic import BaseModel, field_validator
-import plotly.express as px
-from datamodels import MultiTokenActivationExample, ActivationExample, InterpretabilityData
+from pydantic import BaseModel
+from datamodels import (
+    ActivationHypothesis,
+    MultiTokenActivationExample, 
+    ActivationExample, 
+    InterpretabilityData, 
+    FeatureDescription, 
+    FeatureSample
+)
 from automated_interpretability import AutomatedInterpretability
-from utils import find_token_pos, filter_zeros, filter_non_zero_sequence, remove_keys
+from utils import (
+    find_token_pos, 
+    filter_zeros, 
+    filter_non_zero_sequence, 
+    convert_to_pydantic_model,
+    remove_keys, 
+    write_models_to_json, 
+    load_models_from_json
+)
 from mechninterp_utils import torch_spearman_correlation
 import instructor
 import multiprocessing as mp
@@ -27,16 +40,13 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 class PipelineConfig(BaseModel):
     device: str
-    d_type: Any = torch.float32
+    d_type: torch.dtype = torch.float32
     batch_size: int = 512
     seq_len: int = 128
 
-    @field_validator('d_type')
-    @classmethod
-    def check_d_type(cls, v):
-        if v not in [torch.float32, torch.float16]:
-            raise ValueError("d_type must be 'fp32' or 'fp16'")
-        return v
+    class Config:
+        arbitrary_types_allowed = True
+
 
 class MechInterpPipeline:
     def __init__(
@@ -63,12 +73,19 @@ class MechInterpPipeline:
         self.all_tokens = None
         self.cfg = cfg
         self.save_path = save_path
+        
+        #TODO is this a smart design decision?
         self.interp_save_path = os.path.join(save_path, "interpretability_data.parquet")
         if os.path.exists(self.interp_save_path):
             self.interp_df = pd.read_parquet(self.interp_save_path)
         else:
             self.interp_df = None
 
+        self.feature_df_save_path = os.path.join(save_path, "features.json")
+        if os.path.exists(self.feature_df_save_path):
+            self.feature_data : List[FeatureDescription] = load_models_from_json(FeatureDescription, self.feature_df_save_path)
+        else:
+            self.feature_data = [] 
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -215,7 +232,7 @@ class MechInterpPipeline:
     @torch.no_grad()
     def create_acts_dataset(
         self, 
-        neuron_or_feature : Literal["neuron", "feature"],
+        feature_or_neuron : Literal["neuron", "feature"],
         index: int,
         target_tokens : Optional[List[int]] = None,
         context_window: int = 4, # on both sides of token from anthropic paper
@@ -266,7 +283,7 @@ class MechInterpPipeline:
         tuned_batch_size = self.tune_batch_size(dataset)
         for batch_idx in tqdm.tqdm(range(0, dataset_size, tuned_batch_size), desc="getting activations"):
             batch_tokens = dataset[batch_idx:min(batch_idx + tuned_batch_size, dataset_size)]
-            if neuron_or_feature == "neuron":
+            if feature_or_neuron == "neuron":
                 batch_activations = self.get_single_neuron_acts(batch_tokens, index)
             else:   
                 batch_activations = self.get_single_feature_acts(batch_tokens, index)
@@ -277,7 +294,7 @@ class MechInterpPipeline:
         all_activations = torch.cat(all_activations, dim=0)
 
         batch_interp = self.parallel_process_activations(
-            neuron_or_feature, index, all_tokens, all_activations, threshold, remove_zeros=remove_zeros
+            feature_or_neuron, index, all_tokens, all_activations, threshold, remove_zeros=remove_zeros
         )
 
         df = pd.DataFrame([example.model_dump() for example in batch_interp])
@@ -287,20 +304,22 @@ class MechInterpPipeline:
             print(f"Sorting took {time.time() - t0:.2f} seconds")
         if save_dataset:
             df.to_parquet(
-                f"{self.save_path}/acts_{neuron_or_feature}_{index}_from_dataset_size_{dataset_size}.parquet"
+                f"{self.save_path}/acts_{feature_or_neuron}_{index}_from_dataset_size_{dataset_size}.parquet"
             )
         
         return df
 
     def build_and_interpret(self, indices : List[int], kwargs):
         for idx in tqdm.tqdm(indices, desc="Creating Datasets"):
-            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)        
+            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
+            neuron_feature = kwargs.get('feature_or_neuron')
+            #we interpret the data
+            self.get_interpretability_correlation(feature_or_neuron= neuron_feature, index=idx)   
     
     def get_interpretability_correlation(
         self, 
         feature_or_neuron : Literal['feature', 'neuron'],
         index : int,
-        total_examples : int = 60
     ):
         path_start = f'acts_{feature_or_neuron}_{index}_from'
         paths = [
@@ -327,6 +346,10 @@ class MechInterpPipeline:
         bins = np.linspace(min_activation, max_activation, num_bins + 1)
         bin_labels = np.arange(num_bins)  # Labels for each bin
 
+
+        if 'context' in df.columns: #THIS IS A HACK
+            df.rename(columns={'context': 'text'}, inplace=True)
+
         # Use pd.cut to bin the data
         df['quantized_activation'] = pd.cut(df['activation'], bins=bins, labels=bin_labels, include_lowest=True) # type: ignore
         dataset = {}
@@ -352,8 +375,22 @@ class MechInterpPipeline:
             for row in random_samples.to_dict(orient='records')
         ]
         feature_hypothesis = self.automated_interp_pipeline.explain_activation(dataset)
-        df = df.drop(selected_indices) # remove the selected indices from the dataframe
 
+        feature_description = FeatureDescription(
+            **feature_hypothesis.model_dump(),
+            feature_or_neuron=feature_or_neuron,
+            index=index,
+            high_act_samples=[
+                convert_to_pydantic_model(FeatureSample, row) 
+                for row in df.sort_values("activation", ascending=False).head(5).to_dict(orient='records')
+            ],
+            low_act_samples=[
+                convert_to_pydantic_model(FeatureSample, row) 
+                for row in df.sort_values("activation", ascending=False).tail(5).to_dict(orient='records')
+            ],
+        )
+        self.feature_data.append(feature_description)
+        df = df.drop(selected_indices) # remove the selected indices from the dataframe
 
         #we get:
         #top 6 activating examples
@@ -383,6 +420,7 @@ class MechInterpPipeline:
         labels : List[int] = [row['quantized_activation'] for row in examples_df.to_dict(orient='records')]
         lst = [
             remove_keys(row, ['activation', 'quantized_activation']) 
+            # removes the keys from the row(these are hidden from the model so it doesnt use them in its prediction)
             for row in examples_df.to_dict(orient='records')
         ]
 
@@ -415,9 +453,11 @@ class MechInterpPipeline:
         self.interp_df = pd.concat([self.interp_df, pd.DataFrame([data.model_dump()])]) #type: ignore
         self.interp_df.to_parquet(self.interp_save_path)
 
+        write_models_to_json(self.feature_data, self.feature_df_save_path)
+
     def parallel_process_activations(
         self, 
-        neuron_or_feature: Literal["neuron", "feature"],
+        feature_or_neuron: Literal["neuron", "feature"],
         index: int,
         dataset: torch.Tensor, 
         activations: torch.Tensor, 
@@ -425,7 +465,7 @@ class MechInterpPipeline:
         remove_zeros: bool
     ) -> List[Any]:
         
-        n_processes = min(os.cpu_count(), 8)  #type: ignore
+        n_processes = min(os.cpu_count(), 6)  #type: ignore
         batch_size = len(dataset) // n_processes  # Define batch size based on number of processes
         print(f"Batch size: {batch_size}")
 
@@ -436,7 +476,7 @@ class MechInterpPipeline:
                 tqdm.tqdm(
                     [
                         (
-                            neuron_or_feature, 
+                            feature_or_neuron, 
                             index, 
                             dataset[i:i + batch_size], 
                             activations[i:i + batch_size], 
@@ -459,7 +499,7 @@ class MechInterpPipeline:
 
 
 def process_batch(
-    neuron_or_feature: Literal["neuron", "feature"],
+    feature_or_neuron: Literal["neuron", "feature"],
     index: int, 
     dataset: torch.Tensor, 
     activations: torch.Tensor, 
@@ -505,25 +545,25 @@ def process_batch(
 
                 batch_results.append(
                     ActivationExample(
-                        neuron_or_feature=neuron_or_feature,
+                        feature_or_neuron=feature_or_neuron,
                         index=index,
                         token=token_str, 
                         token_id=token_id, 
                         positions = idxs,
                         activation=act,
-                        context=context,
+                        text=context,
                     )
                 )
         else:
             text_tokens = tokenizer.batch_decode(batch_tokens)
             batch_results.append(
                 MultiTokenActivationExample(
-                    neuron_or_feature=neuron_or_feature,
+                    feature_or_neuron=feature_or_neuron,
                     index=index,
                     tokens=text_tokens, 
                     token_ids=batch_tokens.tolist(), 
                     activation=batch_activations.tolist(),
-                    context=''.join(tokenizer.batch_decode(batch_tokens))
+                    text=''.join(tokenizer.batch_decode(batch_tokens))
                 )
             )
     return batch_results

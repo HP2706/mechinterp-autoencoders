@@ -39,35 +39,31 @@ from mechinterp_pipeline import MechInterpPipeline, PipelineConfig
 import pandas as pd
 import torch
 import tqdm
-from typing import List
-cfg = PipelineConfig(device="mps", batch_size = 1024)
-print(cfg)
 
-pipeline = MechInterpPipeline(
-    model_name="gelu-1l",
-    encoder_name="run1",
-    dataset_name="NeelNanda/c4-code-20k",
-    cfg=cfg,    
-)
-#output = pipeline.create_acts_dataset('neuron', 10)
-#print(output)
 
-pipeline.get_interpretability_correlation('neuron', 10)
-
-"""
 if __name__ == "__main__":
-    #pipeline.get_dataset(n_sequences=None, sequence_len = 9) 
-    dataset = pipeline.get_dataset(n_sequences=None, sequence_len = 9)
-    rand_activations = torch.randn(size=dataset.shape)
-    print("rand acts shape", rand_activations.shape)
-    pipeline.parallel_process_activations(
-        neuron_or_feature='neuron',
-        index=10,
-        dataset=dataset, #type: ignore
-        activations=rand_activations,
-        threshold=0.01,
-        remove_zeros=True    
-    ) 
-"""
+    from typing import List
+    import numpy as np
+    import time
+    cfg = PipelineConfig(device="mps", batch_size = 1024)
+    print(cfg)
+
+
+    pipeline = MechInterpPipeline(
+        model_name="gelu-1l",
+        encoder_name="run1",
+        dataset_name="NeelNanda/c4-code-20k",
+        cfg=cfg,    
+    )
+
+    indices = np.random.randint(0, 500, 10).tolist()
+    start = time.time()
+    pipeline.build_and_interpret(indices, kwargs={'feature_or_neuron': 'feature'})
+    print(f"time taken to build feature pipeline for {1} indices ", time.time() - start)
+
+    start = time.time()
+    pipeline.build_and_interpret(indices, kwargs={'feature_or_neuron': 'neuron'})
+    print(f"time taken to build neuron pipeline for {len(indices)} indices ", time.time() - start)
+
 
 

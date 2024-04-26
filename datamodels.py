@@ -15,11 +15,32 @@ class PredictActivation(BaseModel):
         the predicted activation for the feature or neuron in the specified quantized range"""
     )
 
+
 class ActivationHypothesis(BaseModel):
     hypothesis : str = Field(..., description="""
         an hypothesis for what the feature or neuron is doing based on when the feature or neuron is active.
         This hypothesis should be based on the examples you are given.
     """)
+    attributes: str = Field(..., description="""
+        the attributes of the feature or neuron, in what situations is it active?
+    """)
+    reasoning: str = Field(..., description="""
+        the reasoning behind the hypothesis, 
+        rely on the negative and positive examples you are given
+    """)
+
+class FeatureSample(BaseModel):
+    quantized_activation: int
+    activation: float
+    text : str
+    token_id : int
+
+class FeatureDescription(ActivationHypothesis):
+    index: int
+    feature_or_neuron: Literal["feature", "neuron"]
+    high_act_samples: list[FeatureSample]
+    low_act_samples: list[FeatureSample]
+
 
 class PredictNextLogit(BaseModel):
     is_next: bool = Field(..., description="""
@@ -27,7 +48,7 @@ class PredictNextLogit(BaseModel):
     """) 
 
 class ActivationExample(BaseModel):
-    neuron_or_feature: Literal["neuron", "feature"] = "feature"
+    feature_or_neuron: Literal["neuron", "feature"] = "feature"
     index: int
     token: str
     token_id: int
@@ -35,17 +56,15 @@ class ActivationExample(BaseModel):
         the positions in the text where the token appears, this can be multiple places
     """)
     activation: float
-    context: str
-
-
+    text: str
 
 class MultiTokenActivationExample(BaseModel):
-    neuron_or_feature: Literal["neuron", "feature"] = "feature"
+    feature_or_neuron: Literal["neuron", "feature"] = "feature"
     index: int
     tokens: List[str]
     token_ids: List[int]
     activation: List[float]
-    context: str
+    text: str
 
 class RunMetaData(BaseModel):
     n_epoch: int
