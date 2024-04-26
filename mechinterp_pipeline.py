@@ -1,5 +1,4 @@
 from copy import deepcopy
-import json
 import os
 import time
 import tqdm
@@ -12,13 +11,14 @@ from transformer_lens import HookedTransformer, utils
 from datasets import load_dataset, Dataset
 from autoencoder import AutoEncoder
 from pydantic import BaseModel
+from common import image, stub, vol, PATH
 from datamodels import (
-    ActivationHypothesis,
     MultiTokenActivationExample, 
     ActivationExample, 
     InterpretabilityData, 
     FeatureDescription, 
-    FeatureSample
+    FeatureSample,
+    PipelineConfig
 )
 from automated_interpretability import AutomatedInterpretability
 from utils import (
@@ -28,26 +28,28 @@ from utils import (
     convert_to_pydantic_model,
     remove_keys, 
     write_models_to_json, 
-    load_models_from_json
+    load_models_from_json,
+    time_decorator
 )
 from mechninterp_utils import torch_spearman_correlation
 import instructor
 import multiprocessing as mp
+from modal import gpu, Secret, enter, method
 from openai import OpenAI
 torch.manual_seed(42)
 np.random.seed(42)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-class PipelineConfig(BaseModel):
-    device: str
-    d_type: torch.dtype = torch.float32
-    batch_size: int = 512
-    seq_len: int = 128
 
-    class Config:
-        arbitrary_types_allowed = True
-
-
+@stub.cls(
+    image=image,
+    volumes={PATH: vol},
+    timeout=60*60, #1 hour
+    cpu=20, #20 cores    
+    gpu=gpu.T4(),
+    secrets=[Secret.from_name("my-openai-secret")],
+    concurrency_limit=20
+)
 class MechInterpPipeline:
     def __init__(
         self,
@@ -56,38 +58,46 @@ class MechInterpPipeline:
         dataset_name : str,
         cfg : PipelineConfig,
         interpretability_model_name : str = 'gpt-4-turbo',
-        save_path : str = "mechinterp_pipeline"
+        folder_name : str = "mechinterp_pipeline"
     ) -> None:
+        self.model_name = model_name
+        self.encoder_name = encoder_name
+        self.dataset_name = dataset_name
+        self.cfg = cfg
+        self.interpretability_model_name = interpretability_model_name
+        self.save_path = f"{PATH}/{folder_name}"
+    
+    @enter()
+    def load(self):
+        if torch.cuda.is_available():
+            self.cfg.device = "cuda" #override the device to cuda if available
 
         self.automated_interp_pipeline = AutomatedInterpretability(
-            instructor.from_openai(OpenAI()), model=interpretability_model_name
+            instructor.from_openai(OpenAI()), model=self.interpretability_model_name
         )
         model : HookedTransformer = HookedTransformer.from_pretrained(
-            model_name, device=cfg.device
-        ).to(cfg.d_type) #type: ignore
+            self.model_name, device=self.cfg.device
+        ).to(self.cfg.d_type) #type: ignore
         
-        self.dataset_name = dataset_name
         self.model = model 
         self.tokenizer = deepcopy(model.tokenizer)
-        self.encoder = AutoEncoder.load_from_hf(encoder_name, cfg.device).to(cfg.device)
+        self.encoder = AutoEncoder.load_from_hf(self.encoder_name, self.cfg.device).to(self.cfg.device)
         self.all_tokens = None
-        self.cfg = cfg
-        self.save_path = save_path
         
         #TODO is this a smart design decision?
-        self.interp_save_path = os.path.join(save_path, "interpretability_data.parquet")
+        self.interp_save_path = os.path.join(self.save_path, "interpretability_data.parquet")
         if os.path.exists(self.interp_save_path):
             self.interp_df = pd.read_parquet(self.interp_save_path)
         else:
             self.interp_df = None
 
-        self.feature_df_save_path = os.path.join(save_path, "features.json")
+        self.feature_df_save_path = os.path.join(self.save_path, "features.json")
         if os.path.exists(self.feature_df_save_path):
             self.feature_data : List[FeatureDescription] = load_models_from_json(FeatureDescription, self.feature_df_save_path)
         else:
             self.feature_data = [] 
 
-        os.makedirs(save_path, exist_ok=True)
+        os.makedirs(self.save_path, exist_ok=True)
 
     def get_dataset(
         self,
@@ -194,7 +204,6 @@ class MechInterpPipeline:
         neuron_acts = mlp_acts[:, :, neuron_index] # shape (batch, seq_len)
         return neuron_acts.cpu()
 
-
     @torch.no_grad()
     def get_single_feature_acts(
         self,     
@@ -228,8 +237,8 @@ class MechInterpPipeline:
         new_batch_size = int(input.shape[0] * relative)
         return new_batch_size
 
-        
     @torch.no_grad()
+    @time_decorator
     def create_acts_dataset(
         self, 
         feature_or_neuron : Literal["neuron", "feature"],
@@ -254,7 +263,7 @@ class MechInterpPipeline:
             tuples where each tuple contains the text in the batch and the list of activation pairs for the feature index
             sorted by magnitude of activation
         '''
-        
+        t0 = time.time()
         # Check inputs
         if dataset is not None and entire_dataset:
             raise ValueError("Cannot specify both tokens and entire_dataset, to use entire dataset, set tokens to None")
@@ -306,11 +315,13 @@ class MechInterpPipeline:
             df.to_parquet(
                 f"{self.save_path}/acts_{feature_or_neuron}_{index}_from_dataset_size_{dataset_size}.parquet"
             )
-        
+            vol.commit()
+            print(f"Saved dataset to {self.save_path}")
+            print("checking if dataset is saved", os.listdir(self.save_path))
         return df
 
-    def build_and_interpret(self, indices : List[int], kwargs):
-        for idx in tqdm.tqdm(indices, desc="Creating Datasets"):
+    @method()
+    def build_and_interpret(self, idx:int, kwargs):
             self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
             neuron_feature = kwargs.get('feature_or_neuron')
             #we interpret the data
@@ -323,14 +334,16 @@ class MechInterpPipeline:
     ):
         path_start = f'acts_{feature_or_neuron}_{index}_from'
         paths = [
-            path for path in os.listdir('mechinterp_pipeline')
+            path for path in os.listdir(self.save_path)
             if path.endswith('.parquet') and path.startswith(path_start)
-        ] 
+        ]
+
+        print(f"Found {len(paths)} datasets for {feature_or_neuron} {index}")
         
         if len(paths) == 0:
             raise ValueError(f"No dataset found for {feature_or_neuron} {index}")
 
-        df = pd.read_parquet(os.path.join('mechinterp_pipeline', paths[0]))
+        df = pd.read_parquet(os.path.join(self.save_path, paths[0]))
 
         if len(df) < 100:
             raise ValueError(f"Dataset for {feature_or_neuron} {index} is too small, need at least 100 examples")
@@ -417,27 +430,33 @@ class MechInterpPipeline:
         random_samples = available_df.sample(n=10, random_state=42)
 
         examples_df = pd.concat([top_6, df.loc[quantile_indices], random_samples])
-        labels : List[int] = [row['quantized_activation'] for row in examples_df.to_dict(orient='records')]
+
         lst = [
             remove_keys(row, ['activation', 'quantized_activation']) 
             # removes the keys from the row(these are hidden from the model so it doesnt use them in its prediction)
             for row in examples_df.to_dict(orient='records')
         ]
-
         # pre
         batch_size = 8
         
+        labels : List[int] = []
         predictions : List[int] = []
         for i in range(0, len(lst), batch_size):
             batch = lst[i:i+batch_size] 
           
             llm_predictions = self.automated_interp_pipeline.predict_activation(
-                    unseen_examples=batch,
+                unseen_examples=batch,
                 hypothesis=feature_hypothesis,
-                feature_or_neuron=feature_or_neuron,    
+                feature_or_neuron=feature_or_neuron, 
+                max_tries=2   
             )
+            if llm_predictions is None:
+                continue
+
+            labels.extend([row['quantized_activation'] for row in examples_df[i:i+batch_size].to_dict(orient='records')])
             predictions.extend([pred.value for pred in llm_predictions])
 
+        assert len(labels) == len(predictions), f"expected labels and predictions to have the same length, got {len(labels)} and {len(predictions)}"
         spearman_corr = torch_spearman_correlation(
             torch.tensor(predictions, dtype=torch.float), torch.tensor(labels, dtype=torch.float)
         ).item()
@@ -452,8 +471,8 @@ class MechInterpPipeline:
         )
         self.interp_df = pd.concat([self.interp_df, pd.DataFrame([data.model_dump()])]) #type: ignore
         self.interp_df.to_parquet(self.interp_save_path)
-
         write_models_to_json(self.feature_data, self.feature_df_save_path)
+        vol.commit()
 
     def parallel_process_activations(
         self, 
@@ -468,6 +487,7 @@ class MechInterpPipeline:
         n_processes = min(os.cpu_count(), 6)  #type: ignore
         batch_size = len(dataset) // n_processes  # Define batch size based on number of processes
         print(f"Batch size: {batch_size}")
+        print(f"Number of processes: {n_processes}")
 
         tokenizer_copy = deepcopy(self.tokenizer) 
         with mp.Pool(processes=n_processes) as pool:

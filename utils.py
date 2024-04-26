@@ -5,7 +5,17 @@ from typing import List, Optional, Dict, Any, TypeVar, Union
 from pydantic import BaseModel
 import json
 from typing import Type
+import time
+import functools
 
+def time_decorator(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        start = time.time()
+        result = func(*args, **kwargs)
+        print(f"Time taken for {func.__name__} is {time.time() - start}")
+        return result
+    return wrapper
 
 def get_model_memory_usage(numbers, dtype) -> float:
     '''returns memory in GB for n numbers of dtype'''

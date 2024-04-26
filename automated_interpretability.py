@@ -1,4 +1,3 @@
-from altair import Iterable
 from instructor import Instructor, AsyncInstructor
 from typing import Any, AsyncGenerator, List, Optional, Type, TypeVar, Any, Coroutine, Literal
 from datamodels import PredictActivation, ActivationHypothesis, PredictNextLogit, ActivationExample
@@ -51,8 +50,9 @@ class AutomatedInterpretability:
         self,
         unseen_examples : List[dict], 
         hypothesis : ActivationHypothesis,
-        feature_or_neuron : Literal["feature", "neuron"] = "feature"
-    ) -> List[PredictActivation]:
+        max_tries : int = 2,
+        feature_or_neuron : Literal["feature", "neuron"] = "feature",
+    ) -> Optional[List[PredictActivation]]:
         '''
         from anthropic_paper:
         
@@ -70,9 +70,8 @@ class AutomatedInterpretability:
             f"{elm}" for elm in unseen_examples
         )
         
-        n_tries = 2
         err_msg : Optional[str] = None
-        while n_tries > 0:
+        while max_tries > 0:
             try:
                 out =  self.client.chat.create(
                     response_model=List[PredictActivation],
@@ -101,9 +100,10 @@ class AutomatedInterpretability:
                 return out
             
             except Exception as e:
-                n_tries -= 1
-                if n_tries == 0:
-                    raise ValueError(f"Failed to predict activations after 2 tries")
+                print(f"Error: {e}")
+                max_tries -= 1
+                if max_tries == 0:
+                    return None
                 else:
                     if err_msg:
                         err_msg += f"\nError: {e}"

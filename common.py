@@ -35,5 +35,6 @@ image = Image.from_registry(
     "sentencepiece",
     "psutil",
     "instructor",
+    "torchmetrics",
 )
 #.run_function(download_model)

@@ -1,5 +1,15 @@
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional, Literal
+import torch
+
+class PipelineConfig(BaseModel):
+    device: str
+    d_type: torch.dtype = torch.float32
+    batch_size: int = 512
+    seq_len: int = 128
+
+    class Config:
+        arbitrary_types_allowed = True
 
 class InterpretabilityData(BaseModel):
     feature_or_neuron : Literal["feature", "neuron"]
