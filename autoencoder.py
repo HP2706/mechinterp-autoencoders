@@ -155,8 +155,8 @@ class GatedAutoEncoder(nn.Module):
             L_Sparsity = self.l1_coeff * (via_gate_feature_magnitudes.float().sum())
             # Frozen decoder for L_aux
             with torch.no_grad():
-                W_dec_frozen = self.W_dec.clone().detach()
-                b_dec_frozen = self.b_dec.clone().detach()
+                W_dec_frozen = self.W_dec.detach()
+                b_dec_frozen = self.b_dec.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
             L_aux = (x - via_gate_reconstruction).pow(2).sum(-1).mean(0)
 

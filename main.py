@@ -1,4 +1,4 @@
-from common import stub, PATH, vol, image
+""" from common import stub, PATH, vol, image
 from mechinterp_pipeline import MechInterpPipeline, PipelineConfig
 from typing import List
 import numpy as np
@@ -30,6 +30,36 @@ def main():
     ):
         print(x)
     print(f"time taken to build neuron pipeline for {len(indices)} indices ", time.time() - start)
+"""
+
+from modal import method
+from autoencoder import AutoEncoder, AutoencoderConfig, GatedAutoEncoder
+import torch
+
+
+d_mlp = 128
+cfg = AutoencoderConfig(
+    seed=42,
+    batch_size=512*10,
+    buffer_mult=10,
+    lr=1e-3,
+    l1_coeff=0.01,
+    beta1=0.9,
+    beta2=0.999,
+    dict_mult=4,
+    seq_len=512,
+    d_mlp=d_mlp,
+    buffer_size=1000000,
+    buffer_batches=25,
+    device="mps",
+    n_epochs=10
+)
 
 
 
+vec = torch.randn(512, d_mlp)
+
+gate_autoencoder = GatedAutoEncoder(cfg)
+autoencoder = AutoEncoder(cfg)
+
+loss_data =  gate_autoencoder.forward(vec, method="with_loss")
