@@ -63,7 +63,14 @@ class AutoEncoder(nn.Module):
         self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
 
-    def forward(self, x, method : str = 'with_loss')-> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
+    def forward(
+        self,
+        x, 
+        method : Literal[
+            'with_acts', 'with_loss', 'reconstruct', 'with_new_loss'
+        ] = 'with_loss'
+    )-> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
+        
         x_center = x - self.b_dec
         acts = F.relu(x_center @ self.W_enc + self.b_enc)
         if method == 'with_acts':
@@ -74,7 +81,17 @@ class AutoEncoder(nn.Module):
             l1_loss = self.l1_coeff * (acts.float().abs().sum())
             loss = l2_loss + l1_loss
             return loss, x_reconstruct, acts, l2_loss, l1_loss
-  
+        
+        #new anthropic technique for improved autoencoder training
+        elif method == 'with_new_loss':
+            l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
+            l1_loss = torch.sum(
+                torch.abs(acts) 
+                * 
+                torch.norm(self.W_dec, dim=0, p=2)
+            )
+            loss = l2_loss + l1_loss
+            return loss, x_reconstruct, acts, l2_loss, l1_loss
         else:
             return x_reconstruct  
 

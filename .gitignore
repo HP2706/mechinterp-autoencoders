@@ -6,4 +6,5 @@ test_local.py
 main.py
 *.parquet
 *.pyc
+*.npy
 features.json
