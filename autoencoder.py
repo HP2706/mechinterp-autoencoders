@@ -64,8 +64,8 @@ class AutoEncoder(nn.Module):
         self.l1_coeff = cfg.l1_coeff
 
     def forward(self, x, method : str = 'with_loss')-> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]]:
-        x_cent = x - self.b_dec
-        acts = F.relu(x_cent @ self.W_enc + self.b_enc)
+        x_center = x - self.b_dec
+        acts = F.relu(x_center @ self.W_enc + self.b_enc)
         if method == 'with_acts':
             return acts
         x_reconstruct = acts @ self.W_dec + self.b_dec
@@ -138,9 +138,10 @@ class GatedAutoEncoder(nn.Module):
         method: Literal['with_acts', 'with_loss', 'reconstruct']
     ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]:
         # Ensure x is [batch_size, feature_size]
-        x_cent = x - self.b_dec  # [batch_size, feature_size]
-        active_features = ((x_cent @ self.W_gate + self.b_gate) > 0 ).float()  # [batch_size, d_hidden]
-        feature_magnitudes = self.relu(x_cent @ self.W_mag + self.b_mag)  # [batch_size, d_hidden]
+        x_center = x - self.b_dec  # [batch_size, feature_size]
+        gate_center = x_center @ self.W_gate + self.b_gate
+        active_features = (gate_center > 0 ).float()  # [batch_size, d_hidden]
+        feature_magnitudes = self.relu(x_center @ self.W_mag + self.b_mag)  # [batch_size, d_hidden]
         acts = active_features * feature_magnitudes  # [batch_size, d_hidden]
         x_reconstruct = acts @ self.W_dec + self.b_dec  # [batch_size, feature_size]
         
@@ -150,16 +151,15 @@ class GatedAutoEncoder(nn.Module):
             return x_reconstruct
         elif method == 'with_loss':
             L_Reconstruct = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            via_gate_feature_magnitudes = self.relu(x @ self.W_gate + self.b_gate)  # [batch_size, d_hidden]
-            L_Sparsity = self.l1_coeff * (self.relu(via_gate_feature_magnitudes).float().sum())
-            
+            via_gate_feature_magnitudes = self.relu(gate_center)  # [batch_size, d_hidden]
+            L_Sparsity = self.l1_coeff * (via_gate_feature_magnitudes.float().sum())
             # Frozen decoder for L_aux
             with torch.no_grad():
                 W_dec_frozen = self.W_dec.clone().detach()
                 b_dec_frozen = self.b_dec.clone().detach()
-            x_frozen = acts @ W_dec_frozen + b_dec_frozen
-            L_aux = (x - x_frozen).pow(2).sum(-1).mean(0)
-            print("loss shapes", L_aux.shape, L_Reconstruct.shape, L_Sparsity.shape)
+            via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
+            L_aux = (x - via_gate_reconstruction).pow(2).sum(-1).mean(0)
+
             loss = L_Reconstruct + L_Sparsity + L_aux
             return loss, x_reconstruct, acts, L_Reconstruct, L_Sparsity, L_aux
         else:
