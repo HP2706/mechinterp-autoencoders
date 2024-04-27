@@ -4,7 +4,7 @@ from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, field_validator
 from torch.nn import functional as F
-from typing import Tuple, Union
+from typing import Tuple, Union, Literal
 from mechninterp_utils import utils
 import pprint
 #internal imports
@@ -42,8 +42,9 @@ class AutoencoderConfig(BaseModel):
         if value not in ['cuda', 'mps']:
             raise ValueError(f'device must be either cuda or mps got {value}')
         return value
-
-    def get_dtype(self):
+    
+    @property 
+    def dtype(self):
         return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
 
 #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
@@ -53,10 +54,10 @@ class AutoEncoder(nn.Module):
         self.cfg = cfg
         d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.get_dtype())))
-        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.get_dtype())))
-        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.get_dtype())) # initialize to zero
-        self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.get_dtype())) # initialize to zero
+        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
+        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
+        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) # initialize to zero
+        self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
         self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
 
         self.d_hidden = d_hidden
@@ -106,3 +107,60 @@ class AutoEncoder(nn.Module):
         self = cls(cfg=valid_cfg)
         self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True)) # type: ignore
         return self
+
+#from paper https://arxiv.org/pdf/2404.16014
+class GatedAutoEncoder(nn.Module):
+    def __init__(self, cfg : AutoencoderConfig, dtype=torch.float32):
+        super().__init__()
+        self.cfg = cfg
+        d_hidden = cfg.d_mlp * cfg.dict_mult
+        torch.manual_seed(cfg.seed)
+        self.relu = nn.ReLU()
+        # Initialize parameters for the gated autoencoder
+        self.l1_coeff = cfg.l1_coeff
+        self.W_gate = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
+
+        self.b_gate = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
+        self.b_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
+
+        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
+        self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
+
+        # Initialize W_mag as a vector of learnable parameters
+        self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to to zero?
+        self.W_mag = torch.exp(self.r_mag)[None, :] * self.W_gate
+        self.W_mag = nn.Parameter(self.W_mag)
+
+    #TODO: Implement forward and loss
+    def forward(
+        self, 
+        x: Tensor, 
+        method: Literal['with_acts', 'with_loss', 'reconstruct']
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]]:
+        # Ensure x is [batch_size, feature_size]
+        x_cent = x - self.b_dec  # [batch_size, feature_size]
+        active_features = ((x_cent @ self.W_gate + self.b_gate) > 0 ).float()  # [batch_size, d_hidden]
+        feature_magnitudes = self.relu(x_cent @ self.W_mag + self.b_mag)  # [batch_size, d_hidden]
+        acts = active_features * feature_magnitudes  # [batch_size, d_hidden]
+        x_reconstruct = acts @ self.W_dec + self.b_dec  # [batch_size, feature_size]
+        
+        if method == 'with_acts':
+            return acts
+        elif method == 'reconstruct':
+            return x_reconstruct
+        elif method == 'with_loss':
+            L_Reconstruct = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
+            via_gate_feature_magnitudes = self.relu(x @ self.W_gate + self.b_gate)  # [batch_size, d_hidden]
+            L_Sparsity = self.l1_coeff * (self.relu(via_gate_feature_magnitudes).float().sum())
+            
+            # Frozen decoder for L_aux
+            with torch.no_grad():
+                W_dec_frozen = self.W_dec.clone().detach()
+                b_dec_frozen = self.b_dec.clone().detach()
+            x_frozen = acts @ W_dec_frozen + b_dec_frozen
+            L_aux = (x - x_frozen).pow(2).sum(-1).mean(0)
+            print("loss shapes", L_aux.shape, L_Reconstruct.shape, L_Sparsity.shape)
+            loss = L_Reconstruct + L_Sparsity + L_aux
+            return loss, x_reconstruct, acts, L_Reconstruct, L_Sparsity, L_aux
+        else:
+            return x_reconstruct
