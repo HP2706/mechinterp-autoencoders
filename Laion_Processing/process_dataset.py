@@ -4,7 +4,7 @@ from transformers import AutoTokenizer
 import pandas as pd
 from torch.optim import AdamW
 from datamodels import RunMetaData
-from typing import List, Tuple
+from typing import List, Tuple, Union
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
 import torch
 from common import stub, PATH, vol, dataset_vol, LAION_DATASET_PATH,  image, EMB_FOLDER, METADATA_FOLDER
@@ -43,29 +43,37 @@ def download_laion_file(file_name: str, destination_folder: str)->bool:
     image = image,
     volumes = { LAION_DATASET_PATH: dataset_vol},
     _allow_background_volume_commits = True,
-    timeout=5*60, 
-    concurrency_limit=10
+    timeout=10*60, 
+    concurrency_limit=20,
+    container_idle_timeout=30
 )
-async def async_download_laion_file(file_name: str, destination_folder: str)->bool:
-    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{file_name}"
+async def async_download_laion_file(
+    file_name: str, 
+    destination_folder: str
+)->Union[bool, Tuple[bool, Tuple[str, str]]]:
     
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            if response.status == 200:
-                file_path = os.path.join(destination_folder, file_name.split("/")[-1])
-                with open(file_path, 'wb') as f:
-                    while True:
-                        chunk = await response.content.read(1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                dataset_vol.commit()
-                dataset_vol.reload()
-                return True
-            else:
-                print(f"Failed to download {file_name}: HTTP {response.status}")
-                return False
-
+    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{file_name}"
+    try:    
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status == 200:
+                    file_path = os.path.join(destination_folder, file_name.split("/")[-1])
+                    with open(file_path, 'wb') as f:
+                        while True:
+                            chunk = await response.content.read(1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    dataset_vol.commit()
+                    dataset_vol.reload()
+                    return True
+                else:
+                    print(f"Failed to download {file_name}: HTTP {response.status}")
+                    return False
+    except Exception as e:
+        print(f"Failed to download {file_name}: {e}")
+        return (False, (file_name, destination_folder))
+    
 @stub.function(
     image = image,
     volumes = { PATH: vol, LAION_DATASET_PATH: dataset_vol},
@@ -78,21 +86,27 @@ def download_and_processs_laion_dataset():
     os.makedirs(LAION_DATASET_PATH, exist_ok=True)
     os.makedirs(EMB_FOLDER, exist_ok=True)
     os.makedirs(METADATA_FOLDER, exist_ok=True)
-    indices = [i for i in range(0, 20)] # we have 20 chunks
+    indices = [i for i in range(73, 200)] # we have 20 chunks
     vector_names = [f"img_emb/img_emb_{i:04}.npy" for i in indices]
     metadata_names  = [f"laion2B-en-metadata/metadata_{i:04}.parquet" for i in indices]
-
     
+    print(os.listdir(EMB_FOLDER))
     lst = [
         *zip(vector_names,[EMB_FOLDER]*len(vector_names)), 
         *zip(metadata_names, [METADATA_FOLDER]*len(metadata_names))
     ]
 
+    failed_lst = []
     for elm in tqdm(
         async_download_laion_file.starmap(lst),
     ):
-        print("elm", elm)
+        if isinstance(elm, tuple):
+            print(f"Failed to download {elm[1]}")
+            failed_lst.append(elm[1])
+            continue
+        print(elm)
 
+    print(f"Failed to download {len(failed_lst)} files")
     dataset_vol.commit()
     
 

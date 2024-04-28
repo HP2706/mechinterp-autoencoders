@@ -35,8 +35,6 @@ with image.imports():
     import os
     import json
 
-
-
 @stub.function(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
@@ -45,13 +43,12 @@ with image.imports():
     secrets=[modal.Secret.from_name("my-wandb-secret")],
 )
 def train_autoencoder():
-    
-   
+
     model_dir = f"{PATH}/1L_autoencoder"
     if not os.path.exists(model_dir):
         os.makedirs(model_dir)
     
-    d_mlp = 512 #TODO this should not be hardcoded
+    d_mlp = 768 
     cfg = AutoencoderConfig(
         seed=42,
         batch_size=512*10,
@@ -77,46 +74,26 @@ def train_autoencoder():
         config={
             "learning_rate": cfg.lr,
             "architecture": "1Layer Transformer",
-            "dataset": "TinyStories",
+            "dataset": "Laion2B",
             "epochs": cfg.n_epochs,
         }
     )
 
     model.to(model.cfg.device)
     optimizer = AdamW(model.parameters(), lr=1e-3)
+    dataloader = LaionFileLoader(
+        batch_size=cfg.batch_size, 
+        embeddings_path=f"{LAION_DATASET_PATH}/img_emb"
+    ).dataloader
     for epoch in range(model.cfg.n_epochs): # type: ignore
-        for train_file in [ file for file in os.listdir(f"{PATH}/{activations_name}") if "train" in file]:
-            if not train_file.endswith(".parquet"):
-                continue
+        model.train()
+        for batch in tqdm(dataloader):
+            optimizer.zero_grad()
+            loss = model(batch)
+            loss.backward()
+            optimizer.step()
+            wandb.log({"loss": loss.item()})
+        torch.save(model.state_dict(), f"{model_dir}/laion_model_{epoch}.pt")
 
-            df = pd.read_parquet(f"{PATH}/{activations_name}/{train_file}")
-            activations_batched = load_activations(df, model.cfg.batch_size)
-
-            for activations in activations_batched:
-                loss, x_reconstruct, acts, l2_loss, l1_loss = model.forward(
-                    activations.to(model.cfg.device), method='with_loss'
-                )
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                print(f"epoch {epoch} train loss {loss.item()}")
-
-        for eval_file in [file for file in os.listdir(f"{PATH}/{activations_name}") if "validation" in file]:
-            if not eval_file.endswith(".parquet"):
-                continue
-            df = pd.read_parquet(f"{PATH}/{activations_name}/{eval_file}")
-            activations_batched = load_activations(df, model.cfg.batch_size)
-            for activations in activations_batched:
-                with torch.no_grad():
-                    loss, x_reconstruct, acts, l2_loss, l1_loss = model.forward(
-                        activations.to(model.cfg.device), method='with_loss'
-                    )
-                    print(f"validation loss {loss.item()}")
-
-    save_model(model, model.cfg, model_dir)
-    print("model saved")
-    print("checking if model can be loaded")
-    model, cfg = load_model(model_dir)
-    print("model loaded")
 
         

@@ -9,13 +9,11 @@ from typing import Generator, Optional, List, Tuple, Union
 class LaionDataset(Dataset):
     def __init__(
         self, 
-        embeddings_path: str, 
-        with_metadata: bool = False
+        file_paths: List[str], 
     ):
-
-        self.with_metadata = with_metadata
-        self.vec_list = [os.path.join(embeddings_path, file) for file in os.listdir(embeddings_path) if file.endswith(".npy")]
-
+        
+        assert all(file_path.endswith(".npy") for file_path in file_paths), "All files should be .npy"
+        self.file_paths = file_paths
         self.current_file_index = -1
         self.data = None
         self.metadata_df = None
@@ -23,14 +21,14 @@ class LaionDataset(Dataset):
 
     def load_next_file(self):
         self.current_file_index += 1
-        if self.current_file_index < len(self.vec_list):
-            self.data = torch.tensor(np.load(self.vec_list[self.current_file_index]))
+        if self.current_file_index < len(self.file_paths):
+            self.data = torch.tensor(np.load(self.file_paths[self.current_file_index]))
         else:
             self.data = None
 
     def __len__(self):
         if self.data is not None:
-            return self.data.shape[0]*len(self.vec_list)
+            return self.data.shape[0]*len(self.file_paths)
         return 0
 
     def __getitem__(self, idx: int) -> Union[torch.Tensor, dict]:
@@ -47,13 +45,10 @@ class LaionFileLoader:
     def __init__(
         self, 
         batch_size: int, 
-        embeddings_path: str = EMB_FOLDER, 
-        metadata_path: str = METADATA_FOLDER,
-        with_metadata: bool = False
+        file_paths: List[str], 
     ):
         self.dataset = LaionDataset(
-            embeddings_path=embeddings_path, 
-            with_metadata=with_metadata
+            file_paths=file_paths, 
         )
         self.dataloader = DataLoader(
             self.dataset, 
