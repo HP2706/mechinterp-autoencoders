@@ -6,7 +6,6 @@ from torch.optim import AdamW
 from datamodels import RunMetaData
 from typing import List, Tuple, Union
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
-import torch
 from common import stub, PATH, vol, dataset_vol, LAION_DATASET_PATH,  image, EMB_FOLDER, METADATA_FOLDER
 from modal import Image, Volume, gpu
 import aiohttp
@@ -86,11 +85,12 @@ def download_and_processs_laion_dataset():
     os.makedirs(LAION_DATASET_PATH, exist_ok=True)
     os.makedirs(EMB_FOLDER, exist_ok=True)
     os.makedirs(METADATA_FOLDER, exist_ok=True)
-    indices = [i for i in range(73, 200)] # we have 20 chunks
+    indices = [i for i in range(0, 200)] # we have 200 chunks
     vector_names = [f"img_emb/img_emb_{i:04}.npy" for i in indices]
     metadata_names  = [f"laion2B-en-metadata/metadata_{i:04}.parquet" for i in indices]
+    indices = [i for i in range(18,74)] # we have 200 chunks
+    metadata_names  = [f"laion2B-en-metadata/metadata_{i:04}.parquet" for i in indices]
     
-    print(os.listdir(EMB_FOLDER))
     lst = [
         *zip(vector_names,[EMB_FOLDER]*len(vector_names)), 
         *zip(metadata_names, [METADATA_FOLDER]*len(metadata_names))

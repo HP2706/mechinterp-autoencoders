@@ -1,3 +1,5 @@
+import json
+import os
 import time 
 from typing import Optional
 import torch
@@ -5,11 +7,12 @@ from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, field_validator
 from torch.nn import functional as F
-from typing import Tuple, Union, Literal, List
+from typing import Tuple, Union, Literal, List, Any
+from abc import ABC, abstractmethod
 from mechninterp_utils import utils
 #internal imports
 from mechninterp_utils import mean_ablate_hook
-from typing import overload
+from typing import overload, Protocol
 
 
 class GatedAutoEncoderResult(BaseModel):
@@ -34,51 +37,111 @@ class AutoencoderResult(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-
-class AutoencoderConfig(BaseModel):
+class AutoencoderModelConfig(BaseModel):
+    type: Literal['autoencoder', 'gated_autoencoder']
+    dict_mult: int
+    d_mlp: int 
+    l1_coeff: float
     seed: int
+    enc_dtype: Literal['fp32', 'fp16'] = 'fp32'
+    device: Literal['cuda', 'mps'] = 'cuda'
+    
+    @property 
+    def dtype(self):
+        return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
+
+
+class AutoencoderConfig(AutoencoderModelConfig):
     batch_size: int
     buffer_mult: int
-    lr: float
     num_tokens: Optional[int] = None
     l1_coeff: float
+    lr : float
     beta1: float
     beta2: float
-    dict_mult: int
     seq_len: int
-    d_mlp: int
-    enc_dtype: str = 'fp32'
     batch_size: int
     buffer_size: int
     buffer_batches: int
-    device : str 
     n_epochs: int
     n_steps: Optional[int] = None
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
 
 
-    @field_validator('enc_dtype')
-    def check_d_type(cls, value):
-        if value not in ['fp32', 'fp16']:
-            raise ValueError('d_type must be either fp32 or fp16')
-        return value
-    
-    @field_validator('device')
-    def check_device(cls, value):
-        if value not in ['cuda', 'mps']:
-            raise ValueError(f'device must be either cuda or mps got {value}')
-        return value
-    
-    @property 
-    def dtype(self):
-        return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
+    def basename(self, epoch: Optional[int] = None)->str:
+        epoch = epoch if epoch is not None else self.n_epochs
+        return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_lr_{self.lr}_dict_mult_{self.dict_mult}_epoch_{epoch}'
 
-#inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
-class AutoEncoder(nn.Module):
-    def __init__(self, cfg : AutoencoderConfig, dtype=torch.float32):
+
+class AutoEncoderBase(nn.Module, ABC):
+    def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__()
         self.cfg = cfg
+
+    @abstractmethod
+    def forward(self, x: Tensor, method: str) -> Any:
+        """
+        Abstract forward method that must be implemented by subclasses.
+        The method parameter can dictate the behavior of the forward pass.
+        """
+        pass
+
+    @torch.no_grad()
+    @abstractmethod
+    def get_single_feature_acts(
+        self,     
+        model_acts : torch.Tensor, 
+        feature_index : int,
+    ) -> torch.Tensor:
+        """
+        Returns the activations of a single feature.
+        """
+        pass
+
+    @classmethod
+    def get_name(cls) -> str:
+        return cls.__name__.lower()
+    
+    @property
+    def name(self):
+        return self.__class__.__name__.lower()
+    
+    @classmethod
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+        json_path : Optional[str] = None
+    ) -> Union['GatedAutoEncoder', 'AutoEncoder']:
+        """
+        Loads the saved autoencoder from a checkpoint.
+        If a json file is not provided, it is expected that the checkpoint is from a run of the autoencoder
+        and the json file is assumed to be in the same directory as the checkpoint with the same name, but with
+        a .json extension.
+        """
+
+        
+        if not checkpoint_path.endswith(".pt"):
+            raise ValueError("checkpoint_path must end with .pt")
+        if json_path is None:
+            json_path = checkpoint_path.replace(".pt", ".json")
+            if not os.path.exists(json_path):
+                raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
+
+        cfg = AutoencoderConfig(**json.loads(open(json_path).read()))
+        cls.metadata_cfg = cfg
+        if cfg.type == cls.__name__.lower():  # Ensure the type matches the class name
+            model = cls(cfg)
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            return model # type: ignore
+        else:
+            raise ValueError(f"Config type '{cfg.type}' does not match the expected type '{cls.__name__.lower()}'")
+
+#inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
+class AutoEncoder(AutoEncoderBase):
+    def __init__(self, cfg : AutoencoderModelConfig):
+        super().__init__(cfg)
         d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
@@ -86,10 +149,61 @@ class AutoEncoder(nn.Module):
         self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) # initialize to zero
         self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
         self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-
         self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
 
+        self.to(cfg.device) # move to device
+
+    @classmethod
+    @overload
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str,
+        device : Literal['cuda', 'cpu', 'mps'],
+    ) -> 'AutoEncoder': ...
+
+    @classmethod
+    @overload
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+        json_path : Optional[str] = None
+    ) -> 'AutoEncoder': ...
+
+    @classmethod
+    @overload
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+    ) -> 'AutoEncoder': ...
+
+    @classmethod
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+        json_path : Optional[str] = None
+    ) -> 'AutoEncoder': 
+        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path, device, json_path) #type: ignore
+
+    def get_single_feature_acts(
+        self,     
+        model_acts : torch.Tensor, 
+        feature_index : int,
+    ) -> torch.Tensor:
+        '''gets the activation values for a specific feature index(index of the hidden layer)'''
+
+        if model_acts.device != self.cfg.device:
+            model_acts = model_acts.to(self.cfg.device)
+
+        feature_in = self.W_enc[:, feature_index]
+        feature_bias = self.b_enc[feature_index]
+        feature_acts = F.relu((model_acts - self.b_dec) @ feature_in + feature_bias) # shape (batch, seq_len)
+        feature_acts = feature_acts.cpu()
+    
+        return feature_acts
 
     @overload
     def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct']) -> Tensor: ...
@@ -162,20 +276,21 @@ class AutoEncoder(nn.Module):
         elif version=="run2":
             version = 47
 
+
         cfg : dict = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json") # type: ignore
         cfg["buffer_size"] = cfg["batch_size"] * cfg["buffer_mult"] 
         cfg["buffer_batches"] = cfg["buffer_size"] // cfg["seq_len"] 
         cfg["device"] = device 
-        valid_cfg = AutoencoderConfig(**cfg) 
+        valid_cfg = AutoencoderModelConfig(**cfg) 
         self = cls(cfg=valid_cfg)
         self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True)) # type: ignore
         return self
 
+
 #from paper https://arxiv.org/pdf/2404.16014
-class GatedAutoEncoder(nn.Module):
-    def __init__(self, cfg : AutoencoderConfig, dtype=torch.float32):
-        super().__init__()
-        self.cfg = cfg
+class GatedAutoEncoder(AutoEncoderBase):
+    def __init__(self, cfg : AutoencoderModelConfig):
+        super().__init__(cfg)
         d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         self.relu = nn.ReLU()
@@ -194,6 +309,51 @@ class GatedAutoEncoder(nn.Module):
         self.W_mag = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(self.W_mag)
 
+    @classmethod
+    @overload
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+    ) -> 'GatedAutoEncoder': ...
+
+    @classmethod
+    @overload
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path : str, 
+        device : Literal['cuda', 'cpu', 'mps'],
+        json_path : Optional[str] = None
+    ) -> 'GatedAutoEncoder': ...
+
+    @classmethod
+    def load_from_checkpoint(
+        cls, 
+        checkpoint_path: str, 
+        device: Literal['cuda', 'cpu', 'mps'],
+        json_path: Optional[str] = None
+    ) -> 'GatedAutoEncoder':
+        # Implementation remains the same
+        return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, device, json_path) #type: ignore
+
+
+    def get_single_feature_acts(
+        self,     
+        model_acts : torch.Tensor, 
+        feature_index : int,
+    ) -> torch.Tensor:
+        '''gets the activation values for a specific feature index (index of the hidden layer)'''
+
+        if model_acts.device != self.cfg.device:
+            model_acts = model_acts.to(self.cfg.device)
+
+        model_acts_centered = model_acts - self.b_dec
+        gate_activation = model_acts_centered @ self.W_gate[:, feature_index] + self.b_gate[feature_index]
+        active_feature = (gate_activation > 0).float()
+        feature_magnitude = self.relu(model_acts_centered @ self.W_mag[:, feature_index] + self.b_mag[feature_index])
+        feature_activation = active_feature * feature_magnitude
+
+        return feature_activation.unsqueeze(-1)  # Ensure it keeps the right dimensions
 
     
 
