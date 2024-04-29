@@ -8,3 +8,5 @@ main.py
 *.pyc
 *.npy
 features.json
+benchmark.py
+clip_mechinterp_pipeline.py
