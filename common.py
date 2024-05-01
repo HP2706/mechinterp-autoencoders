@@ -41,5 +41,7 @@ image = Image.from_registry(
     "torchmetrics",
     "aiohttp",
     "pillow",
+    "aiofiles",
+    "litellm",
 )
 #.run_function(download_model)

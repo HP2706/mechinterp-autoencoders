@@ -1,9 +1,15 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, List, Optional, Literal
+from typing import Any, List, Optional, Literal, Union
 import torch
 
+class LaionRowData(BaseModel):
+    image_url: str
+    caption: str
+    quantized_activation: int
+
+
 class PipelineConfig(BaseModel):
-    device: str
+    device: Literal['cuda', 'mps', 'cpu']
     d_type: torch.dtype = torch.float32
     batch_size: int = 512
     seq_len: int = 128
@@ -39,18 +45,28 @@ class ActivationHypothesis(BaseModel):
         rely on the negative and positive examples you are given
     """)
 
+class TextContent(BaseModel):
+    token: str
+    token_id: int
+    positions : List[int] = Field(..., description="""
+        the positions in the text where the token appears, this can be multiple places
+    """)
+    text: str
+
+class ImageContent(BaseModel):
+    image_path: str
+    image_caption: str
+
 class FeatureSample(BaseModel):
     quantized_activation: int
     activation: float
-    text : str
-    token_id : int
-
+    content : Union[TextContent, ImageContent]
+    
 class FeatureDescription(ActivationHypothesis):
     index: int
     feature_or_neuron: Literal["feature", "neuron"]
     high_act_samples: list[FeatureSample]
     low_act_samples: list[FeatureSample]
-
 
 class PredictNextLogit(BaseModel):
     is_next: bool = Field(..., description="""
@@ -60,13 +76,8 @@ class PredictNextLogit(BaseModel):
 class ActivationExample(BaseModel):
     feature_or_neuron: Literal["neuron", "feature"] = "feature"
     index: int
-    token: str
-    token_id: int
-    positions : List[int] = Field(..., description="""
-        the positions in the text where the token appears, this can be multiple places
-    """)
     activation: float
-    text: str
+    content : Union[TextContent, ImageContent]
 
 class MultiTokenActivationExample(BaseModel):
     feature_or_neuron: Literal["neuron", "feature"] = "feature"

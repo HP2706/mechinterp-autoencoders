@@ -168,6 +168,8 @@ async def save_activations_async(path: str, activations: torch.Tensor):
         await f.write(buffer.read())
     dataset_vol.commit()
 
+
+
 @stub.function(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
@@ -187,17 +189,15 @@ def get_recons_loss(
     )
 
     print("len validation set", len(autoencoder.metadata_cfg.validation_set)) # type: ignore
-    batch_size = 512*10
+    batch_size = 512*20
     losses = []
-    save_tasks = []
     for file in tqdm(autoencoder.metadata_cfg.validation_set):
         try:
             all_tokens = torch.tensor(np.load(file))
         except:
             print("error loading file", file)
             continue
-        
-        activations = []
+
         num_batches = len(all_tokens)// (batch_size)
         autoencoder.to(autoencoder.cfg.device)
         autoencoder.eval()
@@ -208,30 +208,6 @@ def get_recons_loss(
             x_reconstruct = result.x_reconstruct
             mean_ablated = batch - batch.mean(dim=0)
             losses.append(((x_reconstruct - mean_ablated)**2).mean().item()) #mse
-
-            if save_intermediate_acts:
-                activations.append(result.acts.cpu())
-        
-        if save_intermediate_acts:
-            print("adding activations to queue")
-            t0 = time.time()
-            activations = torch.vstack(activations)
-            filename = file.split('/')[-1].split('.')[0]
-            save_path = f"{LAION_DATASET_PATH}/acts_{filename}_{autoencoder.cfg.type}_{autoencoder.file_name}.npy"
-            save_tasks.append(save_activations_async(save_path, activations))
-            print("time to add to queue", time.time()-t0)
-            del activations
-
-    if save_intermediate_acts:
-        t0 = time.time()
-        print("saving activations to files")
-        async def process_and_save_activations(save_tasks):
-            await asyncio.gather(*save_tasks)
-        # Then replace the existing asyncio.run call with:
-        asyncio.run(process_and_save_activations(save_tasks))
-        print("time to save all activations to files", time.time()-t0)
-        print("chehcking if all files are saved", os.listdir(LAION_DATASET_PATH))
-        dataset_vol.commit()
     
     print("mean loss", np.mean(losses))
 

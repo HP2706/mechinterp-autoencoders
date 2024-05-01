@@ -1,20 +1,26 @@
 import os
-from altair import overload
 import torch
+from typing import Any, overload
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
-from typing import Generator, Optional, List, Tuple, Union
+from typing import Generator, Literal, Optional, List, Tuple, Union
+from pydantic import BaseModel
+
 
 class LaionDataset(Dataset):
     def __init__(
         self, 
         emb_folder: str, 
         metadata_folder: Optional[str],
-        return_tuple: bool
+        split : Literal['train', 'test'],
+        with_filenames : bool = False,
+        train_share : float = 0.8,
+        return_tuple: bool = False,
     ):
-        
+        self.with_filenames = with_filenames
         emb_paths = [os.path.join(emb_folder, f) for f in os.listdir(emb_folder)]
+        metadata_paths = None
         if len(emb_paths) == 0:
             raise ValueError("No embedding files found in emb_folder")
         assert all(emb_path.endswith(".npy") for emb_path in emb_paths), "All embedding files should be .npy"
@@ -22,17 +28,55 @@ class LaionDataset(Dataset):
             if metadata_folder is None:
                 raise ValueError("metadata_paths must be provided if return_tuple is True")
             metadata_paths = [os.path.join(metadata_folder, f) for f in os.listdir(metadata_folder)]
-            self.metadata_paths = metadata_paths
-            assert len(emb_paths) == len(metadata_paths), "Embedding and metadata files must be paired"
+            assert len(emb_paths) == len(metadata_paths), f"""
+            Embedding and metadata files must be paired got different lengths 
+            embs_path :{len(emb_paths)} {emb_paths}
+            metadata_paths :{len(metadata_paths)} {metadata_paths}
+            """
             assert all(metadata_path.endswith(".parquet") for metadata_path in metadata_paths), "All metadata files should be .parquet"
         
+        if split == 'train':
+            self.emb_paths = emb_paths[:int(len(emb_paths)*train_share)]
+            if metadata_paths is not None:
+                self.metadata_paths = metadata_paths[:int(len(metadata_paths)*train_share)]
+        elif split == 'test':
+            self.emb_paths = emb_paths[int(len(emb_paths)*train_share):]
+            if metadata_paths is not None:
+                self.metadata_paths = metadata_paths[int(len(metadata_paths)*train_share):]
 
-        self.emb_paths = emb_paths
         self.return_tuple = return_tuple
         self.current_file_index = -1
         self.data: Optional[torch.Tensor] = None
         self.metadata_df: Optional[pd.DataFrame] = None
         self.load_next_file()
+
+    
+    def iter_files(self)-> Generator[Tuple[torch.Tensor, pd.DataFrame], None, None]:
+        for i in range(len(self.emb_paths)):
+            try:
+                tensors = torch.tensor(np.load(self.emb_paths[i]))
+                df = pd.read_parquet(self.metadata_paths[i])
+                yield (tensors, df)
+            except ValueError as e:
+                print(e)
+                print("file", self.emb_paths[i], "is not a valid numpy shape", "and ")
+                print("accompanying parquet file", self.metadata_paths[i])
+                continue
+                
+            
+
+    @property
+    def get_metadata(self) -> pd.DataFrame:
+        if self.metadata_df is None:
+            raise ValueError("metadata_df is not available")
+        return self.metadata_df
+
+    def get_data_by_idx(self, idx: int) -> Tuple[torch.Tensor, pd.DataFrame]:
+        tensor = torch.tensor(np.load(self.emb_paths[idx]))
+        metadata_df = pd.read_parquet(self.metadata_paths[idx])
+        return tensor, metadata_df
+            
+            
 
     def load_next_file(self):
         self.current_file_index += 1
@@ -46,7 +90,8 @@ class LaionDataset(Dataset):
 
     def __len__(self):
         if self.data is not None:
-            return self.data.shape[0]
+            print("self.emb_paths len", len(self.emb_paths))
+            return self.data.shape[0] * len(self.emb_paths)
         return 0
 
         
@@ -102,12 +147,16 @@ class LaionFileLoader:
     def __init__(
         self, 
         batch_size: int, 
-        emb_folder: str, 
+        emb_folder: str,
+        split : Literal['train', 'test'],
+        train_share : float = 0.8,
     ):
         self.dataset = LaionDataset(
             emb_folder=emb_folder, 
             metadata_folder=None,
             return_tuple=False,
+            split=split,
+            train_share=train_share,
         )
         self.dataloader = DataLoader(
             self.dataset, 
