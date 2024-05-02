@@ -10,6 +10,7 @@ from torch.nn import functional as F
 from typing import Tuple, Union, Literal, List, Any
 from abc import ABC, abstractmethod
 from mechninterp_utils import utils
+from utils import get_device
 #internal imports
 from mechninterp_utils import mean_ablate_hook
 from typing import overload, Protocol
@@ -69,7 +70,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
     validation_set : Optional[List[str]] = None
 
 
-    def basename(self, epoch: Optional[int] = None)->str:
+    def create_basename(self, epoch: Optional[int] = None)->str:
         epoch = epoch if epoch is not None else self.n_epochs
         return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_lr_{self.lr}_dict_mult_{self.dict_mult}_epoch_{epoch}'
 
@@ -107,11 +108,14 @@ class AutoEncoderBase(nn.Module, ABC):
     def name(self):
         return self.__class__.__name__.lower()
     
+    @property
+    def get_file_path(self):
+        return self.metadata_cfg
+    
     @classmethod
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
         json_path : Optional[str] = None
     ) -> Union['GatedAutoEncoder', 'AutoEncoder']:
         """
@@ -127,16 +131,22 @@ class AutoEncoderBase(nn.Module, ABC):
         if json_path is None:
             json_path = checkpoint_path.replace(".pt", ".json")
             if not os.path.exists(json_path):
+                print("files in the same directory", os.listdir(os.path.dirname(checkpoint_path)))
                 raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
 
+        cls.file_name = checkpoint_path.split('/')[-1].split('.')[0] # we removce file extension
         cfg = AutoencoderConfig(**json.loads(open(json_path).read()))
         cls.metadata_cfg = cfg
+
+        device = get_device()
+
         if cfg.type == cls.__name__.lower():  # Ensure the type matches the class name
             model = cls(cfg)
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
             return model # type: ignore
         else:
             raise ValueError(f"Config type '{cfg.type}' does not match the expected type '{cls.__name__.lower()}'")
+
 
 #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
 class AutoEncoder(AutoEncoderBase):
@@ -151,15 +161,15 @@ class AutoEncoder(AutoEncoderBase):
         self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
         self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
+        self.device = get_device()
 
-        self.to(cfg.device) # move to device
+        self.to(self.device) # move to device
 
     @classmethod
     @overload
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str,
-        device : Literal['cuda', 'cpu', 'mps'],
     ) -> 'AutoEncoder': ...
 
     @classmethod
@@ -167,7 +177,6 @@ class AutoEncoder(AutoEncoderBase):
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
         json_path : Optional[str] = None
     ) -> 'AutoEncoder': ...
 
@@ -176,17 +185,16 @@ class AutoEncoder(AutoEncoderBase):
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
     ) -> 'AutoEncoder': ...
 
     @classmethod
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
         json_path : Optional[str] = None
     ) -> 'AutoEncoder': 
-        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path, device, json_path) #type: ignore
+        
+        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
 
     def get_single_feature_acts(
         self,     
@@ -196,14 +204,14 @@ class AutoEncoder(AutoEncoderBase):
         '''gets the activation values for a specific feature index(index of the hidden layer)'''
 
         if model_acts.device != self.cfg.device:
-            model_acts = model_acts.to(self.cfg.device)
+            model_acts = model_acts.to(self.device)
 
         feature_in = self.W_enc[:, feature_index]
         feature_bias = self.b_enc[feature_index]
         feature_acts = F.relu((model_acts - self.b_dec) @ feature_in + feature_bias) # shape (batch, seq_len)
         feature_acts = feature_acts.cpu()
     
-        return feature_acts
+        return feature_acts.unsqueeze(-1) #[batch, 1]
 
     @overload
     def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct']) -> Tensor: ...
@@ -308,13 +316,13 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to to zero?
         self.W_mag = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(self.W_mag)
+        self.device = get_device()
 
     @classmethod
     @overload
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
     ) -> 'GatedAutoEncoder': ...
 
     @classmethod
@@ -322,7 +330,6 @@ class GatedAutoEncoder(AutoEncoderBase):
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
-        device : Literal['cuda', 'cpu', 'mps'],
         json_path : Optional[str] = None
     ) -> 'GatedAutoEncoder': ...
 
@@ -330,11 +337,10 @@ class GatedAutoEncoder(AutoEncoderBase):
     def load_from_checkpoint(
         cls, 
         checkpoint_path: str, 
-        device: Literal['cuda', 'cpu', 'mps'],
         json_path: Optional[str] = None
     ) -> 'GatedAutoEncoder':
         # Implementation remains the same
-        return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, device, json_path) #type: ignore
+        return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
 
 
     def get_single_feature_acts(
@@ -344,8 +350,8 @@ class GatedAutoEncoder(AutoEncoderBase):
     ) -> torch.Tensor:
         '''gets the activation values for a specific feature index (index of the hidden layer)'''
 
-        if model_acts.device != self.cfg.device:
-            model_acts = model_acts.to(self.cfg.device)
+        if model_acts.device != self.device:
+            model_acts = model_acts.to(self.device)
 
         model_acts_centered = model_acts - self.b_dec
         gate_activation = model_acts_centered @ self.W_gate[:, feature_index] + self.b_gate[feature_index]
@@ -353,7 +359,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         feature_magnitude = self.relu(model_acts_centered @ self.W_mag[:, feature_index] + self.b_mag[feature_index])
         feature_activation = active_feature * feature_magnitude
 
-        return feature_activation.unsqueeze(-1)  # Ensure it keeps the right dimensions
+        return feature_activation.unsqueeze(-1) #[batch, 1]
 
     
 
