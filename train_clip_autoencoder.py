@@ -57,7 +57,7 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
 
     cfg = AutoencoderConfig(
         seed=42,
-        batch_size=2048, #2048 or 4096
+        batch_size=4096, #2048 or 4096
         buffer_mult=10,
         lr=5e-5, #anthropic suggested 5e-5
         l1_coeff=0, # initially 0 but progressively increases to 5
@@ -75,12 +75,15 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
         type=type
     )
 
-    model_dir = f"{PATH}/autoencoders"
+    model_dir = f"{PATH}/laion2b_autoencoders"
     os.makedirs(model_dir, exist_ok=True)
-    hidden = cfg.d_mlp * cfg.dict_mult
+    vol.commit()
     
+    if type == "gated_autoencoder":
+        model = GatedAutoEncoder(cfg)
+    else:
+        model = AutoEncoder(cfg)
 
-    model = AutoEncoder(cfg)
     wandb.init(
         # set the wandb project where this run will be logged
         project="Sparse AutoEncoder",
@@ -106,10 +109,6 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
         train_share=0.8
     )
 
-    model_path = f"{model_dir}/laion2b_autoencoder"
-    os.makedirs(model_path, exist_ok=True)
-    vol.commit()
-
     model.to(model.cfg.device)
     
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
@@ -123,7 +122,7 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
     
     for epoch in range(cfg.n_epochs): # type: ignore
         model.train()
-        for batch in tqdm(train_loader, desc="Training"): # type: ignore
+        for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): # type: ignore
             step += 1
             # Update l1_coeff linearly over the first 5% of the total steps
             if step <= l1_ramp_steps:
@@ -137,21 +136,28 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
             result.loss.backward()
             optimizer.step()
             
-            data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
-            wandb.log({**data, "l1_coeff": cfg.l1_coeff})
-            if step % 1000 == 0:
-                print({**data, "l1_coeff": cfg.l1_coeff})
+            #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
+            if step % 10 == 0:
+                wandb.log({
+                    "l1_coeff": cfg.l1_coeff,
+                    **result.format_loss()
+                })
+            
 
-        basename = cfg.basename(epoch)
-        torch.save(model.state_dict(), f"{model_path}/{basename}.pt")
-        with open(f"{model_path}/{basename}.json", "w") as f:
+        basename = cfg.create_basename(epoch)
+        model_path = f'{model_dir}/{basename}'
+        os.makedirs(model_path, exist_ok=True)
+        print("saving model at", model_path)
+        torch.save(model.state_dict(), f"{model_path}/model.pt")
+        with open(f"{model_path}/config.json", "w") as f:
             cfg.n_steps = step
             f.write(cfg.model_dump_json())
         vol.commit()
-        print("checkpoint and cfg saved at", f"{model_path}", os.listdir(model_path))
+        print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
 
         model.eval()
         with torch.no_grad():
+            print(f"evaluation epoch {epoch}\n")
             for batch in tqdm(test_loader, desc="Testing"):
                 batch = batch.to(model.cfg.device)
                 result = model.forward(batch, method="with_loss")
@@ -160,6 +166,7 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
                 wandb.log({**data, "l1_coeff": cfg.l1_coeff})
                 print("\n",{**data, "l1_coeff": cfg.l1_coeff})
 
+
 async def save_activations_async(path: str, activations: torch.Tensor):
     buffer = BytesIO()
     np.save(buffer, activations.numpy(), allow_pickle=False)
@@ -167,8 +174,6 @@ async def save_activations_async(path: str, activations: torch.Tensor):
     async with aiofiles.open(path, 'wb') as f:
         await f.write(buffer.read())
     dataset_vol.commit()
-
-
 
 @stub.function(
     image = image,
@@ -180,12 +185,10 @@ async def save_activations_async(path: str, activations: torch.Tensor):
 )
 def get_recons_loss(
     model_path : str,    
-    save_intermediate_acts : bool
 ):
 
     autoencoder = AutoEncoder.load_from_checkpoint(
         model_path,
-        device="cuda"
     )
 
     print("len validation set", len(autoencoder.metadata_cfg.validation_set)) # type: ignore

@@ -1,6 +1,6 @@
 from modal import Stub, Volume, Image
 stub = Stub(name="autoencoder anthropic")
-vol = Volume.from_name("autoencoder anthropic", create_if_missing=True)
+vol = Volume.from_name("autoencoder", create_if_missing=True)
 dataset_vol = Volume.from_name("laion_dataset", create_if_missing=True)
 PATH = "/autoencoder"
 DATASET_NAME = "roneneldan/TinyStories"
@@ -23,25 +23,8 @@ def download_model():
 
 image = Image.from_registry(
     "nvidia/cuda:12.1.0-base-ubuntu22.04", add_python="3.11"
-).pip_install(
-    "torch",
-    "transformer_lens",
-    "transformers",
-    "datasets",
-    "einops",
-    "pandas",
-    "pydantic>=2.0",
-    "huggingface_hub",
-    "wandb",
-    "tqdm",
-    "pytest",
-    "sentencepiece",
-    "psutil",
-    "instructor",
-    "torchmetrics",
-    "aiohttp",
-    "pillow",
-    "aiofiles",
-    "litellm",
+).pip_install_from_requirements(
+    "requirements.txt"
 )
 #.run_function(download_model)
+

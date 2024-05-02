@@ -28,6 +28,14 @@ class GatedAutoEncoderResult(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
+    def format_loss(self):
+        return {
+            "L_Reconstruct": self.L_Reconstruct.item(),
+            "L_Sparsity": self.L_Sparsity.item(),
+            "L_aux": self.L_aux.item(),
+            "total_loss": self.loss.item()
+        }
+
 class AutoencoderResult(BaseModel):
     loss: Tensor
     x_reconstruct: Tensor
@@ -37,6 +45,13 @@ class AutoencoderResult(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+    def format_loss(self):
+        return {
+            "l2_loss": self.l2_loss.item(),
+            "l1_loss": self.l1_loss.item(),
+            "total_loss": self.loss.item()
+        }
 
 class AutoencoderModelConfig(BaseModel):
     type: Literal['autoencoder', 'gated_autoencoder']
@@ -232,7 +247,6 @@ class AutoEncoder(AutoEncoderBase):
             return acts
         x_reconstruct = acts @ self.W_dec + self.b_dec
         if method == 'with_loss':
-            t0 = time.time()
             l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
             l1_loss = self.l1_coeff * (acts.float().abs().sum())
             loss = l2_loss + l1_loss

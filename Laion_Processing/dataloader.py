@@ -169,7 +169,8 @@ class LaionFileLoader:
     
     def __len__(self):
         if self.dataset.data is not None:
-            return self.dataset.data.shape[0] * len(self.dataset.emb_paths)
+            number = (self.dataset.data.shape[0] * len(self.dataset.emb_paths)) / self.dataloader.batch_size # type: ignore
+            return int(number)
         return 0
     
     def yield_batches(self) -> Generator[
