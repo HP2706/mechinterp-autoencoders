@@ -84,11 +84,21 @@ class AutoencoderConfig(AutoencoderModelConfig):
     n_steps: Optional[int] = None
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
-    loss_func : Literal['with_loss', 'with_new_loss'] = 'with_loss'
+    loss_func : Optional[Literal['with_loss', 'with_new_loss']] = None
+
+    @field_validator('loss_func')
+    @classmethod
+    def check_loss_func(cls, v):
+        if v is not None:
+            if v == 'with_new_loss' and cls.type == 'gated_autoencoder':
+                raise ValueError("Gated Autoencoder does not support 'with_new_loss' loss function")
+        return v
+
 
     def create_basename(self, epoch: Optional[int] = None)->str:
         epoch = epoch if epoch is not None else self.n_epochs
         return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_lr_{self.lr}_dict_mult_{self.dict_mult}_epoch_{epoch}'
+
 
 
 class AutoEncoderBase(nn.Module, ABC):
@@ -144,7 +154,6 @@ class AutoEncoderBase(nn.Module, ABC):
             
         json_path = f'{dir_path}/config.json'
         
-        print(json_path)
         if not os.path.exists(json_path): 
             raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
 
@@ -153,7 +162,6 @@ class AutoEncoderBase(nn.Module, ABC):
         cls.metadata_cfg = cfg
 
         device = get_device()
-        print("config type", cfg.type)
 
         if cfg.type == 'autoencoder':
             model = AutoEncoder(cfg)
@@ -333,6 +341,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.W_mag = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(self.W_mag)
         self.device = get_device()
+        self.to(self.device)
 
     @classmethod
     @overload

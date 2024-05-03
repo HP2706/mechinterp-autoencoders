@@ -122,8 +122,13 @@ def find_token_pos(
     idxs = torch.nonzero(tokens == token).squeeze().tolist() 
     return [idxs] if isinstance(idxs, int) else idxs
 
+def load_and_scale_tensor(
+    path : str,
+    scale : float = 100
+) -> torch.Tensor:
+    tensor = torch.tensor(np.load(path))
+    return tensor*100
 
-    
 def filter_non_zero(
     activations: torch.Tensor,
     threshold: Optional[float] = None

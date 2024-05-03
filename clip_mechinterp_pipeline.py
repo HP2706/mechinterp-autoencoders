@@ -1,5 +1,6 @@
 import os
 import tqdm
+import shutil
 import pandas as pd
 import numpy as np
 import torch
@@ -94,13 +95,55 @@ class ClipMechInterpPipeline:
     def get_acts_dir(self, index : int) -> str:
         return f"{PATH}/laion_acts_idx_{index}_{self.model.dir_name}"
 
-    def interpretability_data(self, index : int) -> Optional[List[pd.DataFrame]]:
+    def get_activations_metadata(self, index : int) -> Optional[pd.DataFrame]:
         dirname = self.get_acts_dir(index)
         if not os.path.exists(dirname):
             return None
-        return [
-            pd.read_parquet(f"{dirname}/metadata_{i}.parquet") for i in range(len(os.listdir(dirname)))
+        
+        dataframes = [
+            pd.read_parquet(os.path.join(dirname, file)) 
+            for file in os.listdir(dirname) 
+            if file.endswith(".parquet")
         ]
+        return pd.concat(dataframes)
+
+    @method()
+    def delete_dir(
+        self,
+        index : int
+    ):
+        dirname = self.get_acts_dir(index)
+        if os.path.exists(dirname):
+            shutil.rmtree(dirname)
+            vol.commit()
+
+    @method()
+    def check_activations(self):
+
+        for (tensor, df_metadata) in tqdm.tqdm(
+            self.dataset.iter_files(max_count=1), 
+        ):      
+            batch_size = 512
+            step = 0
+
+            for j in range(0, tensor.shape[0], batch_size):
+                batch = tensor[j:j+batch_size].to(self.device)
+                data = self.model.forward(batch, 'with_loss')
+                activations = data.acts
+                recons_loss = (data.x_reconstruct - (batch- batch.mean(dim=0))).pow(2).mean() 
+                print("\nrecons_loss", recons_loss)
+                print("mean norm", batch.norm(dim=1).mean())
+                print("\nmax", activations.max(), "min", activations.min(), "mean", activations.mean())
+                # Get the max activation for each index across the batch
+                max_activations = activations.max(dim=0)[0]
+                # Compute the mean of these max activations
+                mean_max_activations = max_activations.mean()
+                print("\nmean_max_activations", mean_max_activations)
+                print("\nmean_max_activations.item()", mean_max_activations.item())
+                step += 1
+
+                if step > 5:
+                    break
 
     @method()
     def create_acts_dataset(
@@ -112,8 +155,11 @@ class ClipMechInterpPipeline:
         dirname = self.get_acts_dir(index)
         os.makedirs(dirname, exist_ok=True)
 
-        for (i, (tensor, df_metadata)) in tqdm.tqdm(
-            enumerate(self.dataset.iter_files(max_count=n_files)), 
+        dataframes = []
+        activations = []
+
+        for (tensor, df_metadata) in tqdm.tqdm(
+            self.dataset.iter_files(max_count=n_files), 
             total=n_files,
             desc="Processing Files"
         ):            
@@ -124,21 +170,37 @@ class ClipMechInterpPipeline:
                 batch_size = 512*20*500 # note we are only using one weight idx, so 1000x less compute and memory
                 for j in range(0, tensor.shape[0], batch_size):
                     result = self.model.get_single_feature_acts(tensor[j:j+batch_size], feature_index=index).cpu()
-                    non_zero_indices, zero_indices = filter_non_zero(result)
+                    print("max", result.max(), "min", result.min(), "mean", result.mean())
+                    non_zero_indices, zero_indices = filter_non_zero(result) # be very careful with thresholding
                     removed_indices.extend(
                         (zero_indices + j).tolist() # get the global index
                     )
                     batch.append(result[non_zero_indices])
-                
-                filtered_acts = torch.cat(batch)
 
-            df_metadata = df_metadata.drop(removed_indices)
-            df_metadata['activation'] = filtered_acts
-            #create quantized activations
-            num_bins = 9
-            df_metadata['quantized_acts'] = np.digitize(filtered_acts, bins = np.linspace(-1, 1, num_bins))
-            df_metadata.to_parquet(f"{dirname}/metadata_{i}.parquet")
-            vol.commit()
+                dataframes.append(df_metadata.drop(removed_indices))
+                filtered_acts = torch.cat(batch)
+                print("filtered_acts", filtered_acts.shape)
+                if len(filtered_acts) == 0: 
+                    # if there are no activations in an entire dataset 
+                    # we skip the feature entirely
+                    print("No activations to process.")
+                    print("activations activations.numel() == 0", activations)
+                    return  # or handle the case as needed
+                activations.append(filtered_acts)
+
+        activations = torch.cat(activations)
+        print("activations", activations.shape)
+        if len(activations) < 50:
+            print("Not enough activations to process, got", len(activations))
+            return
+        
+        df = pd.concat(dataframes)
+        df['activation'] = activations
+        num_bins = 9
+        df['quantized_acts'] = np.digitize(activations, bins = np.linspace(activations.min(), activations.max(), num_bins))
+        
+        df.to_parquet(f"{dirname}/metadata.parquet")
+        vol.commit()
 
 
     @method()
@@ -148,12 +210,10 @@ class ClipMechInterpPipeline:
         feature_or_neuron : Literal['feature', 'neuron'] = 'feature',
     ):
 
-        dataframes = self.interpretability_data(index)
-        if dataframes is None:
+        df = self.get_activations_metadata(index)
+        if df is None:
             raise ValueError(f"Index {index} does not exist")
         
-        print("number of dataframes", len(dataframes))
-        df = pd.concat(dataframes) #this might not work for large dataframes
         df = df.sort_values(by='activation', ascending=False)
         print("df", df)
         print("columns", df.columns)

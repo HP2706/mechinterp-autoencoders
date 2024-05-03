@@ -6,6 +6,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import Generator, Literal, Optional, List, Tuple, Union
 from pydantic import BaseModel
+from utils import load_and_scale_tensor
 
 def check_inputs(kwargs):
     split = kwargs.get('split', None)
@@ -67,7 +68,7 @@ class LaionDataset(Dataset):
         count = 0
         for i in range(len(self.emb_paths)):
             try:
-                tensors = torch.tensor(np.load(self.emb_paths[i]))
+                tensors = load_and_scale_tensor(self.emb_paths[i])
                 df = pd.read_parquet(self.metadata_paths[i])
                 yield (tensors, df)
             except ValueError as e:
@@ -87,16 +88,14 @@ class LaionDataset(Dataset):
         return self.metadata_df
 
     def get_data_by_idx(self, idx: int) -> Tuple[torch.Tensor, pd.DataFrame]:
-        tensor = torch.tensor(np.load(self.emb_paths[idx]))
+        tensor = load_and_scale_tensor(self.emb_paths[idx])
         metadata_df = pd.read_parquet(self.metadata_paths[idx])
         return tensor, metadata_df
             
-            
-
     def load_next_file(self):
         self.current_file_index += 1
         if self.current_file_index < len(self.emb_paths):
-            self.data = torch.tensor(np.load(self.emb_paths[self.current_file_index]))
+            self.data = load_and_scale_tensor(self.emb_paths[self.current_file_index])
             if self.return_tuple:
                 self.metadata_df = pd.read_parquet(self.metadata_paths[self.current_file_index])
         else:
@@ -108,8 +107,6 @@ class LaionDataset(Dataset):
             print("self.emb_paths len", len(self.emb_paths))
             return self.data.shape[0] * len(self.emb_paths)
         return 0
-
-        
         
     @overload
     def __getitem__(self, idx: int) -> torch.Tensor: ...
