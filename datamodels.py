@@ -54,8 +54,8 @@ class TextContent(BaseModel):
     text: str
 
 class ImageContent(BaseModel):
-    image_path: str
-    image_caption: str
+    image_url: str
+    caption: str
 
 class FeatureSample(BaseModel):
     quantized_activation: int

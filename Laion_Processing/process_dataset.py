@@ -23,18 +23,18 @@ with image.imports():
     import requests
 
 
-def download_laion_file(file_name: str, destination_folder: str)->bool:
-    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{file_name}"
+def download_laion_file(dir_name: str, destination_folder: str)->bool:
+    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{dir_name}"
     content = requests.get(url, allow_redirects=True).content
 
     open(
-        os.path.join(destination_folder, file_name.split("/")[-1]), 
+        os.path.join(destination_folder, dir_name.split("/")[-1]), 
         'wb'
     ).write(content)
 
     dataset_vol.commit()
     dataset_vol.reload()
-    print(f"Downloaded {file_name}")
+    print(f"Downloaded {dir_name}")
     print("check if it is saved", os.listdir(destination_folder))
     return True
 
@@ -47,16 +47,16 @@ def download_laion_file(file_name: str, destination_folder: str)->bool:
     container_idle_timeout=30
 )
 async def async_download_laion_file(
-    file_name: str, 
+    dir_name: str, 
     destination_folder: str
 )->Union[bool, Tuple[bool, Tuple[str, str]]]:
     
-    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{file_name}"
+    url = f"https://the-eye.eu/public/AI/cah/laion5b/embeddings/laion2B-en/{dir_name}"
     try:    
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as response:
                 if response.status == 200:
-                    file_path = os.path.join(destination_folder, file_name.split("/")[-1])
+                    file_path = os.path.join(destination_folder, dir_name.split("/")[-1])
                     with open(file_path, 'wb') as f:
                         while True:
                             chunk = await response.content.read(1024)
@@ -67,11 +67,11 @@ async def async_download_laion_file(
                     dataset_vol.reload()
                     return True
                 else:
-                    print(f"Failed to download {file_name}: HTTP {response.status}")
+                    print(f"Failed to download {dir_name}: HTTP {response.status}")
                     return False
     except Exception as e:
-        print(f"Failed to download {file_name}: {e}")
-        return (False, (file_name, destination_folder))
+        print(f"Failed to download {dir_name}: {e}")
+        return (False, (dir_name, destination_folder))
     
 @stub.function(
     image = image,

@@ -1,12 +1,70 @@
 import torch
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from typing import List, Optional, Dict, Any, TypeVar, Union
+from typing import List, Optional, Dict, Any, TypeVar, Union, Literal
 from pydantic import BaseModel
 import json
-from typing import Type
+from typing import Type, Tuple
 import time
 import functools
+import base64
+from PIL import Image
+import io
+import requests
+
+def format_image_anthropic(img: Union[Image.Image, str]) -> dict:
+    if isinstance(img, str):
+        image1_url = "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg"
+        img = Image.open(io.BytesIO(requests.get(image1_url).content))
+        
+    buffered = io.BytesIO()
+    img.save(buffered, format="JPEG")
+    base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
+    image_media_type = "image/jpeg"
+
+    return {
+        "type": "image", 
+        "source": {
+            "type": "base64",
+            "media_type": image_media_type,
+            "data": base64_image
+        }
+    }
+
+def format_image_openai(img: Union[Image.Image, str]) -> dict:
+    if isinstance(img, str):
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": img
+            }
+        }
+    else:
+        buffered = io.BytesIO()
+        img.save(buffered, format="JPEG")
+        base64_image = base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{base64_image}"
+            }
+        }
+
+def filter_valid_image_urls(urls : List[str]) -> List[bool]:
+    valid_data = []
+    for item in urls:
+        try:
+            response = requests.head(item, timeout=5)
+            if response.status_code == 200:
+                valid_data.append(True)
+            else:
+                valid_data.append(False)
+        except requests.RequestException:
+            # Handle exceptions for timeouts, connection problems, etc.
+            valid_data.append(False)
+    return valid_data
+
+
 
 def time_decorator(func):
     @functools.wraps(func)
@@ -34,6 +92,15 @@ def modified_lm_cross_entropy_loss(logits, tokens):
     tokens = tokens[:, 1:].contiguous().view(-1)
     return loss_fn(logits, tokens)
 
+def get_device() -> Literal['cuda', 'cpu', 'mps']:
+    '''returns the device being used'''
+    if torch.cuda.is_available():
+        return 'cuda'
+    elif torch.backends.mps.is_available(): #type: ignore
+        return 'mps'
+    else:
+        return 'cpu'
+
 def get_gpu_memory_usage() -> float:
     '''returns the percentage of GPU memory used'''
     return torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated()
@@ -55,28 +122,21 @@ def find_token_pos(
     idxs = torch.nonzero(tokens == token).squeeze().tolist() 
     return [idxs] if isinstance(idxs, int) else idxs
 
-def filter_non_zero_sequence(   
-    tokens : torch.Tensor,
+
+    
+def filter_non_zero(
     activations: torch.Tensor,
-    threshold : Optional[float] = None
-) -> tuple[torch.Tensor, torch.Tensor]:
-    '''filters out the non-zero activations
-    activations shape is (batch_size, seq_len) or (seq_len)
-    Args:
-        tokens: (batch_size, seq_len) or (seq_len)
-        activations: (batch_size, seq_len) or (seq_len)
-    Returns:
-        non_zero_activations : (n_non_zero_activations)
-        non_zero_tokens : (n_non_zero_activations)
-    '''
-    non_zero_indices = torch.nonzero(activations, as_tuple=True)
-    non_zero_activations = activations[non_zero_indices]
-    non_zero_tokens = tokens[non_zero_indices]
+    threshold: Optional[float] = None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+   
     if threshold is not None:
-        condition = non_zero_activations > threshold
-        non_zero_activations = non_zero_activations[condition]
-        non_zero_tokens = non_zero_tokens[condition]
-    return non_zero_activations, non_zero_tokens
+        mask = torch.any(torch.abs(activations) > threshold, dim=-1)
+    else:
+        mask = torch.any(activations != 0, dim=-1)
+
+    non_zero_indices = mask.nonzero(as_tuple=True)[0]
+    zero_indices = (~mask).nonzero(as_tuple=True)[0]
+    return non_zero_indices, zero_indices
 
 T = TypeVar("T")
 

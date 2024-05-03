@@ -15,6 +15,7 @@ from common import image, stub, vol, PATH
 from datamodels import (
     MultiTokenActivationExample, 
     ActivationExample, 
+    TextContent,
     InterpretabilityData, 
     FeatureDescription, 
     FeatureSample,
@@ -24,7 +25,7 @@ from automated_interpretability import AutomatedInterpretability
 from utils import (
     find_token_pos, 
     filter_zeros, 
-    filter_non_zero_sequence, 
+    filter_non_zero, 
     convert_to_pydantic_model,
     remove_keys, 
     write_models_to_json, 
@@ -75,17 +76,18 @@ class MechInterpPipeline:
         self.automated_interp_pipeline = AutomatedInterpretability(
             instructor.from_openai(OpenAI()), model=self.interpretability_model_name
         )
+        
         model : HookedTransformer = HookedTransformer.from_pretrained(
             self.model_name, device=self.cfg.device
         ).to(self.cfg.d_type) #type: ignore
-        
+    
         self.model = model 
         self.tokenizer = deepcopy(model.tokenizer)
         self.encoder = AutoEncoder.load_from_hf(self.encoder_name, self.cfg.device).to(self.cfg.device)
         self.all_tokens = None
         
         #TODO is this a smart design decision?
-        self.interp_save_path = os.path.join(self.save_path, "interpretability_data.parquet")
+        self.interp_save_path = os.path.join(self.save_path, f"interpretability_data_{self.model_name}.parquet")
         if os.path.exists(self.interp_save_path):
             self.interp_df = pd.read_parquet(self.interp_save_path)
         else:
@@ -322,10 +324,10 @@ class MechInterpPipeline:
 
     @method()
     def build_and_interpret(self, idx:int, kwargs):
-            self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
-            neuron_feature = kwargs.get('feature_or_neuron')
-            #we interpret the data
-            self.get_interpretability_correlation(feature_or_neuron= neuron_feature, index=idx)   
+        self.create_acts_dataset(index =idx, **kwargs, save_dataset=True)
+        neuron_feature = kwargs.get('feature_or_neuron')
+        #we interpret the data
+        self.get_interpretability_correlation(feature_or_neuron= neuron_feature, index=idx)   
     
     def get_interpretability_correlation(
         self, 
@@ -365,28 +367,28 @@ class MechInterpPipeline:
 
         # Use pd.cut to bin the data
         df['quantized_activation'] = pd.cut(df['activation'], bins=bins, labels=bin_labels, include_lowest=True) # type: ignore
-        dataset = {}
-
         #we get 2 random examples for each interval and 10 for the last one(the biggest)
+        dataset = []
+        
         selected_indices = []
 
         for i in range(12):
             quantile_indices = df[df['quantized_activation'] == i].index
             sample_size = min(10 if i == 11 else 2, len(quantile_indices))
             sampled_indices = df.loc[quantile_indices].sample(n=sample_size, random_state=42).index
-            dataset[f'quantile_{i}'] = [
+            dataset.extend([
                 {key: value for key, value in row.items() if key != 'activation'} 
                 for row in df.loc[sampled_indices].to_dict(orient='records')
-            ]
+            ])
             selected_indices.extend(sampled_indices.tolist())
 
         # Now, select random samples from the indices that were not picked
         remaining_indices = list(set(df.index) - set(selected_indices))
         random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
-        dataset['random'] = [
+        dataset.extend([
             remove_keys(row, 'activation')
             for row in random_samples.to_dict(orient='records')
-        ]
+        ])
         feature_hypothesis = self.automated_interp_pipeline.explain_activation(dataset)
 
         feature_description = FeatureDescription(
@@ -502,7 +504,7 @@ class MechInterpPipeline:
                             activations[i:i + batch_size], 
                             threshold, 
                             remove_zeros,
-                            filter_non_zero_sequence,
+                            filter_non_zero, #this is a small hack to get the tokenizer
                             tokenizer_copy,
                         )
                         for i in range(0, len(dataset), batch_size)
@@ -514,9 +516,7 @@ class MechInterpPipeline:
         batch_results = []
         for sublist in results:
             batch_results.extend(sublist)
-
         return batch_results
-
 
 def process_batch(
     feature_or_neuron: Literal["neuron", "feature"],
@@ -525,7 +525,7 @@ def process_batch(
     activations: torch.Tensor, 
     threshold: float, 
     remove_zeros: bool,
-    filter_non_zero_sequence : Callable[
+    filter_non_zero : Callable[
         [torch.Tensor, torch.Tensor, Optional[float]], tuple[torch.Tensor, torch.Tensor]
     ], 
     tokenizer : Any,
@@ -542,7 +542,7 @@ def process_batch(
         batch_tokens = dataset[batch_idx]
         batch_activations = activations[batch_idx]
         if remove_zeros:
-            acts, zero_tokens = filter_non_zero_sequence(
+            acts, zero_tokens = filter_non_zero(
                 batch_tokens, batch_activations, threshold
             ) 
             if acts.numel() == 0:  # no non-zero activations, we skip
@@ -563,15 +563,19 @@ def process_batch(
                 chunk = ''.join(tokenizer.batch_decode(batch_tokens[start_idx:])) #type: ignore get the last chunk
                 context += chunk
 
+                content = TextContent(
+                    token_id=token_id, 
+                    token=token_str, 
+                    positions=idxs, 
+                    text=context
+                )
+
                 batch_results.append(
                     ActivationExample(
                         feature_or_neuron=feature_or_neuron,
-                        index=index,
-                        token=token_str, 
-                        token_id=token_id, 
-                        positions = idxs,
-                        activation=act,
-                        text=context,
+                        index=index, 
+                        content=content,
+                        activation=act
                     )
                 )
         else:

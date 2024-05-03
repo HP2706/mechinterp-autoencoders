@@ -2,6 +2,7 @@ import json
 import os
 import time 
 from typing import Optional
+from click import Option
 import torch
 from torch import Tensor
 import torch.nn as nn
@@ -83,7 +84,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
     n_steps: Optional[int] = None
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
-
+    loss_func : Literal['with_loss', 'with_new_loss'] = 'with_loss'
 
     def create_basename(self, epoch: Optional[int] = None)->str:
         epoch = epoch if epoch is not None else self.n_epochs
@@ -130,8 +131,7 @@ class AutoEncoderBase(nn.Module, ABC):
     @classmethod
     def load_from_checkpoint(
         cls, 
-        checkpoint_path : str, 
-        json_path : Optional[str] = None
+        dir_path : str, 
     ) -> Union['GatedAutoEncoder', 'AutoEncoder']:
         """
         Loads the saved autoencoder from a checkpoint.
@@ -139,29 +139,31 @@ class AutoEncoderBase(nn.Module, ABC):
         and the json file is assumed to be in the same directory as the checkpoint with the same name, but with
         a .json extension.
         """
-
+        if not os.path.isdir(dir_path):
+            raise ValueError(f"Checkpoint file not found at {dir_path}")
+            
+        json_path = f'{dir_path}/config.json'
         
-        if not checkpoint_path.endswith(".pt"):
-            raise ValueError("checkpoint_path must end with .pt")
-        if json_path is None:
-            json_path = checkpoint_path.replace(".pt", ".json")
-            if not os.path.exists(json_path):
-                print("files in the same directory", os.listdir(os.path.dirname(checkpoint_path)))
-                raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
+        print(json_path)
+        if not os.path.exists(json_path): 
+            raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
 
-        cls.file_name = checkpoint_path.split('/')[-1].split('.')[0] # we removce file extension
+        cls.dir_name = dir_path.split('/')[-1] 
         cfg = AutoencoderConfig(**json.loads(open(json_path).read()))
         cls.metadata_cfg = cfg
 
         device = get_device()
+        print("config type", cfg.type)
 
-        if cfg.type == cls.__name__.lower():  # Ensure the type matches the class name
-            model = cls(cfg)
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-            return model # type: ignore
+        if cfg.type == 'autoencoder':
+            model = AutoEncoder(cfg)
+        elif cfg.type == 'gated_autoencoder':
+            model = GatedAutoEncoder(cfg)
         else:
             raise ValueError(f"Config type '{cfg.type}' does not match the expected type '{cls.__name__.lower()}'")
 
+        model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=device))
+        return model
 
 #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
 class AutoEncoder(AutoEncoderBase):
@@ -387,57 +389,30 @@ class GatedAutoEncoder(AutoEncoderBase):
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct']
     ) -> Union[Tensor, GatedAutoEncoderResult]:
-        start_time = time.time()
 
-        # Centering x
         x_center = x - self.b_dec
-        center_time = time.time()
-
-        # Computing gate activations
         gate_center = x_center @ self.W_gate + self.b_gate
-        gate_time = time.time()
-
-        # Computing active features
         active_features = (gate_center > 0).float()
-        active_features_time = time.time()
 
-        # Computing feature magnitudes
         feature_magnitudes = self.relu(x_center @ self.W_mag + self.b_mag)
-        feature_magnitudes_time = time.time()
 
         # Computing final activations
         acts = active_features * feature_magnitudes
-        acts_time = time.time()
 
         # Reconstructing x
         x_reconstruct = acts @ self.W_dec + self.b_dec
-        reconstruct_time = time.time()
-
-        total_time = time.time() - start_time
-        print("distribution of time spent in each part of the forward pass")
-        print(f"Time spent centering x: {(center_time - start_time) / total_time * 100:.2f}%")
-        print(f"Time spent computing gate activations: {(gate_time - center_time) / total_time * 100:.2f}%")
-        print(f"Time spent computing active features: {(active_features_time - gate_time) / total_time * 100:.2f}%")
-        print(f"Time spent computing feature magnitudes: {(feature_magnitudes_time - active_features_time) / total_time * 100:.2f}%")
-        print(f"Time spent computing final activations: {(acts_time - feature_magnitudes_time) / total_time * 100:.2f}%")
-        print(f"Time spent reconstructing x: {(reconstruct_time - acts_time) / total_time * 100:.2f}%")
-
+ 
         if method == 'with_acts':
-            print(f"Total time: {reconstruct_time - start_time:.6f}s")
             return acts
         elif method == 'reconstruct':
-            print(f"Total time: {reconstruct_time - start_time:.6f}s")
             return x_reconstruct
         elif method == 'with_loss':
-            loss_time = time.time()
-            # Computing L_Reconstruct
+            #Reconstruct loss
             L_Reconstruct = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            l_reconstruct_time = time.time()
 
-            # Computing L_Sparsity
+            # Computing Sparsity loss
             via_gate_feature_magnitudes = self.relu(gate_center)
             L_Sparsity = self.l1_coeff * (via_gate_feature_magnitudes.float().sum())
-            l_sparsity_time = time.time()
 
             # Computing L_aux with frozen decoder
             with torch.no_grad():
@@ -445,14 +420,10 @@ class GatedAutoEncoder(AutoEncoderBase):
                 b_dec_frozen = self.b_dec.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
             L_aux = (x - via_gate_reconstruction).pow(2).sum(-1).mean(0)
-            l_aux_time = time.time()
 
             # Summing up the losses
             loss = L_Reconstruct + L_Sparsity + L_aux
-            loss_time = time.time()
 
-            print(f"Total time: {loss_time - start_time:.6f}s")
-            print(f"time in with_loss: {loss_time - reconstruct_time:.6f}s")
             return GatedAutoEncoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
@@ -462,5 +433,4 @@ class GatedAutoEncoder(AutoEncoderBase):
                 L_aux=L_aux
             )
         else:
-            print(f"Total time: {reconstruct_time - start_time:.6f}s")
             return x_reconstruct

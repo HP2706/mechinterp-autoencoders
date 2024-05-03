@@ -49,7 +49,12 @@ with image.imports():
     secrets=[modal.Secret.from_name("my-wandb-secret")],
     _allow_background_volume_commits=True
 )
-def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoencoder'], dict_mult : int):
+def train_autoencoder(
+    n_epochs: int, 
+    type: Literal['autoencoder', 'gated_autoencoder'], 
+    dict_mult : int,
+    loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss'
+):
     d_mlp = 768 
     paths = [os.path.join(EMB_FOLDER, p) for p in os.listdir(EMB_FOLDER)]
     train_files = paths[:int(len(paths)*0.8)]
@@ -79,10 +84,17 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
     
+
+
     if type == "gated_autoencoder":
         model = GatedAutoEncoder(cfg)
     else:
         model = AutoEncoder(cfg)
+        if loss_func :
+            if loss_func in ['with_loss', 'with_new_loss']:
+                model.metadata_cfg.loss_func = loss_func
+            else:
+                raise ValueError("loss_func must be one of ['with_loss', 'with_new_loss']")
 
     wandb.init(
         # set the wandb project where this run will be logged
@@ -116,13 +128,10 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
     total_steps = len(train_loader) * cfg.n_epochs 
     l1_coeff_final = 5
     l1_ramp_steps = int(0.05 * total_steps)
-    print("total steps", total_steps*cfg.batch_size)
-    print("expected ca total steps", 16*9.5*10e5*cfg.n_epochs)
-
     
     for epoch in range(cfg.n_epochs): # type: ignore
         model.train()
-        for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): # type: ignore
+        for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
             # Update l1_coeff linearly over the first 5% of the total steps
             if step <= l1_ramp_steps:
@@ -132,7 +141,7 @@ def train_autoencoder(n_epochs: int, type: Literal['autoencoder', 'gated_autoenc
 
             batch = batch.to(model.cfg.device)
             optimizer.zero_grad()
-            result = model.forward(batch, method="with_loss")
+            result = model.forward(batch, method=loss_func) # type: ignore
             result.loss.backward()
             optimizer.step()
             
