@@ -92,20 +92,35 @@ class ClipMechInterpPipeline:
         else:
             self.feature_data = [] 
 
-    def get_acts_dir(self, index : int) -> str:
-        return f"{PATH}/laion_acts_idx_{index}_{self.model.dir_name}"
 
-    def get_activations_metadata(self, index : int) -> Optional[pd.DataFrame]:
+
+    def get_acts_dir(self, index : Union[int, Literal['all']]) -> str:
+        if index == 'all':
+            return f"{PATH}/laion_acts_all_{self.model.dir_name}"
+        else:
+            return f"{PATH}/laion_acts_idx_{index}_{self.model.dir_name}"
+
+    def get_activations_metadata(
+        self, 
+        index : Union[int, Literal['all']] = 'all'
+    ) -> pd.DataFrame:
+        
         dirname = self.get_acts_dir(index)
         if not os.path.exists(dirname):
-            return None
+            dirname = f"{PATH}/laion_acts_all_{self.model.dir_name}"
+            
+        if not os.path.exists(dirname):
+            raise ValueError(f"Index {index} does not exist")
         
         dataframes = [
             pd.read_parquet(os.path.join(dirname, file)) 
             for file in os.listdir(dirname) 
             if file.endswith(".parquet")
         ]
-        return pd.concat(dataframes)
+        df = pd.concat(dataframes)
+        if isinstance(index, int):
+            df = df[df['feature_idx'] == index]
+        return df
 
     @method()
     def delete_dir(
@@ -173,7 +188,7 @@ class ClipMechInterpPipeline:
             with torch.no_grad():
                 df_rows = []
                 batch_size = 1024
-                for j in tqdm.tqdm(range(0, tensor.shape[0], batch_size)):
+                for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
                     scaled_batch = tensor[j:j+batch_size].to(self.device)
                     out = self.model.forward(scaled_batch, 'with_loss')
                     non_zero_indices, _ = filter_non_zero_batch(out.acts, threshold=1e-3)
@@ -199,10 +214,9 @@ class ClipMechInterpPipeline:
                             'feature_idx': idx[1],
                             'data_idx': original_indices[idx[0]]+nrows,
                         })
-                    
-            dataframes.append(pd.DataFrame(df_rows))
-            save_intermediate()
+                        
 
+            dataframes.append(pd.DataFrame(df_rows))
             print("df_rows", len(df_rows))
             print("df head", dataframes[-1].head())
             nrows += len(df_metadata)
@@ -213,12 +227,6 @@ class ClipMechInterpPipeline:
         df['quantized_acts'] = np.digitize(activations, bins = np.linspace(activations.min(), activations.max(), num_bins))
         save_intermediate()
         vol.commit()
-
-
-
-           
-
-
 
     @method()
     def create_acts_dataset_by_index(
@@ -245,7 +253,6 @@ class ClipMechInterpPipeline:
                 for j in range(0, tensor.shape[0], batch_size):
                     batch_tensor = tensor[j:j+batch_size].to(self.device)
                     result = self.model.get_single_feature_acts(batch_tensor, feature_index=index).cpu()
-                    print("max", result.max(), "min", result.min(), "mean", result.mean())
                     non_zero_indices, zero_indices = filter_non_zero_batch(result) # be very careful with thresholding
                     removed_indices.extend(
                         (zero_indices + j).tolist() # get the global index
@@ -254,17 +261,11 @@ class ClipMechInterpPipeline:
 
                 dataframes.append(df_metadata.drop(removed_indices))
                 filtered_acts = torch.cat(batch)
-                print("filtered_acts", filtered_acts.shape)
                 if len(filtered_acts) == 0: 
-                    # if there are no activations in an entire dataset 
-                    # we skip the feature entirely
-                    print("No activations to process.")
-                    print("activations activations.numel() == 0", activations)
                     return  # or handle the case as needed
                 activations.append(filtered_acts)
 
         activations = torch.cat(activations)
-        print("activations", activations.shape)
         if len(activations) < 50:
             print("Not enough activations to process, got", len(activations))
             return
@@ -286,15 +287,19 @@ class ClipMechInterpPipeline:
     ):
 
         df = self.get_activations_metadata(index)
-        if df is None:
-            raise ValueError(f"Index {index} does not exist")
-        
         df = df.sort_values(by='activation', ascending=False)
-        print("df", df)
+
         print("columns", df.columns)
         print("len df", len(df))
         selected_indices = []
         dataset = []
+        
+        df = self.get_activations_metadata(index)
+        df = df.sort_values(by='activation', ascending=False)
+
+        
+        print("value counts feature_idx", df['feature_idx'].value_counts())
+
 
         # for each bin, select 2 examples except for the last bin where we select 10 examples
         for i in range(9):
@@ -302,12 +307,28 @@ class ClipMechInterpPipeline:
                 10 if i == 9 else 2, 
                 len(df[df['quantized_acts'] == i])
             )
-            sampled_indices = df[df['quantized_acts'] == i].sample(n=sample_size, random_state=42).index
-            print("number of rows with quantized_acts level", i, len(df[df['quantized_acts'] == i]))
-            selected_indices.extend(sampled_indices)
-            dataset.extend(df.loc[sampled_indices].to_dict(orient='records')) # type: ignore
+            
+            df_quantized = df[df['quantized_acts'] == i]
+            df_quantized = df_quantized.sort_values(by='activation', ascending=False)
+            valid_sampled_data = []
+            remaining_indices = df_quantized.index.tolist()
 
+            while len(valid_sampled_data) < sample_size and len(remaining_indices) > 0:
+                # Reduce sample size to avoid infinite loop in case of persistent invalid URLs
+                sample_size = max(0, sample_size - len(valid_sampled_data))
+
+                sampled_indices = np.random.choice(remaining_indices, size=sample_size, replace=False)
+                sampled_data = df_quantized.loc[sampled_indices].to_dict(orient='records')
+                
+                valid_data = filter_valid_image_urls([row['url'] for row in sampled_data])
+                valid_sampled_data.extend([sampled_data[j] for j in range(len(sampled_data)) if valid_data[j]])
+            
+            dataset.extend(valid_sampled_data)
+            if len(valid_sampled_data) < sample_size:
+                print(f"Could not reach target sample size for quantized_acts level {i}. Expected {sample_size}, got {len(valid_sampled_data)}")
+        
         #of remaining rows, select 5 random samples
+        #TODO this can be improved massively!!!
         remaining_indices = list(set(df.index) - set(selected_indices))
         random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
         dataset.extend(random_samples.to_dict(orient='records')) # type: ignore
@@ -321,13 +342,8 @@ class ClipMechInterpPipeline:
             for row in dataset
         ] 
 
-        t0 = time.time()
         valid_data = filter_valid_image_urls([row.image_url for row in formatted_data])
-        print("Time taken for filtering", time.time() - t0)
-        print("len before filtering", len(formatted_data))
         formatted_data = [formatted_data[i] for i in range(len(formatted_data)) if valid_data[i]]
-        print("len after filtering", len(formatted_data))
-        print("Time taken for filtering", time.time() - t0)
         feature_hypothesis = self.automated_interp_pipeline.explain_activation(formatted_data[:3])
 
         print("feature_hypothesis", feature_hypothesis)
@@ -343,7 +359,7 @@ class ClipMechInterpPipeline:
                         image_url=row['url'],
                         caption=row['caption']
                     )
-                ) for row in dataset
+                ) for row in df.head(10).to_dict(orient='records')
             ],
             low_act_samples=[
                 FeatureSample(
@@ -353,10 +369,9 @@ class ClipMechInterpPipeline:
                         image_url=row['url'],
                         caption=row['caption']
                     )
-                ) for row in dataset
+                ) for row in df.tail(10).to_dict(orient='records')
             ],
         )
-        return
         self.feature_data.append(feature_description)
         write_models_to_json(self.feature_data, self.feature_df_save_path)
         vol.commit()
