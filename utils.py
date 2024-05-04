@@ -129,19 +129,26 @@ def load_and_scale_tensor(
     tensor = torch.tensor(np.load(path))
     return tensor*100
 
-def filter_non_zero(
+
+def get_sparsity_factor(x : torch.Tensor):
+    '''returns the sparsity factor of a tensor'''
+    mask = x == 0
+    return mask.float().sum() / x.numel()
+
+
+def filter_non_zero_batch(
     activations: torch.Tensor,
     threshold: Optional[float] = None
 ) -> Tuple[torch.Tensor, torch.Tensor]:
    
-    if threshold is not None:
+    if threshold:
         mask = torch.any(torch.abs(activations) > threshold, dim=-1)
     else:
         mask = torch.any(activations != 0, dim=-1)
 
-    non_zero_indices = mask.nonzero(as_tuple=True)[0]
-    zero_indices = (~mask).nonzero(as_tuple=True)[0]
-    return non_zero_indices, zero_indices
+    non_zero_indices = mask.nonzero(as_tuple=False)
+    zero_indices = (~mask).nonzero(as_tuple=False)
+    return non_zero_indices.reshape(-1), zero_indices.reshape(-1)
 
 T = TypeVar("T")
 
@@ -177,17 +184,6 @@ def load_models_from_json(model_class: Type[B], filename: str) -> List[B]:
         models = [model_class(**data) for data in json_data]
     return models
 
-def filter_zeros(
-    a : torch.Tensor, 
-    threshold : float = 1e-4
-):
-    '''filters across batch dimension'''
-    # Step 1: Identify batches where all elements are zero in the sequence dimension
-    zero_batches = torch.all(torch.abs(a) < threshold, dim=1)
-
-    # Step 2: Filter out batches that are entirely zero
-    filtered_a = a[~zero_batches]
-    return filtered_a
 
 def test_loss_fn():
     # Test the functions

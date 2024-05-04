@@ -37,13 +37,13 @@ from automated_interpretability import AutomatedInterpretability
 from utils import (
     write_models_to_json, 
     load_models_from_json,
+    filter_non_zero_batch,
 )
 from litellm import completion
 from Laion_Processing.dataloader import LaionDataset
 import instructor
 from modal import gpu, Secret, enter, method, build
 from openai import OpenAI
-from utils import filter_non_zero
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -148,6 +148,81 @@ class ClipMechInterpPipeline:
     @method()
     def create_acts_dataset(
         self,
+        n_files : int = 5,
+    ) -> None:
+
+        dirname = f"{PATH}/laion_acts_all_{self.model.dir_name}"
+        os.makedirs(dirname, exist_ok=True)
+
+        dataframes : List[pd.DataFrame] = []
+
+        def save_intermediate():
+            #save intermediate 
+            df = pd.concat(dataframes)
+            df.to_parquet(f"{dirname}/metadata.parquet")
+            vol.commit()
+
+
+        nrows = 0
+        for (tensor, df_metadata) in tqdm.tqdm(
+            self.dataset.iter_files(max_count=n_files), 
+            total=n_files,
+            desc="Processing Files"
+        ):            
+            
+            with torch.no_grad():
+                df_rows = []
+                batch_size = 1024
+                for j in tqdm.tqdm(range(0, tensor.shape[0], batch_size)):
+                    scaled_batch = tensor[j:j+batch_size].to(self.device)
+                    out = self.model.forward(scaled_batch, 'with_loss')
+                    non_zero_indices, _ = filter_non_zero_batch(out.acts, threshold=1e-3)
+                    
+                    #if there are no non-zero activations, we skip the batch because 
+                    # it is all zeros or below the activation threshold
+                    if non_zero_indices.nelement() == 0:
+                        continue
+                    
+                    # Get non-zero activations and their indices for the entire batch
+                    non_zero_activations = out.acts[non_zero_indices]
+                    non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
+                    original_indices = (non_zero_indices + j).tolist()
+                    
+                    # Extract the activation values using these indices
+                    activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
+            
+                    #this might become the bottleneck
+                    for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
+                        df_rows.append(
+                            {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
+                            'activation': value,
+                            'feature_idx': idx[1],
+                            'data_idx': original_indices[idx[0]]+nrows,
+                        })
+                    
+            dataframes.append(pd.DataFrame(df_rows))
+            save_intermediate()
+
+            print("df_rows", len(df_rows))
+            print("df head", dataframes[-1].head())
+            nrows += len(df_metadata)
+
+        df = pd.concat(dataframes)
+        num_bins = 9
+        activations = df['activation']
+        df['quantized_acts'] = np.digitize(activations, bins = np.linspace(activations.min(), activations.max(), num_bins))
+        save_intermediate()
+        vol.commit()
+
+
+
+           
+
+
+
+    @method()
+    def create_acts_dataset_by_index(
+        self,
         index : int,
         n_files : int = 5,
     ) -> None:
@@ -163,15 +238,15 @@ class ClipMechInterpPipeline:
             total=n_files,
             desc="Processing Files"
         ):            
-            tensor = tensor.to(self.device)
             with torch.no_grad():
                 batch = []
                 removed_indices = []
                 batch_size = 512*20*500 # note we are only using one weight idx, so 1000x less compute and memory
                 for j in range(0, tensor.shape[0], batch_size):
-                    result = self.model.get_single_feature_acts(tensor[j:j+batch_size], feature_index=index).cpu()
+                    batch_tensor = tensor[j:j+batch_size].to(self.device)
+                    result = self.model.get_single_feature_acts(batch_tensor, feature_index=index).cpu()
                     print("max", result.max(), "min", result.min(), "mean", result.mean())
-                    non_zero_indices, zero_indices = filter_non_zero(result) # be very careful with thresholding
+                    non_zero_indices, zero_indices = filter_non_zero_batch(result) # be very careful with thresholding
                     removed_indices.extend(
                         (zero_indices + j).tolist() # get the global index
                     )

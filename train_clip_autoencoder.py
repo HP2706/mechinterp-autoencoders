@@ -15,31 +15,17 @@ import asyncio
 from io import BytesIO
 from Laion_Processing.dataloader import LaionDataset, LaionFileLoader
 import wandb
-from autoencoder import AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
-from utils import load_activations
+from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
+from utils import load_and_scale_tensor
 from modal import gpu
 import modal
-from datamodels import ActivationData, ActivationMetaData
-import pandas as pd
 import os
-import numpy as np
-import torch
 from typing import Literal, Optional
 from utils import remove_keys
 
-with image.imports():
-    from transformers import AutoTokenizer, AutoModelForCausalLM
-    from datasets import load_from_disk
-    from huggingface_hub import snapshot_download
-    import torch
-    from torch.optim import AdamW
-    from typing import Any, Dict, List, Type, Union, Generator
-    import wandb
-    from tqdm import tqdm
-    import psutil
-    import time
-    import os
-    import json
+from torch.optim import AdamW
+from tqdm import tqdm
+
 
 @stub.function(
     image = image,
@@ -53,49 +39,53 @@ def train_autoencoder(
     n_epochs: int, 
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
-    loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss'
+    with_ramp: bool,
+    loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
+    retrain_path : Optional[str] = None,
+    additional_epochs : Optional[int] = 2
 ):
-    d_mlp = 768 
-    paths = [os.path.join(EMB_FOLDER, p) for p in os.listdir(EMB_FOLDER)]
-    train_files = paths[:int(len(paths)*0.8)]
-    test_files = paths[int(len(paths)*0.8):]
+    
+    if retrain_path is not None:
+        model = AutoEncoderBase.load_from_checkpoint(retrain_path)
+        model_dir = retrain_path
+        print("retraining model")
+        cfg = model.metadata_cfg
+    else:
+        d_mlp = 768 
+        paths = [os.path.join(EMB_FOLDER, p) for p in os.listdir(EMB_FOLDER)]
+        train_files = paths[:int(len(paths)*0.8)]
+        test_files = paths[int(len(paths)*0.8):]
 
-    cfg = AutoencoderConfig(
-        seed=42,
-        batch_size=4096, #2048 or 4096
-        buffer_mult=10,
-        lr=5e-5, #anthropic suggested 5e-5
-        l1_coeff=0, # initially 0 but progressively increases to 5
-        beta1=0.9,
-        beta2=0.999,
-        dict_mult=dict_mult,
-        seq_len=512,
-        d_mlp=d_mlp,
-        buffer_size=1000000,
-        buffer_batches=25,
-        device="cuda",
-        n_epochs=n_epochs,
-        training_set=train_files,
-        validation_set=test_files,
-        type=type
-    )
+        cfg = AutoencoderConfig(
+            seed=42,
+            batch_size=4096, #2048 or 4096
+            buffer_mult=10,
+            lr=5e-5, #anthropic suggested 5e-5
+            l1_coeff=0, # initially 0 but progressively increases to 5
+            beta1=0.9,
+            beta2=0.999,
+            dict_mult=dict_mult,
+            seq_len=512,
+            d_mlp=d_mlp,
+            buffer_size=1000000,
+            buffer_batches=25,
+            device="cuda",
+            n_epochs=n_epochs,
+            training_set=train_files,
+            validation_set=test_files,
+            type=type
+        )
+
+        if type == "gated_autoencoder":
+            model = GatedAutoEncoder(cfg)
+        else:
+            model = AutoEncoder(cfg)
+
 
     model_dir = f"{PATH}/laion2b_autoencoders"
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
     
-
-
-    if type == "gated_autoencoder":
-        model = GatedAutoEncoder(cfg)
-    else:
-        model = AutoEncoder(cfg)
-        if loss_func :
-            if loss_func in ['with_loss', 'with_new_loss']:
-                model.metadata_cfg.loss_func = loss_func
-            else:
-                raise ValueError("loss_func must be one of ['with_loss', 'with_new_loss']")
-
     wandb.init(
         # set the wandb project where this run will be logged
         project="Sparse AutoEncoder",
@@ -128,18 +118,25 @@ def train_autoencoder(
     total_steps = len(train_loader) * cfg.n_epochs 
     l1_coeff_final = 5
     l1_ramp_steps = int(0.05 * total_steps)
-    
-    for epoch in range(cfg.n_epochs): # type: ignore
+
+    model.l1_coeff = l1_coeff_final
+    if retrain_path is not None:
+        _range = range(cfg.n_epochs, cfg.n_epochs + additional_epochs) # type: ignore
+    else:
+        _range = range(cfg.n_epochs)
+
+    for epoch in _range: # type: ignore
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
             # Update l1_coeff linearly over the first 5% of the total steps
-            if step <= l1_ramp_steps:
-                cfg.l1_coeff = (l1_coeff_final / l1_ramp_steps) * step #linearly increase l1_coeff
-            else:
-                cfg.l1_coeff = l1_coeff_final
+            if with_ramp:
+                if step <= l1_ramp_steps:
+                    model.l1_coeff = (l1_coeff_final / l1_ramp_steps) * step #linearly increase l1_coeff
 
             batch = batch.to(model.cfg.device)
+            #we have scaled the embeddings by 100 to make them larger and easier to work with
+
             optimizer.zero_grad()
             result = model.forward(batch, method=loss_func) # type: ignore
             result.loss.backward()
@@ -148,7 +145,7 @@ def train_autoencoder(
             #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
             if step % 10 == 0:
                 wandb.log({
-                    "l1_coeff": cfg.l1_coeff,
+                    "l1_coeff": model.l1_coeff,
                     **result.format_loss()
                 })
             
@@ -160,6 +157,8 @@ def train_autoencoder(
         torch.save(model.state_dict(), f"{model_path}/model.pt")
         with open(f"{model_path}/config.json", "w") as f:
             cfg.n_steps = step
+            cfg.loss_func = loss_func
+            
             f.write(cfg.model_dump_json())
         vol.commit()
         print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
@@ -170,11 +169,7 @@ def train_autoencoder(
             for batch in tqdm(test_loader, desc="Testing"):
                 batch = batch.to(model.cfg.device)
                 result = model.forward(batch, method="with_loss")
-
-                data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
-                wandb.log({**data, "l1_coeff": cfg.l1_coeff})
-                print("\n",{**data, "l1_coeff": cfg.l1_coeff})
-
+                wandb.log({**result.format_loss(), "l1_coeff": model.l1_coeff})
 
 async def save_activations_async(path: str, activations: torch.Tensor):
     buffer = BytesIO()
@@ -195,7 +190,6 @@ async def save_activations_async(path: str, activations: torch.Tensor):
 def get_recons_loss(
     model_path : str,    
 ):
-
     autoencoder = AutoEncoder.load_from_checkpoint(
         model_path,
     )
@@ -205,7 +199,7 @@ def get_recons_loss(
     losses = []
     for file in tqdm(autoencoder.metadata_cfg.validation_set):
         try:
-            all_tokens = torch.tensor(np.load(file))
+            all_tokens = load_and_scale_tensor(file)
         except:
             print("error loading file", file)
             continue
@@ -222,6 +216,5 @@ def get_recons_loss(
             losses.append(((x_reconstruct - mean_ablated)**2).mean().item()) #mse
     
     print("mean loss", np.mean(losses))
-
 
 
