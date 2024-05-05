@@ -68,6 +68,41 @@ class FeatureDescription(ActivationHypothesis):
     high_act_samples: list[FeatureSample]
     low_act_samples: list[FeatureSample]
 
+    @staticmethod
+    def build_feature_description(
+        feature_hypothesis : ActivationHypothesis, 
+        index : int, 
+        feature_or_neuron : Literal["feature", "neuron"], 
+        positive_samples : List[FeatureSample], 
+        negative_samples : List[FeatureSample]
+    ):
+        return FeatureDescription(
+            **feature_hypothesis.model_dump(),
+            feature_or_neuron=feature_or_neuron,
+            index=index,
+            high_act_samples=[
+                FeatureSample(
+                    quantized_activation=row['quantized_acts'],
+                    activation=row['activation'],
+                    content=ImageContent(
+                        image_url=row['url'],
+                        caption=row['caption']
+                    )
+                ) for row in positive_samples
+            ],
+            low_act_samples=[
+                FeatureSample(
+                    quantized_activation=row['quantized_acts'],
+                    activation=row['activation'],
+                    content=ImageContent(
+                        image_url=row['url'],
+                        caption=row['caption']
+                    )
+                ) for row in negative_samples
+            ],
+        )
+
+
 class PredictNextLogit(BaseModel):
     is_next: bool = Field(..., description="""
         based on earlier history, guess if the next token is the suggested token or not, given the context

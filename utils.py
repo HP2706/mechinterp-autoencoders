@@ -50,6 +50,31 @@ def format_image_openai(img: Union[Image.Image, str]) -> dict:
             }
         }
 
+
+import asyncio
+import aiohttp
+
+async def async_filter_valid_image_urls(urls: List[str], max_concurrent_requests: int = 50) -> List[bool]:
+    semaphore = asyncio.Semaphore(max_concurrent_requests)
+
+    async def fetch_status(url):
+        async with semaphore:
+            async with aiohttp.ClientSession() as session:
+                attempts = 3  # Number of retries
+                for _ in range(attempts):
+                    try:
+                        async with session.head(url, timeout=20) as response:  # Increased timeout
+                            if response.status == 200:
+                                return True
+                    except aiohttp.ClientError:
+                        continue
+                    await asyncio.sleep(0.1)  # Wait a bit before retrying
+                return False
+
+    async def fetch_all(urls):
+        return await asyncio.gather(*(fetch_status(url) for url in urls))
+    return await fetch_all(urls)
+
 def filter_valid_image_urls(urls : List[str]) -> List[bool]:
     valid_data = []
     for item in urls:
@@ -63,8 +88,6 @@ def filter_valid_image_urls(urls : List[str]) -> List[bool]:
             # Handle exceptions for timeouts, connection problems, etc.
             valid_data.append(False)
     return valid_data
-
-
 
 def time_decorator(func):
     @functools.wraps(func)
@@ -176,6 +199,16 @@ def write_models_to_json(models: List[B], filename: str) -> None:
     with open(filename, 'w') as file:
         json_data = [model.model_dump() for model in models]
         json.dump(json_data, file, indent=4)
+
+def clip_embed_image(images: List[Image.Image]):
+    '''this function embeds images using the CLIP model from OpenAI.'''
+    from transformers import CLIPProcessor, CLIPModel
+    model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14-336")
+    processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14-336")
+    inputs = processor(images=images, return_tensors="pt", padding=True, truncation=True) # type: ignore
+    outputs = model(**inputs) # type: ignore
+    return outputs.image_embeds
+
 
 def load_models_from_json(model_class: Type[B], filename: str) -> List[B]:
     '''Loads a list of BaseModel derived objects from a JSON file.'''

@@ -282,96 +282,70 @@ class ClipMechInterpPipeline:
     @method()
     def get_interpretability_correlation(
         self, 
-        index : int,
-        feature_or_neuron : Literal['feature', 'neuron'] = 'feature',
+        index: int,
+        feature_or_neuron: Literal['feature', 'neuron'] = 'feature',
     ):
+        df = self.get_activations_metadata(index).sort_values(by='activation', ascending=False)
 
-        df = self.get_activations_metadata(index)
-        df = df.sort_values(by='activation', ascending=False)
-
-        print("columns", df.columns)
-        print("len df", len(df))
-        selected_indices = []
+        positive_samples = []
+        negative_samples = []
         dataset = []
-        
-        df = self.get_activations_metadata(index)
-        df = df.sort_values(by='activation', ascending=False)
 
-        
-        print("value counts feature_idx", df['feature_idx'].value_counts())
-
-
-        # for each bin, select 2 examples except for the last bin where we select 10 examples
+        # Process each quantization bin
         for i in range(9):
-            sample_size = min(
-                10 if i == 9 else 2, 
-                len(df[df['quantized_acts'] == i])
-            )
-            
-            df_quantized = df[df['quantized_acts'] == i]
-            df_quantized = df_quantized.sort_values(by='activation', ascending=False)
-            valid_sampled_data = []
-            remaining_indices = df_quantized.index.tolist()
+            sample_size = 10 if i == 8 else 2
+            df_quantized = df[df['quantized_acts'] == i].sort_values(by='activation', ascending=False)
+            valid_sampled_data = sample_valid_data(df_quantized, sample_size)
 
-            while len(valid_sampled_data) < sample_size and len(remaining_indices) > 0:
-                # Reduce sample size to avoid infinite loop in case of persistent invalid URLs
-                sample_size = max(0, sample_size - len(valid_sampled_data))
+            if i > 5:
+                positive_samples.extend(valid_sampled_data)
+            else:
+                negative_samples.extend(valid_sampled_data)
 
-                sampled_indices = np.random.choice(remaining_indices, size=sample_size, replace=False)
-                sampled_data = df_quantized.loc[sampled_indices].to_dict(orient='records')
-                
-                valid_data = filter_valid_image_urls([row['url'] for row in sampled_data])
-                valid_sampled_data.extend([sampled_data[j] for j in range(len(sampled_data)) if valid_data[j]])
-            
             dataset.extend(valid_sampled_data)
             if len(valid_sampled_data) < sample_size:
                 print(f"Could not reach target sample size for quantized_acts level {i}. Expected {sample_size}, got {len(valid_sampled_data)}")
-        
-        #of remaining rows, select 5 random samples
-        #TODO this can be improved massively!!!
-        remaining_indices = list(set(df.index) - set(selected_indices))
+
+        # Sample additional random data
+        remaining_indices = list(set(df.index) - set(sum([data.index.tolist() for data in dataset], [])))
         random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
-        dataset.extend(random_samples.to_dict(orient='records')) # type: ignore
+        dataset.extend(random_samples.to_dict(orient='records'))
 
-        formatted_data = [
-            LaionRowData(
-                image_url=row['url'],
-                caption=row['caption'],
-                quantized_activation=row['quantized_acts'],
-            )
-            for row in dataset
-        ] 
-
-        valid_data = filter_valid_image_urls([row.image_url for row in formatted_data])
-        formatted_data = [formatted_data[i] for i in range(len(formatted_data)) if valid_data[i]]
-        feature_hypothesis = self.automated_interp_pipeline.explain_activation(formatted_data[:3])
-
+        # Process and format data
+        formatted_data = format_data_for_interpretation(dataset)
+        feature_hypothesis = self.automated_interp_pipeline.explain_activation(formatted_data)
         print("feature_hypothesis", feature_hypothesis)
-        feature_description = FeatureDescription(
-            **feature_hypothesis.model_dump(),
-            feature_or_neuron=feature_or_neuron,
-            index=index,
-            high_act_samples=[
-                FeatureSample(
-                    quantized_activation=row['quantized_acts'],
-                    activation=row['activation'],
-                    content=ImageContent(
-                        image_url=row['url'],
-                        caption=row['caption']
-                    )
-                ) for row in df.head(10).to_dict(orient='records')
-            ],
-            low_act_samples=[
-                FeatureSample(
-                    quantized_activation=row['quantized_acts'],
-                    activation=row['activation'],
-                    content=ImageContent(
-                        image_url=row['url'],
-                        caption=row['caption']
-                    )
-                ) for row in df.tail(10).to_dict(orient='records')
-            ],
+        # Create and save feature description
+        feature_description = FeatureDescription.build_feature_description(
+            feature_hypothesis, 
+            index, 
+            feature_or_neuron, 
+            positive_samples, 
+            negative_samples
         )
         self.feature_data.append(feature_description)
         write_models_to_json(self.feature_data, self.feature_df_save_path)
         vol.commit()
+
+def sample_valid_data(df, sample_size):
+    valid_sampled_data = []
+    remaining_indices = df.index.tolist()
+
+    while len(valid_sampled_data) < sample_size and remaining_indices:
+        sampled_indices = np.random.choice(remaining_indices, size=sample_size, replace=False)
+        sampled_data = df.loc[sampled_indices].to_dict(orient='records')
+        valid_data = filter_valid_image_urls([row['url'] for row in sampled_data])
+        filtered = [sampled_data[j] for j in range(len(sampled_data)) if valid_data[j]]
+        valid_sampled_data.extend(filtered)
+        remaining_indices = list(set(remaining_indices) - set(sampled_indices))
+
+    return valid_sampled_data
+
+def format_data_for_interpretation(dataset):
+    return [
+        LaionRowData(
+            image_url=row['url'],
+            caption=row['caption'],
+            quantized_activation=row['quantized_acts'],
+        ) for row in dataset if filter_valid_image_urls([row['url']])
+    ]

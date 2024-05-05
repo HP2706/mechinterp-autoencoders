@@ -11,3 +11,4 @@ features.json
 *.jpg
 config.json
 model.pt
+*.wav
