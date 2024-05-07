@@ -1,7 +1,6 @@
 from instructor import Instructor, AsyncInstructor
 from typing import Any, AsyncGenerator, List, Optional, Type, TypeVar, Any, Coroutine, Literal, Union
-from datamodels import PredictActivation, ActivationHypothesis, PredictNextLogit, ActivationExample, LaionRowData
-from utils import format_image_anthropic, format_image_openai, remove_keys
+from datamodels import InconclusiveHypothesis, PredictActivation, ActivationHypothesis, PredictNextLogit, FeatureSample, ImageContent
 from PIL import Image
 import numpy as np
 #image computability metrics 
@@ -35,53 +34,30 @@ class AutomatedInterpretability:
         
     def explain_activation(
         self,
-        examples : Union[List[LaionRowData], List[ActivationExample]], 
+        examples : List[FeatureSample], 
         feature_or_neuron : Literal["feature", "neuron"] = "feature",
-        image_provider : Literal['openai', 'anthropic'] = 'openai'
-    ) -> ActivationHypothesis:
+        image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai'
+    ) -> Union[ActivationHypothesis, InconclusiveHypothesis]:
         '''predicts an explanation based on earlier examples
         Args:
             client : AsyncInstructor, the client to use to predict activations
             model : str, the model to predict activations for
-            examples : List[ActivationExample], the examples of different activations, and the immediate context in which they appear
+            examples : List[FeatureSample], the examples of different activations, and the immediate context in which they appear
             feature_or_neuron : Literal["feature", "neuron"], whether to predict a feature or neuron
         '''
-        assert all (isinstance(elm, LaionRowData) for elm in examples) or all (isinstance(elm, ActivationExample) for elm in examples), "All examples should be LaionRowData or dict"
+        assert all(isinstance(elm, FeatureSample) for elm in examples), "All examples should be LaionRowData or dict"
 
         formatted_examples = []
-
         
         for elm in examples:
-            if isinstance(elm, LaionRowData):
-                formatted_examples.extend(
-                    [
-                        { #type: ignore
-                            "type": "text", 
-                            "text": f"""
-                                caption:{elm.caption}\n
-                                quantized_activation:{elm.quantized_activation}
-                                for below image
-                            """
-
-                        },
-                        format_image_openai(elm.image_url) if image_provider == 'openai' else format_image_anthropic(elm.image_url)
-                    ]
-                )
-            else:
-                formatted_examples.extend(
-                    [
-                        { #type: ignore
-                            "type": "text", 
-                            "text": f"{elm.model_dump()}\nThe image is below" #
-                        },
-                    ]
-                )
-    
-        print("formatted_examples", formatted_examples)
+            formatted_examples.extend(
+                elm.format_for_api(image_provider)
+            )
 
         return self.client.chat.create(
-            response_model=ActivationHypothesis,
+            response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
             model=self.model,
+            max_turns=1,
             messages=[
                 {
                     "role": "system", #type: ignore
@@ -90,13 +66,14 @@ class AutomatedInterpretability:
                             "type": "text", 
                             "text": f"""
                             You are a machine learning scientist.
-                            You job is to create an explanation of a {feature_or_neuron} based on emperical observations 
-                            of in what contexts the {feature_or_neuron} is active and to what degree.
-                            You will base your answer on the following examples, where you will see the context, 
-                            the token and the associated activation for that token.
-                            for each example a quantized activation of the {feature_or_neuron} is given in the interval [0, 9] 
+                            You job is to analyze the following examples, and if posqible, find an hypothesis for 
+                            why the {feature_or_neuron} is active in the given context. In many cases this is not possible,
+                            and you should return a json in format InconclusiveHypothesis. Do not hesitate to return this if
+                            you are not able to find an explanation. With that said, abstract explanation as long as evidence supports it.
+                            For each example you will see the data(text, video, images, audio) and a quantized activation of the {feature_or_neuron} is given in the interval [0, 9] 
                             the higher the more active the {feature_or_neuron} is.
-                            return in the specified json format
+                            the conviction should be a number between 1 and 5. Be nuanced.
+                            return in the specified json format. 
                             """
                         },
                     ]
@@ -104,7 +81,6 @@ class AutomatedInterpretability:
                 {
                     "role": "user", #type: ignore
                     "content": [
-                        #{'type': 'text', 'text': 'the images:'},
                         *formatted_examples 
                     ]
                 }
@@ -178,7 +154,7 @@ class AutomatedInterpretability:
 
     def predict_next_logit(
         self,
-        examples : List[ActivationExample],
+        examples : List[FeatureSample],
         hypothesis : ActivationHypothesis
     ) -> PredictNextLogit:
         '''

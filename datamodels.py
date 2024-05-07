@@ -1,12 +1,14 @@
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, List, Optional, Literal, Union
+from typing import Any, List, Optional, Literal, Protocol, Union, runtime_checkable
+from utils import format_image_anthropic, format_image_openai
 import torch
 
-class LaionRowData(BaseModel):
-    image_url: str
-    caption: str
-    quantized_activation: int
+def save_html(samples : List['FeatureSample'], filename: str):
+    assert all(isinstance(elm, FeatureSample) for elm in samples), "All examples should be FeatureSample"
 
+    html = ''.join([elm.generate_html() for elm in samples])
+    with open(filename, 'w') as file:
+        file.write(html)
 
 class PipelineConfig(BaseModel):
     device: Literal['cuda', 'mps', 'cpu']
@@ -25,18 +27,12 @@ class InterpretabilityData(BaseModel):
     actual_data : Optional[List[int]] = Field(None, description="""quantized activations""")
     llm_predictions : Optional[List[int]] = Field(None, description="""guess on the quantized activation""")
 
-
 class PredictActivation(BaseModel):
     value : int = Field(..., description="""
         the predicted activation for the feature or neuron in the specified quantized range"""
     )
 
-
 class ActivationHypothesis(BaseModel):
-    hypothesis : str = Field(..., description="""
-        an hypothesis for what the feature or neuron is doing based on when the feature or neuron is active.
-        This hypothesis should be based on the examples you are given.
-    """)
     attributes: str = Field(..., description="""
         the attributes of the feature or neuron, in what situations is it active?
     """)
@@ -44,6 +40,28 @@ class ActivationHypothesis(BaseModel):
         the reasoning behind the hypothesis, 
         rely on the negative and positive examples you are given
     """)
+    hypothesis : str = Field(..., description="""
+        an hypothesis for what the feature or neuron is doing based on when the feature or neuron is active.
+        This hypothesis should be based on the examples you are given.
+    """)
+    conviction : int = Field(..., description="""how certain you are in your hypothesis, 1-5 scale""")
+    
+    @field_validator('conviction')
+    def check_conviction(cls, v):
+        if not 1 <= v <= 5:
+            raise ValueError("conviction should be between 1 and 5")
+        return v
+
+
+
+@runtime_checkable
+class FormatForAPI(Protocol):
+    def format_for_api(self, image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai') -> List[dict]:
+        ...
+
+
+class InconclusiveHypothesis(ActivationHypothesis):
+    reason: str = Field(..., description="""why the hypothesis is inconclusive""")
 
 class TextContent(BaseModel):
     token: str
@@ -53,14 +71,71 @@ class TextContent(BaseModel):
     """)
     text: str
 
+    def format_for_api(self) -> List[dict]:
+        return [
+            { #type: ignore
+                "type": "text", 
+                "text": f"""
+                    text:{self.text}\n
+                    token:{self.token} (ID: {self.token_id})\n
+                    positions(the indexes in the text where the token appears):{self.positions}
+                """
+            }
+        ]
+
 class ImageContent(BaseModel):
     image_url: str
     caption: str
 
+    def format_for_api(self, image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai') -> List[dict]:
+        return [
+            { #type: ignore
+                "type": "text", 
+                "text": f"""
+                    caption:{self.caption}\n
+                    for below image
+                """
+
+            },
+            format_image_openai(self.image_url) if image_provider in ['openai', 'gemini'] 
+            else format_image_anthropic(self.image_url)
+        ]
+
 class FeatureSample(BaseModel):
     quantized_activation: int
     activation: float
-    content : Union[TextContent, ImageContent]
+    content : FormatForAPI
+    
+    class Config:
+        arbitrary_types_allowed=True
+
+    def generate_html(self) -> str:
+        html_content = f"<p><strong>Activation:</strong> {self.quantized_activation}</p>"
+        if isinstance(self.content, TextContent):
+            html_content += f"<p><strong>Text:</strong> {self.content.text}</p>"
+            html_content += f"<p><strong>Token:</strong> {self.content.token} (ID: {self.content.token_id})</p>"
+            html_content += f"<p><strong>Positions:</strong> {self.content.positions}</p>"
+        elif isinstance(self.content, ImageContent):
+            html_content += f"<img src='{self.content.image_url}' alt='{self.content.caption}' style='width:300px;'><br>"
+            html_content += f"<caption>{self.content.caption}</caption>"
+        return html_content
+    
+    def format_for_api(
+        self, 
+        image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai'
+    )-> List[dict]:
+        return [
+            { #type: ignore
+                "type": "text", 
+                "text": f"""
+                    quantized_activation:{self.quantized_activation}
+                    for the below data
+                """
+            },
+            *self.content.format_for_api(image_provider)
+        ]
+
+
     
 class FeatureDescription(ActivationHypothesis):
     index: int
@@ -80,47 +155,49 @@ class FeatureDescription(ActivationHypothesis):
             **feature_hypothesis.model_dump(),
             feature_or_neuron=feature_or_neuron,
             index=index,
-            high_act_samples=[
-                FeatureSample(
-                    quantized_activation=row['quantized_acts'],
-                    activation=row['activation'],
-                    content=ImageContent(
-                        image_url=row['url'],
-                        caption=row['caption']
-                    )
-                ) for row in positive_samples
-            ],
-            low_act_samples=[
-                FeatureSample(
-                    quantized_activation=row['quantized_acts'],
-                    activation=row['activation'],
-                    content=ImageContent(
-                        image_url=row['url'],
-                        caption=row['caption']
-                    )
-                ) for row in negative_samples
-            ],
+            high_act_samples=positive_samples,
+            low_act_samples=negative_samples
         )
+    
+    def display_in_file(self, folder_path: str):
+        import os
+        import json
+        from PIL import Image
+        from IPython.display import display, HTML
 
+        # Ensure the folder exists
+        os.makedirs(folder_path, exist_ok=True)
+
+        # Create a unique filename for this feature
+        filename = f"feature_{self.index}_{self.feature_or_neuron}.html"
+        file_path = os.path.join(folder_path, filename)
+
+        # Start HTML document
+        html_content = f"<html><head><title>Feature Description for {self.feature_or_neuron} {self.index}</title></head><body>"
+        html_content += f"<h1>Hypothesis: {self.hypothesis}</h1>"
+        html_content += f"<h2>Attributes: {self.attributes}</h2>"
+        html_content += f"<h3>Reasoning: {self.reasoning}</h3>"
+
+        # Add high activation samples
+        html_content += "<h2>High Activation Samples:</h2>"
+        for sample in self.high_act_samples:
+            html_content += sample.generate_html()
+
+        # Add low activation samples
+        html_content += "<h2>Low Activation Samples:</h2>"
+        for sample in self.low_act_samples:
+            html_content += sample.generate_html()
+        # Close HTML document
+        html_content += "</body></html>"
+
+        # Write to file
+        with open(file_path, "w") as file:
+            file.write(html_content)
 
 class PredictNextLogit(BaseModel):
     is_next: bool = Field(..., description="""
         based on earlier history, guess if the next token is the suggested token or not, given the context
     """) 
-
-class ActivationExample(BaseModel):
-    feature_or_neuron: Literal["neuron", "feature"] = "feature"
-    index: int
-    activation: float
-    content : Union[TextContent, ImageContent]
-
-class MultiTokenActivationExample(BaseModel):
-    feature_or_neuron: Literal["neuron", "feature"] = "feature"
-    index: int
-    tokens: List[str]
-    token_ids: List[int]
-    activation: List[float]
-    text: str
 
 class RunMetaData(BaseModel):
     n_epoch: int

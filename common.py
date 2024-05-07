@@ -3,10 +3,12 @@ stub = Stub(name="autoencoder anthropic")
 vol = Volume.from_name("autoencoder", create_if_missing=True)
 dataset_vol = Volume.from_name("laion_dataset", create_if_missing=True)
 PATH = "/autoencoder"
-DATASET_NAME = "roneneldan/TinyStories"
 LAION_DATASET_PATH = "/laion"
 EMB_FOLDER =  f"{LAION_DATASET_PATH}/img_emb"
 METADATA_FOLDER = f"{LAION_DATASET_PATH}/metadata"
+
+CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
+DIFFUSION_MODEL_ID = "stabilityai/stable-diffusion-2-1-unclip-small"
 
 MODELS_DIR = f"{PATH}/hf_models"
 def download_model():

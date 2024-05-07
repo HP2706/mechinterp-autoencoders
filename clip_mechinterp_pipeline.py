@@ -25,12 +25,10 @@ from common import (
     METADATA_FOLDER
 )
 from datamodels import (
-    ActivationExample, 
     ImageContent,
     InterpretabilityData, 
     FeatureDescription, 
     FeatureSample,
-    LaionRowData,
     PipelineConfig
 )
 from automated_interpretability import AutomatedInterpretability
@@ -297,6 +295,8 @@ class ClipMechInterpPipeline:
             df_quantized = df[df['quantized_acts'] == i].sort_values(by='activation', ascending=False)
             valid_sampled_data = sample_valid_data(df_quantized, sample_size)
 
+            #samples under 5 are considered negative samples
+            #samples above 5 are considered positive samples
             if i > 5:
                 positive_samples.extend(valid_sampled_data)
             else:
@@ -343,9 +343,9 @@ def sample_valid_data(df, sample_size):
 
 def format_data_for_interpretation(dataset):
     return [
-        LaionRowData(
-            image_url=row['url'],
-            caption=row['caption'],
+        FeatureSample(
             quantized_activation=row['quantized_acts'],
+            activation=row['activation'],
+            content=ImageContent(image_url=row['url'], caption=row['caption'])
         ) for row in dataset if filter_valid_image_urls([row['url']])
     ]
