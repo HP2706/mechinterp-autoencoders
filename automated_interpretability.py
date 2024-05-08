@@ -1,5 +1,9 @@
+from anthropic import Anthropic
 from instructor import Instructor, AsyncInstructor
+import instructor
 from typing import Any, AsyncGenerator, List, Optional, Type, TypeVar, Any, Coroutine, Literal, Union
+
+from openai import OpenAI
 from datamodels import InconclusiveHypothesis, PredictActivation, ActivationHypothesis, PredictNextLogit, FeatureSample, ImageContent
 from PIL import Image
 import numpy as np
@@ -26,12 +30,72 @@ def color_diversity(img: Image.Image) -> int:
 class AutomatedInterpretability:
     def __init__(
         self, 
-        client : Instructor,
-        model : str = 'gpt-4-turbo'
+        client : Union[OpenAI, Anthropic],
+        model : str = 'gpt-4-turbo',
+        use_logfire : bool = True
     ) -> None:
-        self.client = client
+        if isinstance(client, Anthropic):
+            self.client = instructor.from_anthropic(client)
+        elif isinstance(client, OpenAI):
+            self.client = instructor.from_openai(client)
+            if use_logfire:
+                import logfire
+                logfire.instrument_openai(client)
         self.model = model
         
+
+    def aggregate_explanation(
+        self,
+        examples : List[FeatureSample], 
+        feature_or_neuron : Literal["feature", "neuron"] = "feature",
+        image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai',
+        max_samples_per_prompt : int = 5
+    ):
+        '''it prompts for an explanation for a set of examples, the prompts and llm to merge the explanations'''
+        pass
+        
+        hypothesis : List[Union[ActivationHypothesis, InconclusiveHypothesis]] = []
+        for i in range(0, len(examples), max_samples_per_prompt):
+            hypothesis.append(
+                self.explain_activation(
+                    examples[i:i+max_samples_per_prompt], 
+                    feature_or_neuron,
+                    image_provider
+                )
+            )
+
+        return self.client.chat.create(
+            response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
+            model=self.model,
+            max_retries=1,
+            messages=[
+                {
+                    "role": "system", #type: ignore
+                    "content": [ 
+                        { #type: ignore
+                            "type": "text", 
+                            "text": f"""
+                            You are a machine learning scientist.
+                            You previously came up with a list of hypothesis for why the {feature_or_neuron} is active 
+                            based on different non overlapping examples.
+                            Your job is to aggregate these hypothesis into one hypothesis. 
+                            or alternatively return an inconclusive hypothesis if the activation hypothesis do not have 
+                            an overlapping theme/explanation.
+                            """
+                        },
+                    ]
+                },
+                {
+                    "role": "user", #type: ignore
+                    "content": [
+                        '\n'.join(
+                            hyp.stringify() for hyp in hypothesis
+                        ) 
+                    ]
+                }
+            ]
+        )
+
     def explain_activation(
         self,
         examples : List[FeatureSample], 
@@ -47,8 +111,7 @@ class AutomatedInterpretability:
         '''
         assert all(isinstance(elm, FeatureSample) for elm in examples), "All examples should be LaionRowData or dict"
 
-        formatted_examples = []
-        
+        formatted_examples = []        
         for elm in examples:
             formatted_examples.extend(
                 elm.format_for_api(image_provider)
@@ -57,7 +120,7 @@ class AutomatedInterpretability:
         return self.client.chat.create(
             response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
             model=self.model,
-            max_turns=1,
+            max_retries=1,
             messages=[
                 {
                     "role": "system", #type: ignore
@@ -89,7 +152,7 @@ class AutomatedInterpretability:
 
     def predict_activation(
         self,
-        unseen_examples : List[dict], 
+        unseen_examples : List[FeatureSample], 
         hypothesis : ActivationHypothesis,
         max_tries : int = 2,
         feature_or_neuron : Literal["feature", "neuron"] = "feature",
@@ -124,7 +187,9 @@ class AutomatedInterpretability:
                                 You are a machine learning scientist.
                                 You job is to predict the activation of a {feature_or_neuron}. 
                                 You previously came up with the following hypothesis for when the {feature_or_neuron} is active:
-                                {hypothesis.hypothesis}
+                                hypothesis: {hypothesis.hypothesis}
+                                degree of conviction: {hypothesis.conviction} 
+                                reasoning: {hypothesis.reasoning}
                                 with this in mind, predict the quantized activation(an integer) caused by the following context:
                                 {formatted_examples}
                                 return in the specified json format. 
@@ -168,6 +233,7 @@ class AutomatedInterpretability:
         return self.client.chat.create(
             response_model=PredictNextLogit,
             model=self.model,
+            max_retries=2,
             messages=[
                 {
                     "role": "system", 
@@ -175,7 +241,8 @@ class AutomatedInterpretability:
                         You are a machine learning scientist.
                         You study the behaviour of features or neurons in an ml model.
                         You have previously come up with the following hypothesis for 
-                        what the feature does {hypothesis.hypothesis}:
+                        what the feature does {hypothesis.hypothesis} with a conviction of {hypothesis.conviction} 
+                        and reasoning {hypothesis.reasoning}:
                         Your job is to, given the following examples, predict whether the 
                         Now you observe the following examples:
                         {examples_stringified}

@@ -1,3 +1,4 @@
+import os
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional, Literal, Protocol, Union, runtime_checkable
 from utils import format_image_anthropic, format_image_openai
@@ -6,7 +7,8 @@ import torch
 def save_html(samples : List['FeatureSample'], filename: str):
     assert all(isinstance(elm, FeatureSample) for elm in samples), "All examples should be FeatureSample"
 
-    html = ''.join([elm.generate_html() for elm in samples])
+    sorted_samples = sorted(samples, key=lambda x: x.quantized_activation) # sort by quantized activation
+    html = ''.join([elm.generate_html() for elm in sorted_samples])
     with open(filename, 'w') as file:
         file.write(html)
 
@@ -19,13 +21,11 @@ class PipelineConfig(BaseModel):
     class Config:
         arbitrary_types_allowed = True
 
-class InterpretabilityData(BaseModel):
-    feature_or_neuron : Literal["feature", "neuron"]
-    index : int
+class InterpretabilityMetaData(BaseModel):
     llm_explanation : str
     spearman_corr : float
-    actual_data : Optional[List[int]] = Field(None, description="""quantized activations""")
-    llm_predictions : Optional[List[int]] = Field(None, description="""guess on the quantized activation""")
+    actual_quantized_activations : Optional[List[int]] = Field(None, description="""quantized activations""")
+    llm_predicted_quantized_activations : Optional[List[int]] = Field(None, description="""guess on the quantized activation""")
 
 class PredictActivation(BaseModel):
     value : int = Field(..., description="""
@@ -44,13 +44,24 @@ class ActivationHypothesis(BaseModel):
         an hypothesis for what the feature or neuron is doing based on when the feature or neuron is active.
         This hypothesis should be based on the examples you are given.
     """)
-    conviction : int = Field(..., description="""how certain you are in your hypothesis, 1-5 scale""")
+    conviction : Optional[int] = Field(None, description="""the level of certainty in the hypothesis from 1-5""") 
     
     @field_validator('conviction')
     def check_conviction(cls, v):
+        if v is None:
+            return v
         if not 1 <= v <= 5:
             raise ValueError("conviction should be between 1 and 5")
         return v
+    
+    def stringify(self) -> str:
+        return f"""
+            ActivationHypothesis:
+            Hypothesis: {self.hypothesis}
+            Attributes: {self.attributes}
+            Reasoning: {self.reasoning}
+            Conviction: {self.conviction}
+        """
 
 
 
@@ -62,6 +73,12 @@ class FormatForAPI(Protocol):
 
 class InconclusiveHypothesis(ActivationHypothesis):
     reason: str = Field(..., description="""why the hypothesis is inconclusive""")
+
+    def stringify(self) -> str:
+        return f"""
+            InconclusiveHypothesis:
+            reason: {self.reason}
+        """
 
 class TextContent(BaseModel):
     token: str
@@ -135,13 +152,14 @@ class FeatureSample(BaseModel):
             *self.content.format_for_api(image_provider)
         ]
 
-
     
-class FeatureDescription(ActivationHypothesis):
+class FeatureDescription(BaseModel):
     index: int
+    activation_hypothesis: ActivationHypothesis
     feature_or_neuron: Literal["feature", "neuron"]
     high_act_samples: list[FeatureSample]
     low_act_samples: list[FeatureSample]
+    metadata: Optional[InterpretabilityMetaData] = None
 
     @staticmethod
     def build_feature_description(
@@ -152,7 +170,7 @@ class FeatureDescription(ActivationHypothesis):
         negative_samples : List[FeatureSample]
     ):
         return FeatureDescription(
-            **feature_hypothesis.model_dump(),
+            activation_hypothesis=feature_hypothesis,
             feature_or_neuron=feature_or_neuron,
             index=index,
             high_act_samples=positive_samples,
@@ -160,11 +178,6 @@ class FeatureDescription(ActivationHypothesis):
         )
     
     def display_in_file(self, folder_path: str):
-        import os
-        import json
-        from PIL import Image
-        from IPython.display import display, HTML
-
         # Ensure the folder exists
         os.makedirs(folder_path, exist_ok=True)
 

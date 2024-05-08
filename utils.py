@@ -12,6 +12,10 @@ from PIL import Image
 import io
 import requests
 
+T = TypeVar("T")
+def flatten_lst(lst: List[List[T]]) -> List[T]:
+    return [item for sublist in lst for item in sublist]
+
 def format_image_anthropic(img: Union[Image.Image, str]) -> dict:
     if isinstance(img, str):
         image1_url = "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg"
@@ -194,11 +198,10 @@ def convert_to_pydantic_model(target : Type[C], data : dict) -> C:
 
 B = TypeVar('B', bound=BaseModel)
 
-def write_models_to_json(models: List[B], filename: str) -> None:
+def write_to_json(data: Dict[int, B], filename: str) -> None:
     '''Writes a list of BaseModel derived objects to a JSON file.'''
     with open(filename, 'w') as file:
-        json_data = [model.model_dump() for model in models]
-        json.dump(json_data, file, indent=4)
+        json.dump({k: v.model_dump() for k, v in data.items()}, file, indent=4)
 
 def clip_embed_image(images: List[Image.Image]):
     '''this function embeds images using the CLIP model from OpenAI.'''
@@ -210,11 +213,11 @@ def clip_embed_image(images: List[Image.Image]):
     return outputs.image_embeds
 
 
-def load_models_from_json(model_class: Type[B], filename: str) -> List[B]:
+def load_feature_descriptions(model_class: Type[B], filename: str) -> Dict[int, B]:
     '''Loads a list of BaseModel derived objects from a JSON file.'''
     with open(filename, 'r') as file:
         json_data = json.load(file)
-        models = [model_class(**data) for data in json_data]
+        models = {int(k): model_class(**data) for k, data in json_data.items()}
     return models
 
 

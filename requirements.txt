@@ -11,10 +11,12 @@ tqdm
 pytest
 sentencepiece
 psutil
-instructor
+instructor==1.2.5
 torchmetrics
 aiohttp
 pillow
 aiofiles
 litellm
+anthropic
+logfire
 google-generativeai

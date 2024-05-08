@@ -1,11 +1,12 @@
 import os
+import random
 import tqdm
 import shutil
 import pandas as pd
 import numpy as np
 import torch
-from utils import get_device
-from typing import List, Literal, Optional, Type, Union
+from utils import get_device, load_feature_descriptions, write_to_json, flatten_lst
+from typing import Any, Dict, List, Literal, Optional, Type, Union
 from utils import filter_valid_image_urls
 import time
 from autoencoder import (
@@ -26,15 +27,16 @@ from common import (
 )
 from datamodels import (
     ImageContent,
-    InterpretabilityData, 
     FeatureDescription, 
     FeatureSample,
-    PipelineConfig
+    InterpretabilityMetaData,
+    PipelineConfig,
+    save_html
 )
 from automated_interpretability import AutomatedInterpretability
 from utils import (
-    write_models_to_json, 
-    load_models_from_json,
+    write_to_json, 
+    load_feature_descriptions,
     filter_non_zero_batch,
 )
 from litellm import completion
@@ -45,6 +47,7 @@ from openai import OpenAI
 
 torch.manual_seed(42)
 np.random.seed(42)
+#set seed for pandas
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 @stub.cls(
@@ -74,10 +77,12 @@ class ClipMechInterpPipeline:
 
         self.dataset = LaionDataset(**dataset_kwargs)
         self.automated_interp_pipeline = AutomatedInterpretability(
-            instructor.from_openai(OpenAI()), model=self.interpretability_model_name
+            OpenAI(), model=self.interpretability_model_name
             #instructor.from_litellm(completion, instructor.mode.Mode.MD_JSON), model=self.interpretability_model_name
         )
         #TODO is this a smart design decision?
+        self.interp_vis_save_path = os.path.join(self.save_path, f"html_vis_{self.model.dir_name}")
+        os.makedirs(self.interp_vis_save_path, exist_ok=True)
         self.interp_save_path = os.path.join(self.save_path, f"interpretability_data_{self.model.dir_name}.parquet")
         if os.path.exists(self.interp_save_path):
             self.interp_df = pd.read_parquet(self.interp_save_path)
@@ -86,9 +91,9 @@ class ClipMechInterpPipeline:
 
         self.feature_df_save_path = os.path.join(self.save_path, "features.json")
         if os.path.exists(self.feature_df_save_path):
-            self.feature_data : List[FeatureDescription] = load_models_from_json(FeatureDescription, self.feature_df_save_path)
+            self.feature_data : Dict[int,FeatureDescription] = load_feature_descriptions(FeatureDescription, self.feature_df_save_path)
         else:
-            self.feature_data = [] 
+            self.feature_data = {} 
 
 
 
@@ -131,6 +136,7 @@ class ClipMechInterpPipeline:
             vol.commit()
 
     @method()
+    #NOTE for debugging
     def check_activations(self):
 
         for (tensor, df_metadata) in tqdm.tqdm(
@@ -227,6 +233,7 @@ class ClipMechInterpPipeline:
         vol.commit()
 
     @method()
+    #NOTE this will almost never be used because activations are so sparse that it can be done all at once.
     def create_acts_dataset_by_index(
         self,
         index : int,
@@ -276,72 +283,141 @@ class ClipMechInterpPipeline:
         df.to_parquet(f"{dirname}/metadata.parquet")
         vol.commit()
 
-
     @method()
-    def get_interpretability_correlation(
+    def get_interpretability_explanation(
         self, 
         index: int,
         feature_or_neuron: Literal['feature', 'neuron'] = 'feature',
     ):
         df = self.get_activations_metadata(index).sort_values(by='activation', ascending=False)
-
-        positive_samples = []
-        negative_samples = []
-        dataset = []
-
         # Process each quantization bin
-        for i in range(9):
-            sample_size = 10 if i == 8 else 2
-            df_quantized = df[df['quantized_acts'] == i].sort_values(by='activation', ascending=False)
-            valid_sampled_data = sample_valid_data(df_quantized, sample_size)
+        data_by_quant, remaining_indices = sample_and_filter_data(df)
 
-            #samples under 5 are considered negative samples
-            #samples above 5 are considered positive samples
-            if i > 5:
-                positive_samples.extend(valid_sampled_data)
-            else:
-                negative_samples.extend(valid_sampled_data)
+        # Filter positive and negative samples based on activation values
+        positive_samples = [
+            lst for (key, lst) in data_by_quant.items() if isinstance(key, int) and key > 5    
+        ]
+        negative_samples = [
+            lst for (key, lst) in data_by_quant.items() if isinstance(key, int) and key < 5    
+        ]
 
-            dataset.extend(valid_sampled_data)
-            if len(valid_sampled_data) < sample_size:
-                print(f"Could not reach target sample size for quantized_acts level {i}. Expected {sample_size}, got {len(valid_sampled_data)}")
-
-        # Sample additional random data
-        remaining_indices = list(set(df.index) - set(sum([data.index.tolist() for data in dataset], [])))
-        random_samples = df.loc[np.random.choice(remaining_indices, size=5, replace=False)]
-        dataset.extend(random_samples.to_dict(orient='records'))
-
+        # Flatten the list of FeatureSample objects for processing
+        all_samples = flatten_lst([lst for lst in data_by_quant.values()])
         # Process and format data
-        formatted_data = format_data_for_interpretation(dataset)
-        feature_hypothesis = self.automated_interp_pipeline.explain_activation(formatted_data)
+        print("number of samples", len(all_samples))
+        random.shuffle(all_samples) #inplace
+        valid_samples = filter_valid_image_urls([elm.content.image_url for elm in all_samples]) #type: ignore
+        if sum(valid_samples) != len(all_samples): # check if all are True
+            raise ValueError("Not all samples are valid, filtering doesnt work", valid_samples)
+        
+        save_html(all_samples[:5], os.path.join(self.interp_vis_save_path, f"test_feature_idx_{index}.html"))
+        vol.commit()
+        feature_hypothesis = self.automated_interp_pipeline.explain_activation(all_samples[:3])
+
         print("feature_hypothesis", feature_hypothesis)
         # Create and save feature description
         feature_description = FeatureDescription.build_feature_description(
             feature_hypothesis, 
             index, 
             feature_or_neuron, 
-            positive_samples, 
-            negative_samples
+            flatten_lst(positive_samples), 
+            flatten_lst(negative_samples)
         )
-        self.feature_data.append(feature_description)
-        write_models_to_json(self.feature_data, self.feature_df_save_path)
+        
+        self.feature_data[index] = feature_description #NOTE this will overwrite the previous 
+        #feature description, perhaps TODO make warning if this happens
+        write_to_json(self.feature_data, self.feature_df_save_path)
         vol.commit()
 
-def sample_valid_data(df, sample_size):
+    @method()
+    def get_interpretability_correlation(
+        self,
+        feature_index: int,
+        n_samples: int = 100,
+    ): 
+        df = self.get_activations_metadata(feature_index)
+        df.sort_values(by='activation', ascending=False, inplace=True)
+        print("columns", df.columns)
+        print(df.head())
+        if feature_index not in self.feature_data:
+            raise ValueError(f"Feature {feature_index} does not exist in feature_data")
+        
+        sampled_data_by_quant, remaining_indices = sample_and_filter_data(df)
+        # we take 10 randomly for each quantile
+        data = flatten_lst([lst for lst in sampled_data_by_quant.values()])
+        hypothesis = self.feature_data[feature_index].activation_hypothesis
+        self.automated_interp_pipeline.predict_activation(data, hypothesis)
+
+def sample_and_filter_data(
+    df: pd.DataFrame, 
+    quant_levels: int = 9, 
+    final_sample_size: int = 10,
+    samples_per_quant: int = 2,
+    exceptions: Optional[Dict[int, int]] = None,
+) -> tuple[Dict[Any, List[FeatureSample]], List[int]]:
+    """
+    Samples and filters data from the dataframe based on quantization levels and filters valid URLs.
+    
+    Args:
+    df (pd.DataFrame): The dataframe to sample from.
+    quant_levels (int): The number of quantization levels.
+    final_sample_size (int): The number of random samples to take after processing all quantization levels.
+    
+    Returns:
+    Tuple[Dict[int, List[dict]], List[int]]: A dictionary with quantization levels as keys and lists of sampled data as values,
+                                              and a list of remaining indices after sampling.
+    """
+    sampled_data_by_quant : Dict[Any, List[FeatureSample]] = {}
+    all_sampled_indices : List[int] = []
+
+    for i in range(quant_levels):
+        df_quantized = df[df['quantized_acts'] == i].sort_values(by='activation', ascending=False)
+
+        if exceptions and i in exceptions:
+            sample_size = min(exceptions[i], len(df_quantized))
+        else:
+            sample_size = min(samples_per_quant, len(df_quantized))
+        valid_sampled_data, sampled_indices = sample_valid_data(df_quantized, sample_size)
+        sampled_data_by_quant[i] = format(valid_sampled_data)
+        all_sampled_indices.extend(sampled_indices)
+
+    remaining_indices = list(set(df.index) - set(all_sampled_indices))
+    if len(remaining_indices) > 0:
+        random_samples = sample_valid_data(df.loc[remaining_indices], final_sample_size)[0]
+        sampled_data_by_quant['random'] = format(random_samples)
+
+    return sampled_data_by_quant, remaining_indices
+
+def sample_valid_data(df: pd.DataFrame, sample_size: int) -> tuple[List[dict], List[int]]:
+    """
+    Samples valid data based on URL filtering from a dataframe.
+    
+    Args:
+    df (pd.DataFrame): The dataframe to sample from.
+    sample_size (int): The number of samples to attempt to take.
+    
+    Returns:
+    Tuple[List[dict], List[int]]: A list of valid sampled data and a list of remaining indices after sampling.
+    """
     valid_sampled_data = []
-    remaining_indices = df.index.tolist()
+    remaining_indices : List[int] = df.index.tolist()
+    sampled_indices : List[int] = []
 
     while len(valid_sampled_data) < sample_size and remaining_indices:
-        sampled_indices = np.random.choice(remaining_indices, size=sample_size, replace=False)
+        sampled_indices = np.random.choice(
+            remaining_indices, 
+            size=min(sample_size, len(remaining_indices)), 
+            replace=False
+        ).tolist()
+
         sampled_data = df.loc[sampled_indices].to_dict(orient='records')
         valid_data = filter_valid_image_urls([row['url'] for row in sampled_data])
         filtered = [sampled_data[j] for j in range(len(sampled_data)) if valid_data[j]]
         valid_sampled_data.extend(filtered)
-        remaining_indices = list(set(remaining_indices) - set(sampled_indices))
 
-    return valid_sampled_data
+    return valid_sampled_data, list(set(sampled_indices))
 
-def format_data_for_interpretation(dataset):
+def format(dataset : List[dict]) -> List[FeatureSample]:
     return [
         FeatureSample(
             quantized_activation=row['quantized_acts'],
