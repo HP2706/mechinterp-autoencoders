@@ -1,13 +1,11 @@
-from typing import Literal
+from typing import Awaitable, Literal, Union
 from automated_interpretability import AutomatedInterpretability
 import instructor
-from openai import OpenAI
-from datamodels import FeatureDescription, FeatureSample, ImageContent, TextContent, InconclusiveHypothesis, save_html
+from openai import OpenAI, AsyncOpenAI
+from datamodels import ActivationHypothesis, FeatureDescription, FeatureSample, ImageContent, TextContent, InconclusiveHypothesis, save_html
 
 Models = Literal['gpt-4-turbo', 'claude-3-opus-20240229', 'gemini/gemini-1.5-pro-latest']
-def test_vision_prompt(model :Models):
-    pipeline = AutomatedInterpretability(instructor.from_openai(OpenAI()), model)
-
+async def test_vision_prompt(model :Models):
     mapping : dict[Models, str]= {
         'gpt-4-turbo': 'openai',
         'claude-3-opus-20240229': 'anthropic',
@@ -66,8 +64,28 @@ def test_vision_prompt(model :Models):
         ),
     ] 
 
+    from instructor.retry import InstructorRetryException
     save_html(bad_vision_examples, 'examples.html')
-    explanation = pipeline.explain_activation(examples = bad_vision_examples, image_provider=mapping[model]) #type: ignore
-    print("llm explanation",explanation)
+    pipeline = AutomatedInterpretability(AsyncOpenAI(), model) 
+    try:
+        explanation =  await pipeline.aggregate_explanation_async(
+            examples = [
+                FeatureSample(
+                    activation=0.0,
+                    content=TextContent( #type: ignore
+                        text="an ant",
+                        token="ant",
+                        token_id=1,
+                        positions=[1]
+                    ),
+                    quantized_activation=10
+                )
+            ], 
+            image_provider=mapping[model] #type: ignore
+        ) #type: ignore
+    except InstructorRetryException as e:
+        print("retry error", e)
+        raise Exception("InstructorRetryException should not be raised")
+    
     if not isinstance(explanation, InconclusiveHypothesis):
         raise Exception("Explanation is not an InconclusiveHypothesis, it should be.")

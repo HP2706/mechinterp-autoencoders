@@ -54,8 +54,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},
     image = image,
     gpu=gpu.A10G(),
-    timeout=10*60*60, #10 hours   
-    secrets=[Secret.from_name("my-gemini-secret"), Secret.from_name("my-openai-secret")], 
+    timeout=10*60*60, #10 hours    
 )
 class ClipMechInterpPipeline:
     def __init__(
@@ -312,7 +311,7 @@ class ClipMechInterpPipeline:
         
         save_html(all_samples[:5], os.path.join(self.interp_vis_save_path, f"test_feature_idx_{index}.html"))
         vol.commit()
-        feature_hypothesis = self.automated_interp_pipeline.explain_activation(all_samples[:3])
+        feature_hypothesis = self.automated_interp_pipeline.explain_activation_sync(all_samples[:3])
 
         print("feature_hypothesis", feature_hypothesis)
         # Create and save feature description
@@ -346,7 +345,7 @@ class ClipMechInterpPipeline:
         # we take 10 randomly for each quantile
         data = flatten_lst([lst for lst in sampled_data_by_quant.values()])
         hypothesis = self.feature_data[feature_index].activation_hypothesis
-        self.automated_interp_pipeline.predict_activation(data, hypothesis)
+        self.automated_interp_pipeline.predict_activation_sync(data, hypothesis)
 
 def sample_and_filter_data(
     df: pd.DataFrame, 

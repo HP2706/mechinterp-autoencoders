@@ -1,5 +1,14 @@
-from modal import Stub, Volume, Image
-stub = Stub(name="autoencoder anthropic")
+from modal import Stub, Volume, Image, Secret
+
+stub = Stub(
+    name="autoencoder anthropic", 
+    secrets=[
+        Secret.from_name("my-gemini-secret"), 
+        Secret.from_name("my-openai-secret"),
+        Secret.from_name("my-logfire-secret"),
+    ]
+)
+
 vol = Volume.from_name("autoencoder", create_if_missing=True)
 dataset_vol = Volume.from_name("laion_dataset", create_if_missing=True)
 PATH = "/autoencoder"

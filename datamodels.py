@@ -1,6 +1,6 @@
 import os
 from pydantic import BaseModel, Field, field_validator
-from typing import Any, List, Optional, Literal, Protocol, Union, runtime_checkable
+from typing import Any, List, Optional, Literal, Protocol, Union, overload, runtime_checkable
 from utils import format_image_anthropic, format_image_openai
 import torch
 
@@ -67,6 +67,11 @@ class ActivationHypothesis(BaseModel):
 
 @runtime_checkable
 class FormatForAPI(Protocol):
+    @overload
+    def format_for_api(self) -> List[dict]: ...
+    @overload
+    def format_for_api(self, image_provider : Literal['openai', 'anthropic', 'gemini']) -> List[dict]: ...
+    
     def format_for_api(self, image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai') -> List[dict]:
         ...
 
@@ -88,7 +93,7 @@ class TextContent(BaseModel):
     """)
     text: str
 
-    def format_for_api(self) -> List[dict]:
+    def format_for_api(self ) -> List[dict]:
         return [
             { #type: ignore
                 "type": "text", 
@@ -141,6 +146,10 @@ class FeatureSample(BaseModel):
         self, 
         image_provider : Literal['openai', 'anthropic', 'gemini'] = 'openai'
     )-> List[dict]:
+        if isinstance(self.content, ImageContent) :
+            content = self.content.format_for_api(image_provider)
+        else:
+            content = self.content.format_for_api()
         return [
             { #type: ignore
                 "type": "text", 
@@ -149,7 +158,7 @@ class FeatureSample(BaseModel):
                     for the below data
                 """
             },
-            *self.content.format_for_api(image_provider)
+            *content
         ]
 
     
@@ -187,9 +196,9 @@ class FeatureDescription(BaseModel):
 
         # Start HTML document
         html_content = f"<html><head><title>Feature Description for {self.feature_or_neuron} {self.index}</title></head><body>"
-        html_content += f"<h1>Hypothesis: {self.hypothesis}</h1>"
-        html_content += f"<h2>Attributes: {self.attributes}</h2>"
-        html_content += f"<h3>Reasoning: {self.reasoning}</h3>"
+        html_content += f"<h1>Hypothesis: {self.activation_hypothesis.hypothesis}</h1>"
+        html_content += f"<h2>Attributes: {self.activation_hypothesis.attributes}</h2>"
+        html_content += f"<h3>Reasoning: {self.activation_hypothesis.reasoning}</h3>"
 
         # Add high activation samples
         html_content += "<h2>High Activation Samples:</h2>"
