@@ -25,5 +25,5 @@ esac
 
 # Execute the command
 modal volume get autoencoder clip_mechinterp_pipeline --force
-
 echo "Operation completed successfully."
+

@@ -18,18 +18,10 @@ METADATA_FOLDER = f"{LAION_DATASET_PATH}/metadata"
 
 CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
 DIFFUSION_MODEL_ID = "stabilityai/stable-diffusion-2-1-unclip-small"
-
 MODELS_DIR = f"{PATH}/hf_models"
-def download_model():
-    from huggingface_hub import snapshot_download
-    import os
-    
-    os.makedirs(MODELS_DIR, exist_ok=True)
 
-    versions = ["small", "base", "large", "xl"]
-    for version in [versions[0]]:
-        MODEL_PATH = f"thesephist/contra-bottleneck-t5-{version}-wikipedia"
-        snapshot_download(MODEL_PATH, local_dir=f"{MODELS_DIR}/{MODEL_PATH.replace('/', '-')}")
+def get_model_dir()-> str:
+    return f"{PATH}/laion2b_autoencoders"
 
 
 image = Image.from_registry(

@@ -22,8 +22,11 @@ class PipelineConfig(BaseModel):
         arbitrary_types_allowed = True
 
 class InterpretabilityMetaData(BaseModel):
-    llm_explanation : str
-    spearman_corr : float
+    total_samples: int
+    mean_prediction: float
+    #mse: float
+    spearman_corr : float   
+    distribution : dict[Union[int, str], int] = Field(..., description="how many samples are in each quantized range")
     actual_quantized_activations : Optional[List[int]] = Field(None, description="""quantized activations""")
     llm_predicted_quantized_activations : Optional[List[int]] = Field(None, description="""guess on the quantized activation""")
 
@@ -126,7 +129,7 @@ class ImageContent(BaseModel):
 class FeatureSample(BaseModel):
     quantized_activation: int
     activation: float
-    content : FormatForAPI
+    content : Union[TextContent, ImageContent]
     
     class Config:
         arbitrary_types_allowed=True
@@ -169,6 +172,7 @@ class FeatureDescription(BaseModel):
     high_act_samples: list[FeatureSample]
     low_act_samples: list[FeatureSample]
     metadata: Optional[InterpretabilityMetaData] = None
+    used_indices: List[int]
 
     @staticmethod
     def build_feature_description(
@@ -176,16 +180,22 @@ class FeatureDescription(BaseModel):
         index : int, 
         feature_or_neuron : Literal["feature", "neuron"], 
         positive_samples : List[FeatureSample], 
-        negative_samples : List[FeatureSample]
+        negative_samples : List[FeatureSample],
+        used_indices : List[int]
     ):
         return FeatureDescription(
             activation_hypothesis=feature_hypothesis,
             feature_or_neuron=feature_or_neuron,
             index=index,
             high_act_samples=positive_samples,
-            low_act_samples=negative_samples
+            low_act_samples=negative_samples,
+            used_indices=used_indices
         )
     
+
+    def set_metadata(self, metadata: InterpretabilityMetaData):
+        self.metadata = metadata
+
     def display_in_file(self, folder_path: str):
         # Ensure the folder exists
         os.makedirs(folder_path, exist_ok=True)

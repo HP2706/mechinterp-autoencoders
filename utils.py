@@ -1,7 +1,8 @@
 import torch
 from torch.nn import CrossEntropyLoss
 import numpy as np
-from typing import List, Optional, Dict, Any, TypeVar, Union, Literal
+from typing import List, Optional, Dict, Any, TypeVar, Union, Literal, cast
+from typing import cast
 from pydantic import BaseModel
 import json
 from typing import Type, Tuple
@@ -13,6 +14,8 @@ import io
 import requests
 
 T = TypeVar("T")
+B = TypeVar('B')
+
 def flatten_lst(lst: List[List[T]]) -> List[T]:
     return [item for sublist in lst for item in sublist]
 
@@ -57,6 +60,11 @@ def format_image_openai(img: Union[Image.Image, str]) -> dict:
 
 import asyncio
 import aiohttp
+
+def filter_pairs_by_first(lst : List[Optional[T]], lst2: List[B]) -> Tuple[List[T], List[B]]:
+    '''filters both list by None indices in the first list'''
+    indices = [i for i, item in enumerate(lst) if item is not None]
+    return cast(List[T], [lst[i] for i in indices]),  [lst2[i] for i in indices]
 
 async def async_filter_valid_image_urls(urls: List[str], max_concurrent_requests: int = 50) -> List[bool]:
     semaphore = asyncio.Semaphore(max_concurrent_requests)
@@ -212,13 +220,6 @@ def clip_embed_image(images: List[Image.Image]):
     outputs = model(**inputs) # type: ignore
     return outputs.image_embeds
 
-
-def load_feature_descriptions(model_class: Type[B], filename: str) -> Dict[int, B]:
-    '''Loads a list of BaseModel derived objects from a JSON file.'''
-    with open(filename, 'r') as file:
-        json_data = json.load(file)
-        models = {int(k): model_class(**data) for k, data in json_data.items()}
-    return models
 
 
 def test_loss_fn():

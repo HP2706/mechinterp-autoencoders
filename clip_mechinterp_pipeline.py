@@ -1,14 +1,25 @@
 import os
+import pydantic
 import random
 import tqdm
 import shutil
 import pandas as pd
 import numpy as np
 import torch
-from utils import get_device, load_feature_descriptions, write_to_json, flatten_lst
+from mechninterp_utils import torch_spearman_correlation
+from utils import (
+    get_device, 
+    write_to_json, 
+    flatten_lst,
+    filter_pairs_by_first,
+    write_to_json, 
+    filter_non_zero_batch,
+)
+import json
 from typing import Any, Dict, List, Literal, Optional, Type, Union
 from utils import filter_valid_image_urls
 import time
+from datamodels import PredictActivation
 from autoencoder import (
     AutoEncoder, 
     GatedAutoEncoder,
@@ -34,11 +45,6 @@ from datamodels import (
     save_html
 )
 from automated_interpretability import AutomatedInterpretability
-from utils import (
-    write_to_json, 
-    load_feature_descriptions,
-    filter_non_zero_batch,
-)
 from litellm import completion
 from Laion_Processing.dataloader import LaionDataset
 import instructor
@@ -62,74 +68,93 @@ class ClipMechInterpPipeline:
         auto_encoder_path_dir: str,    
         device : Optional[Literal['cpu', 'cuda']] = None,
         interpretability_model_name : str = 'gpt-4-turbo',
-        folder_name : str = "clip_mechinterp_pipeline",
+        dataset_name : str = "laion",
         **dataset_kwargs,
     ):
         self.model = AutoEncoderBase.load_from_checkpoint(auto_encoder_path_dir)
         self.interpretability_model_name = interpretability_model_name
-        self.save_path = f"{PATH}/{folder_name}"
+        self.model_path = auto_encoder_path_dir
+        self.dataset_name = dataset_name
+
+        self.acts_dir = f"{self.model_path}/activations"
+        os.makedirs(self.acts_dir, exist_ok=True)
         if device is None:
             self.device = get_device()
         else:
             self.device = device
-        os.makedirs(self.save_path, exist_ok=True)
+       
 
         self.dataset = LaionDataset(**dataset_kwargs)
         self.automated_interp_pipeline = AutomatedInterpretability(
             OpenAI(), model=self.interpretability_model_name
-            #instructor.from_litellm(completion, instructor.mode.Mode.MD_JSON), model=self.interpretability_model_name
         )
         #TODO is this a smart design decision?
-        self.interp_vis_save_path = os.path.join(self.save_path, f"html_vis_{self.model.dir_name}")
+        self.interp_vis_save_path = os.path.join(self.model_path, f"html_vis")
         os.makedirs(self.interp_vis_save_path, exist_ok=True)
-        self.interp_save_path = os.path.join(self.save_path, f"interpretability_data_{self.model.dir_name}.parquet")
+        self.interp_save_path = os.path.join(self.model_path, f"interpretability_data.parquet")
+
         if os.path.exists(self.interp_save_path):
             self.interp_df = pd.read_parquet(self.interp_save_path)
         else:
             self.interp_df = None
 
-        self.feature_df_save_path = os.path.join(self.save_path, "features.json")
+        self.feature_df_save_path = os.path.join(self.model_path, "features.json")
         if os.path.exists(self.feature_df_save_path):
-            self.feature_data : Dict[int,FeatureDescription] = load_feature_descriptions(FeatureDescription, self.feature_df_save_path)
+            try:
+                self.feature_data = self.load_feature_descriptions(self.feature_df_save_path)
+            except pydantic.ValidationError as e:
+                print(f"Failed to load feature descriptions due to validation error: {e}")
         else:
             self.feature_data = {} 
+            print("feature data does not exist creating new file")
 
 
+    def load_feature_descriptions(self, filename: str) -> Dict[int, FeatureDescription]:
+        '''Loads a list of BaseModel derived objects from a JSON file.'''
+        with open(filename, 'r') as file:
+            json_data = json.load(file)
+            models = {int(k): FeatureDescription(**data) for k, data in json_data.items()}
+        return models
 
-    def get_acts_dir(self, index : Union[int, Literal['all']]) -> str:
+    def get_acts_filepath(
+        self, 
+        index : Union[int, Literal['all']]
+    ) -> str:
         if index == 'all':
-            return f"{PATH}/laion_acts_all_{self.model.dir_name}"
+            filename = self.create_acts_filename('all')
         else:
-            return f"{PATH}/laion_acts_idx_{index}_{self.model.dir_name}"
+            filename = self.create_acts_filename(index)
+
+        if not os.path.exists(filename):
+            raise ValueError(f"Index {index} does not exist")
+        
+        return filename
 
     def get_activations_metadata(
         self, 
-        index : Union[int, Literal['all']] = 'all'
+        index : Union[int, Literal['all']],
+        filter_from_all : bool = True
     ) -> pd.DataFrame:
+        if index == 'all' and filter_from_all:
+            raise ValueError("can not filter from all if index is all")
         
-        dirname = self.get_acts_dir(index)
-        if not os.path.exists(dirname):
-            dirname = f"{PATH}/laion_acts_all_{self.model.dir_name}"
-            
-        if not os.path.exists(dirname):
-            raise ValueError(f"Index {index} does not exist")
-        
-        dataframes = [
-            pd.read_parquet(os.path.join(dirname, file)) 
-            for file in os.listdir(dirname) 
-            if file.endswith(".parquet")
-        ]
-        df = pd.concat(dataframes)
-        if isinstance(index, int):
+        print("getting activations metadata", self.acts_dir, os.listdir(self.acts_dir))
+
+        if filter_from_all:
+            filename = self.get_acts_filepath('all')
+            df = pd.read_parquet(filename)
             df = df[df['feature_idx'] == index]
+        else:
+            filename = self.get_acts_filepath(index)
+            df = pd.read_parquet(filename)
         return df
 
     @method()
-    def delete_dir(
+    def delete_acts_data(
         self,
         index : int
     ):
-        dirname = self.get_acts_dir(index)
+        dirname = self.get_acts_filepath(index)
         if os.path.exists(dirname):
             shutil.rmtree(dirname)
             vol.commit()
@@ -163,23 +188,18 @@ class ClipMechInterpPipeline:
                 if step > 5:
                     break
 
+    def create_acts_filename(self, index : Union[int, Literal['all']]) -> str:
+        if index == 'all':
+            return f"{self.acts_dir}/{self.dataset_name}_acts_all.parquet"
+        else:
+            return f"{self.acts_dir}/{self.dataset_name}_acts_{index}.parquet"
+
     @method()
     def create_acts_dataset(
         self,
         n_files : int = 5,
     ) -> None:
-
-        dirname = f"{PATH}/laion_acts_all_{self.model.dir_name}"
-        os.makedirs(dirname, exist_ok=True)
-
         dataframes : List[pd.DataFrame] = []
-
-        def save_intermediate():
-            #save intermediate 
-            df = pd.concat(dataframes)
-            df.to_parquet(f"{dirname}/metadata.parquet")
-            vol.commit()
-
 
         nrows = 0
         for (tensor, df_metadata) in tqdm.tqdm(
@@ -187,7 +207,6 @@ class ClipMechInterpPipeline:
             total=n_files,
             desc="Processing Files"
         ):            
-            
             with torch.no_grad():
                 df_rows = []
                 batch_size = 1024
@@ -217,18 +236,19 @@ class ClipMechInterpPipeline:
                             'feature_idx': idx[1],
                             'data_idx': original_indices[idx[0]]+nrows,
                         })
-                        
 
             dataframes.append(pd.DataFrame(df_rows))
-            print("df_rows", len(df_rows))
-            print("df head", dataframes[-1].head())
             nrows += len(df_metadata)
 
         df = pd.concat(dataframes)
         num_bins = 9
         activations = df['activation']
-        df['quantized_acts'] = np.digitize(activations, bins = np.linspace(activations.min(), activations.max(), num_bins))
-        save_intermediate()
+        df['quantized_activation'] = np.digitize(
+            activations, 
+            bins = np.linspace(activations.min(), activations.max(), num_bins)
+        )
+        filename = self.create_acts_filename('all')
+        df.to_parquet(filename)
         vol.commit()
 
     @method()
@@ -239,9 +259,7 @@ class ClipMechInterpPipeline:
         n_files : int = 5,
     ) -> None:
         
-        dirname = self.get_acts_dir(index)
-        os.makedirs(dirname, exist_ok=True)
-
+        filename = self.create_acts_filename(index)
         dataframes = []
         activations = []
 
@@ -277,9 +295,12 @@ class ClipMechInterpPipeline:
         df = pd.concat(dataframes)
         df['activation'] = activations
         num_bins = 9
-        df['quantized_acts'] = np.digitize(activations, bins = np.linspace(activations.min(), activations.max(), num_bins))
+        df['quantized_activation'] = np.digitize(
+            activations, 
+            bins = np.linspace(activations.min(), activations.max(), num_bins)
+        )
         
-        df.to_parquet(f"{dirname}/metadata.parquet")
+        df.to_parquet(f"{filename}.parquet")
         vol.commit()
 
     @method()
@@ -287,10 +308,13 @@ class ClipMechInterpPipeline:
         self, 
         index: int,
         feature_or_neuron: Literal['feature', 'neuron'] = 'feature',
+        filter_from_all : bool = True
     ):
-        df = self.get_activations_metadata(index).sort_values(by='activation', ascending=False)
+        df = self.get_activations_metadata(index, filter_from_all=filter_from_all).sort_values(
+            by='activation', ascending=False
+        )
         # Process each quantization bin
-        data_by_quant, remaining_indices = sample_and_filter_data(df)
+        data_by_quant, used_indices = sample_and_filter_data(df)
 
         # Filter positive and negative samples based on activation values
         positive_samples = [
@@ -314,38 +338,90 @@ class ClipMechInterpPipeline:
         feature_hypothesis = self.automated_interp_pipeline.explain_activation_sync(all_samples[:3])
 
         print("feature_hypothesis", feature_hypothesis)
+
         # Create and save feature description
         feature_description = FeatureDescription.build_feature_description(
             feature_hypothesis, 
             index, 
             feature_or_neuron, 
             flatten_lst(positive_samples), 
-            flatten_lst(negative_samples)
+            flatten_lst(negative_samples),
+            used_indices=used_indices
         )
-        
         self.feature_data[index] = feature_description #NOTE this will overwrite the previous 
         #feature description, perhaps TODO make warning if this happens
         write_to_json(self.feature_data, self.feature_df_save_path)
         vol.commit()
 
     @method()
-    def get_interpretability_correlation(
+    def get_interpretability_data(
         self,
         feature_index: int,
         n_samples: int = 100,
+        n_samples_per_prompt: int = 5,
+        filter_from_all: bool = True
     ): 
-        df = self.get_activations_metadata(feature_index)
+        hypothesis = self.feature_data[feature_index].activation_hypothesis
+        
+        df = self.get_activations_metadata(feature_index, filter_from_all=filter_from_all)
+        used_indices = self.feature_data[feature_index].used_indices
+        if used_indices is None:
+            print("used_indices is None")
+        else:
+            df.drop(used_indices, inplace=True)
         df.sort_values(by='activation', ascending=False, inplace=True)
-        print("columns", df.columns)
-        print(df.head())
+        if len(df) < 5:
+            raise ValueError(f"not enough samples to process got {len(df)} samples")
+
+        print("length of df", len(df))
+
         if feature_index not in self.feature_data:
             raise ValueError(f"Feature {feature_index} does not exist in feature_data")
         
         sampled_data_by_quant, remaining_indices = sample_and_filter_data(df)
+
         # we take 10 randomly for each quantile
         data = flatten_lst([lst for lst in sampled_data_by_quant.values()])
-        hypothesis = self.feature_data[feature_index].activation_hypothesis
-        self.automated_interp_pipeline.predict_activation_sync(data, hypothesis)
+        #TODO perhaps do accuracy per quantized category as well as overall??
+        preds_lst : List[Optional[PredictActivation]] = []
+        for i in tqdm.tqdm(range(0, min(n_samples, len(data)), n_samples_per_prompt)):    
+            preds = self.automated_interp_pipeline.predict_activation_sync(
+                data[i:i+n_samples_per_prompt], 
+                hypothesis
+            )
+            if preds is not None:
+                preds_lst.extend(preds)
+
+        
+        predictions, quantized_activations = filter_pairs_by_first(preds_lst, data)
+        if len(predictions) != len(quantized_activations):
+            raise ValueError(
+                f"""
+                predictions and quantized_activations 
+                should be the same length got {len(predictions)} and {len(quantized_activations)}
+                """
+            )
+        
+        quantized_activations = [act.quantized_activation for act in quantized_activations]
+        predictions = [pred.value for pred in predictions]
+
+        spearman_corr = torch_spearman_correlation(
+            torch.tensor(predictions, dtype=torch.float32), 
+            torch.tensor(quantized_activations, dtype=torch.float32)
+        )
+
+        metadata = InterpretabilityMetaData(
+            total_samples=n_samples,
+            mean_prediction=torch.tensor(predictions, dtype=torch.float32).mean().item(),
+            spearman_corr=spearman_corr.item(),
+            distribution={k : len(v) for k, v in sampled_data_by_quant.items()},
+            actual_quantized_activations=quantized_activations,
+            llm_predicted_quantized_activations=predictions,
+        )
+        print("metadata", metadata)
+        self.feature_data[feature_index].set_metadata(metadata)
+        write_to_json(self.feature_data, self.feature_df_save_path)
+        vol.commit()
 
 def sample_and_filter_data(
     df: pd.DataFrame, 
@@ -353,7 +429,7 @@ def sample_and_filter_data(
     final_sample_size: int = 10,
     samples_per_quant: int = 2,
     exceptions: Optional[Dict[int, int]] = None,
-) -> tuple[Dict[Any, List[FeatureSample]], List[int]]:
+) -> tuple[Dict[Union[int, str], List[FeatureSample]], List[int]]:
     """
     Samples and filters data from the dataframe based on quantization levels and filters valid URLs.
     
@@ -366,11 +442,11 @@ def sample_and_filter_data(
     Tuple[Dict[int, List[dict]], List[int]]: A dictionary with quantization levels as keys and lists of sampled data as values,
                                               and a list of remaining indices after sampling.
     """
-    sampled_data_by_quant : Dict[Any, List[FeatureSample]] = {}
+    sampled_data_by_quant : Dict[Union[int, str], List[FeatureSample]] = {}
     all_sampled_indices : List[int] = []
 
     for i in range(quant_levels):
-        df_quantized = df[df['quantized_acts'] == i].sort_values(by='activation', ascending=False)
+        df_quantized = df[df['quantized_activation'] == i].sort_values(by='activation', ascending=False)
 
         if exceptions and i in exceptions:
             sample_size = min(exceptions[i], len(df_quantized))
@@ -382,10 +458,11 @@ def sample_and_filter_data(
 
     remaining_indices = list(set(df.index) - set(all_sampled_indices))
     if len(remaining_indices) > 0:
-        random_samples = sample_valid_data(df.loc[remaining_indices], final_sample_size)[0]
+        random_samples, used_indices = sample_valid_data(df.loc[remaining_indices], final_sample_size)
+        all_sampled_indices.extend(used_indices)
         sampled_data_by_quant['random'] = format(random_samples)
 
-    return sampled_data_by_quant, remaining_indices
+    return sampled_data_by_quant, all_sampled_indices
 
 def sample_valid_data(df: pd.DataFrame, sample_size: int) -> tuple[List[dict], List[int]]:
     """
@@ -419,7 +496,7 @@ def sample_valid_data(df: pd.DataFrame, sample_size: int) -> tuple[List[dict], L
 def format(dataset : List[dict]) -> List[FeatureSample]:
     return [
         FeatureSample(
-            quantized_activation=row['quantized_acts'],
+            quantized_activation=row['quantized_activation'],
             activation=row['activation'],
             content=ImageContent(image_url=row['url'], caption=row['caption'])
         ) for row in dataset if filter_valid_image_urls([row['url']])

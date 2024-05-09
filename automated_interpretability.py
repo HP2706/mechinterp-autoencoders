@@ -183,8 +183,6 @@ class AutomatedInterpretability:
             max_retries=max_retries,
             messages=messages
         ))
-
-
        
     async def explain_activation_async(
         self,
@@ -206,7 +204,6 @@ class AutomatedInterpretability:
         max_retries: int = 2
     ) -> Union[ActivationHypothesis, InconclusiveHypothesis]:
         self.check_client(async_mode=False)
-        print("required fields!!", ActivationHypothesis.model_fields)
         return cast(Union[ActivationHypothesis, InconclusiveHypothesis], self.explain_activation_core(
             examples, feature_or_neuron, image_provider, max_retries, async_mode=False
         ))
@@ -286,10 +283,24 @@ class AutomatedInterpretability:
         max_tries: int = 2,
         feature_or_neuron: Literal["feature", "neuron"] = "feature"
     ) -> Optional[List[PredictActivation]]: 
+        #this will ever if this synchronous function is run with asyncio.run() 
+        # as 2 event loops will be created
+        
         self.check_client(async_mode=False)
-        return cast(Optional[List[PredictActivation]], self.predict_activation_core(
-            unseen_examples, hypothesis, max_tries, feature_or_neuron, async_mode=False
-        ))
+
+        loop = asyncio.get_event_loop()
+        coroutine = self.predict_activation_core(
+            unseen_examples, 
+            hypothesis, 
+            max_tries, 
+            feature_or_neuron, 
+            async_mode=False
+        )
+        return cast(
+            Optional[List[PredictActivation]], 
+            loop.run_until_complete(coroutine)
+        )
+        
 
     async def predict_activation_async(self,
         unseen_examples: List[FeatureSample],
@@ -298,8 +309,14 @@ class AutomatedInterpretability:
         feature_or_neuron: Literal["feature", "neuron"] = "feature"
     ) -> Awaitable[Optional[List[PredictActivation]]]:
         self.check_client(async_mode=True)
-        return cast(Awaitable[Optional[List[PredictActivation]]], await self.predict_activation_core(
-            unseen_examples, hypothesis, max_tries, feature_or_neuron, async_mode=True
+        return cast(
+            Awaitable[Optional[List[PredictActivation]]], 
+            self.predict_activation_core(
+                unseen_examples, 
+                hypothesis, 
+                max_tries, 
+                feature_or_neuron, 
+                async_mode=True
         ))
 
     async def predict_activation_core(
