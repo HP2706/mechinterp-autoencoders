@@ -66,9 +66,9 @@ async def test_vision_prompt(model :Models):
 
     from instructor.retry import InstructorRetryException
     save_html(bad_vision_examples, 'examples.html')
-    pipeline = AutomatedInterpretability(AsyncOpenAI(), model) 
+    pipeline = AutomatedInterpretability(OpenAI(), model) 
     try:
-        explanation =  await pipeline.aggregate_explanation_async(
+        explanation = pipeline.aggregate_explanation_sync(
             examples = [
                 FeatureSample(
                     activation=0.0,
@@ -88,4 +88,4 @@ async def test_vision_prompt(model :Models):
         raise Exception("InstructorRetryException should not be raised")
     
     if not isinstance(explanation, InconclusiveHypothesis):
-        raise Exception("Explanation is not an InconclusiveHypothesis, it should be.")
+        raise Exception(f"Explanation is not an InconclusiveHypothesis, it should be. {explanation}")

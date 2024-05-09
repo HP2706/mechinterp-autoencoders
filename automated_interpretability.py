@@ -72,10 +72,51 @@ class AutomatedInterpretability:
         image_provider: Literal['openai', 'anthropic', 'gemini'] = 'openai',
         max_retries: int = 2
     ) -> Union[ActivationHypothesis, InconclusiveHypothesis]:
-        self.check_client(async_mode=True)
-        return await self._aggregate_explanation_core(
-            examples, max_samples_per_prompt, feature_or_neuron, image_provider, max_retries, async_mode=True
-        )
+        self.check_client(async_mode=True)     
+        hypothesis = []
+        for i in range(0, len(examples), max_samples_per_prompt):
+            hypothesis.append(
+                self.explain_activation_async(
+                    examples[i:i+max_samples_per_prompt], 
+                    feature_or_neuron,
+                    image_provider,
+                    max_retries
+                )
+            )
+
+        #we wait for all the hypothesis to be generated before summarizing them
+        hypothesis = await asyncio.gather(*hypothesis) 
+            
+        messages = [
+            {
+                "role": "system",
+                "content": [{
+                    "type": "text", 
+                    "text": f"""
+                        You are a machine learning scientist.
+                        You previously came up with a list of hypothesis for why the {feature_or_neuron} is active 
+                        based on different non overlapping examples.
+                        Your job is to aggregate these hypothesis into one hypothesis. 
+                        or alternatively return an inconclusive hypothesis if the activation hypothesis do not have 
+                        an overlapping theme/explanation.
+                        """
+                }]
+            },
+            {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": '\n'.join(hyp.stringify() for hyp in hypothesis)
+                }]
+            }
+        ]
+
+        return cast(Union[ActivationHypothesis, InconclusiveHypothesis], await self.client.chat.completions.create(
+            response_model=Union[ActivationHypothesis, InconclusiveHypothesis], #type: ignore
+            model=self.model,
+            max_retries=max_retries,
+            messages=messages #type: ignore
+        ))
 
     def aggregate_explanation_sync(
         self,
@@ -86,52 +127,34 @@ class AutomatedInterpretability:
         max_retries: int = 2
     ) -> Union[ActivationHypothesis, InconclusiveHypothesis]:
         self.check_client(async_mode=False)
-        return cast(Union[ActivationHypothesis, InconclusiveHypothesis], self._aggregate_explanation_core(
-            examples, max_samples_per_prompt, feature_or_neuron, image_provider, max_retries, async_mode=False
-        ))
-
-    def _aggregate_explanation_core(
-        self,
-        examples: List[FeatureSample], 
-        max_samples_per_prompt: int,
-        feature_or_neuron: Literal["feature", "neuron"],
-        image_provider: Literal['openai', 'anthropic', 'gemini'],
-        max_retries: int,
-        async_mode: bool = False
-    ) -> MaybeAwaitable[Union[ActivationHypothesis, InconclusiveHypothesis]]:
         
-        hypothesis = []
+         
+        """ hypothesis = []
         for i in range(0, len(examples), max_samples_per_prompt):
-            if async_mode:
-                hypothesis.append(
-                    self.explain_activation_async(
-                        examples[i:i+max_samples_per_prompt], 
-                        feature_or_neuron,
-                        image_provider,
-                        max_retries
-                    )
+            hypothesis.append(
+                self.explain_activation_async(
+                    examples[i:i+max_samples_per_prompt], 
+                    feature_or_neuron,
+                    image_provider,
+                    max_retries
                 )
-            else:
-                hypothesis.append(
-                    self.explain_activation_sync(
-                        examples[i:i+max_samples_per_prompt], 
-                        feature_or_neuron,
-                        image_provider,
-                        max_retries
-                    )
-                )
+            ) """
 
-        if async_mode:
-            loop = asyncio.get_event_loop()
-            coroutine = asyncio.gather(*hypothesis)
-            loop.run_until_complete(coroutine)
-            hypothesis = coroutine.result()
+        hypothesis = [
+            ActivationHypothesis
+            (
+                attributes="",
+                hypothesis="The feature is active when it sees a banana",
+                conviction=5,
+                reasoning="The feature is active when it sees a banana"
+            ),
+        ]
 
-        print("hypothesis", hypothesis)
         messages = [
-            {
-                "role": "system",
-                "content": {
+        {
+            "role": "system",
+            "content": [
+                {
                     "type": "text", 
                     "text": f"""
                         You are a machine learning scientist.
@@ -141,28 +164,28 @@ class AutomatedInterpretability:
                         or alternatively return an inconclusive hypothesis if the activation hypothesis do not have 
                         an overlapping theme/explanation.
                         """
-                },
-            },
-            {
-                "role": "user",
-                "content": '\n'.join(hyp.stringify() for hyp in hypothesis)
-            }
-        ]
-        if async_mode:
-            return self.client.chat.completions.create(
-                response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
-                model=self.model,
-                max_retries=max_retries,
-                messages=messages
-            )
-        else:
-            return self.client.chat.create(
-                response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
-                model=self.model,
-                max_retries=max_retries,
-                messages=messages
-            )
+                }
+            ]
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text", 
+                    "text": '\n'.join(hyp.stringify() for hyp in hypothesis)
+                }
+            ]
+        }]
+        
+        return cast(Union[ActivationHypothesis, InconclusiveHypothesis], self.client.chat.create(
+            response_model=Union[ActivationHypothesis, InconclusiveHypothesis],
+            model=self.model,
+            max_retries=max_retries,
+            messages=messages
+        ))
 
+
+       
     async def explain_activation_async(
         self,
         examples : List[FeatureSample], 
