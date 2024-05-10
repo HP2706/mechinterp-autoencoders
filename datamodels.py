@@ -144,6 +144,7 @@ class FeatureSample(BaseModel):
             html_content += f"<img src='{self.content.image_url}' alt='{self.content.caption}' style='width:300px;'><br>"
             html_content += f"<caption>{self.content.caption}</caption>"
         return html_content
+
     
     def format_for_api(
         self, 
@@ -173,25 +174,7 @@ class FeatureDescription(BaseModel):
     low_act_samples: list[FeatureSample]
     metadata: Optional[InterpretabilityMetaData] = None
     used_indices: List[int]
-
-    @staticmethod
-    def build_feature_description(
-        feature_hypothesis : ActivationHypothesis, 
-        index : int, 
-        feature_or_neuron : Literal["feature", "neuron"], 
-        positive_samples : List[FeatureSample], 
-        negative_samples : List[FeatureSample],
-        used_indices : List[int]
-    ):
-        return FeatureDescription(
-            activation_hypothesis=feature_hypothesis,
-            feature_or_neuron=feature_or_neuron,
-            index=index,
-            high_act_samples=positive_samples,
-            low_act_samples=negative_samples,
-            used_indices=used_indices
-        )
-    
+    total_feature_distribution: Optional[dict[int, int]] = Field(None, description="how many samples are in each quantized range")
 
     def set_metadata(self, metadata: InterpretabilityMetaData):
         self.metadata = metadata

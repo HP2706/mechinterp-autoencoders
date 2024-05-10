@@ -12,7 +12,6 @@ from utils import (
     write_to_json, 
     flatten_lst,
     filter_pairs_by_first,
-    write_to_json, 
     filter_non_zero_batch,
 )
 import json
@@ -50,6 +49,7 @@ from Laion_Processing.dataloader import LaionDataset
 import instructor
 from modal import gpu, Secret, enter, method, build
 from openai import OpenAI
+Index = Union[int, Literal['all']]
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -118,7 +118,7 @@ class ClipMechInterpPipeline:
 
     def get_acts_filepath(
         self, 
-        index : Union[int, Literal['all']]
+        index : Index
     ) -> str:
         if index == 'all':
             filename = self.create_acts_filename('all')
@@ -132,7 +132,7 @@ class ClipMechInterpPipeline:
 
     def get_activations_metadata(
         self, 
-        index : Union[int, Literal['all']],
+        index : Index,
         filter_from_all : bool = True
     ) -> pd.DataFrame:
         if index == 'all' and filter_from_all:
@@ -188,7 +188,7 @@ class ClipMechInterpPipeline:
                 if step > 5:
                     break
 
-    def create_acts_filename(self, index : Union[int, Literal['all']]) -> str:
+    def create_acts_filename(self, index : Index) -> str:
         if index == 'all':
             return f"{self.acts_dir}/{self.dataset_name}_acts_all.parquet"
         else:
@@ -198,6 +198,7 @@ class ClipMechInterpPipeline:
     def create_acts_dataset(
         self,
         n_files : int = 5,
+        save_html_vis : bool = True
     ) -> None:
         dataframes : List[pd.DataFrame] = []
 
@@ -240,16 +241,54 @@ class ClipMechInterpPipeline:
             dataframes.append(pd.DataFrame(df_rows))
             nrows += len(df_metadata)
 
-        df = pd.concat(dataframes)
-        num_bins = 9
-        activations = df['activation']
-        df['quantized_activation'] = np.digitize(
-            activations, 
-            bins = np.linspace(activations.min(), activations.max(), num_bins)
+        self.quantize_and_save(
+            dataframes, 
+            self.create_acts_filename('all'), 
+            'all', 
+            save_html_vis
         )
-        filename = self.create_acts_filename('all')
-        df.to_parquet(filename)
-        vol.commit()
+
+    @method()
+    def create_html_vis(self, index: Index):
+        df = self.get_activations_metadata(index, filter_from_all=False)
+        html_dir = os.path.join(self.acts_dir, f"html_visualizations")
+        os.makedirs(html_dir, exist_ok=True)
+
+        if index == 'all':
+            import time
+            for (feature_idx , sub_df) in tqdm.tqdm(df.groupby('feature_idx')):
+                t0 = time.time()
+                print("len of sub_df", len(sub_df), sub_df.head(),"columns", sub_df.columns)
+                data = [
+                    FeatureSample(
+                        quantized_activation=row['quantized_activation'],
+                        activation=row['activation'],
+                        content=ImageContent(
+                            image_url=row['url'],
+                            caption=row['caption'],
+                        )
+                    )    
+                    for i, row in sub_df.iterrows()
+                ]
+                save_html(data, os.path.join(html_dir, f"feature_idx_{feature_idx}.html"))
+                vol.commit()
+                print("time taken to save html", time.time()-t0)
+        else:
+            if index not in df['feature_idx'].unique():
+                raise ValueError(f"Feature index {index} does not exist in the dataset")
+            data = [
+                FeatureSample(
+                    quantized_activation=row['quantized_activation'],
+                    activation=row['activation'],
+                    content=ImageContent(
+                        image_url=row['url'],
+                        caption=row['caption'],
+                    )
+                )    
+                for i, row in df[df['feature_idx'] == index].iterrows()
+            ]
+            save_html(data, os.path.join(html_dir, f"feature_idx_{index}.html"))
+            #vol.commit()
 
     @method()
     #NOTE this will almost never be used because activations are so sparse that it can be done all at once.
@@ -257,6 +296,7 @@ class ClipMechInterpPipeline:
         self,
         index : int,
         n_files : int = 5,
+        save_html_vis : bool = True
     ) -> None:
         
         filename = self.create_acts_filename(index)
@@ -292,16 +332,34 @@ class ClipMechInterpPipeline:
             print("Not enough activations to process, got", len(activations))
             return
         
+        self.quantize_and_save(
+            dataframes, 
+            filename, 
+            index, 
+            save_html_vis
+        )
+
+    def quantize_and_save(
+        self,
+        dataframes : List[pd.DataFrame], 
+        filename : str, 
+        index : Index,
+        save_html_vis : bool = True,
+        num_bins : int = 9
+    ) -> None:
+        
         df = pd.concat(dataframes)
-        df['activation'] = activations
-        num_bins = 9
+        activations = df['activation']
         df['quantized_activation'] = np.digitize(
             activations, 
             bins = np.linspace(activations.min(), activations.max(), num_bins)
         )
-        
+
         df.to_parquet(f"{filename}.parquet")
         vol.commit()
+
+        if save_html_vis:
+            self.create_html_vis(index)
 
     @method()
     def get_interpretability_explanation(
@@ -340,13 +398,16 @@ class ClipMechInterpPipeline:
         print("feature_hypothesis", feature_hypothesis)
 
         # Create and save feature description
-        feature_description = FeatureDescription.build_feature_description(
-            feature_hypothesis, 
-            index, 
-            feature_or_neuron, 
-            flatten_lst(positive_samples), 
-            flatten_lst(negative_samples),
-            used_indices=used_indices
+        feature_description = FeatureDescription(
+            index=index,
+            activation_hypothesis=feature_hypothesis,
+            feature_or_neuron=feature_or_neuron,
+            high_act_samples=flatten_lst(positive_samples),
+            low_act_samples=flatten_lst(negative_samples),
+            used_indices=used_indices,
+            total_feature_distribution={
+                k : v for k, v in df['quantized_activation'].value_counts().items() #type: ignore
+            }
         )
         self.feature_data[index] = feature_description #NOTE this will overwrite the previous 
         #feature description, perhaps TODO make warning if this happens

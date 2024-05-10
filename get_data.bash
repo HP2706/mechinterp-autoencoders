@@ -15,7 +15,6 @@ fi
 OS="$(uname -s)"
 case "$OS" in
   Linux* | Darwin*)
-    echo "Running on $OS"
     ;;
   *)
     echo "Unsupported OS: $OS" >&2
@@ -23,7 +22,15 @@ case "$OS" in
     ;;
 esac
 
-# Execute the command
-modal volume get autoencoder clip_mechinterp_pipeline --force
+
+# Check if model name is provided as an argument
+if [ -z "$1" ]; then
+  echo "Error: No model name provided." >&2
+  exit 1
+fi
+
+# Execute the command with the provided model name
+modal volume get autoencoder laion2b_autoencoders/$1 --force
 echo "Operation completed successfully."
+
 
