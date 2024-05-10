@@ -349,12 +349,18 @@ class ClipMechInterpPipeline:
     ) -> None:
         
         df = pd.concat(dataframes)
-        activations = df['activation']
-        df['quantized_activation'] = np.digitize(
-            activations, 
-            bins = np.linspace(activations.min(), activations.max(), num_bins)
-        )
+        num_bins = 9
+        # Calculate min and max per feature_idx
+        min_activations = df.groupby('feature_idx')['activation'].agg('min').sort_index()
+        max_activations = df.groupby('feature_idx')['activation'].agg('max').sort_index()
 
+
+        def quantize_activations(row):
+            feature_idx = row['feature_idx']
+            bins = np.linspace(min_activations[feature_idx], max_activations[feature_idx], num_bins + 1)
+            return np.searchsorted(bins, row['activation'], side='right') - 1
+
+        df['quantized_activation'] = df.apply(quantize_activations, axis=1)
         df.to_parquet(f"{filename}.parquet")
         vol.commit()
 
