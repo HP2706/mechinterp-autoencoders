@@ -1,6 +1,6 @@
 import json
+import pandas as pd
 import os
-import time 
 from typing import Optional
 from click import Option
 import torch
@@ -8,13 +8,15 @@ from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, field_validator
 from torch.nn import functional as F
-from typing import Tuple, Union, Literal, List, Any
+from typing import Tuple, Union, Literal, List, Any, Type, cast
 from abc import ABC, abstractmethod
 from mechninterp_utils import utils
 from utils import get_device
 #internal imports
 from mechninterp_utils import mean_ablate_hook
 from typing import overload, Protocol
+from common import stub, vol, image, PATH
+from modal import gpu, enter, method
 
 
 class GatedAutoEncoderResult(BaseModel):
@@ -443,3 +445,69 @@ class GatedAutoEncoder(AutoEncoderBase):
             )
         else:
             return x_reconstruct
+        
+
+import tqdm
+from utils import filter_non_zero_batch
+
+@stub.cls(
+    image = image,
+    volumes={PATH: vol},   
+    timeout=10*60, #10 minutes
+    concurrency_limit=20,
+    container_idle_timeout=30, #30 seconds
+    _allow_background_volume_commits=True,
+    gpu=gpu.T4()    
+)
+class AutoEncoderWrapper:
+    def __init__(self, checkpoint_path: str):
+        self.model = AutoEncoderBase.load_from_checkpoint(checkpoint_path)
+
+    @method()
+    @torch.no_grad()
+    def embed_and_filter_dataframe(
+        self, 
+        tensor: Tensor, 
+        df_metadata: pd.DataFrame,
+    ) -> pd.DataFrame:
+        assert isinstance(tensor, torch.Tensor), f"tensor must be a torch.Tensor got {type(tensor)}"
+        assert isinstance(df_metadata, pd.DataFrame), f"df_metadata must be a pandas DataFrame got {type(df_metadata)}"
+        assert tensor.shape[0] == len(df_metadata), f"tensor and df_metadata must have the same number of rows got {tensor.shape[0]} and {len(df_metadata)}"
+
+        df_rows = []
+        batch_size = 1024
+        for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
+            scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
+            acts = self.model.forward(scaled_batch, 'with_acts')
+            non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
+            
+            #if there are no non-zero activations, we skip the batch because 
+            # it is all zeros or below the activation threshold
+            if non_zero_indices.nelement() == 0:
+                continue
+            
+            # Get non-zero activations and their indices for the entire batch
+            non_zero_activations = acts[non_zero_indices]
+            non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
+            original_indices = (non_zero_indices + j).tolist()
+            
+            # Extract the activation values using these indices
+            activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
+    
+            #this might become the bottleneck
+            for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
+                df_rows.append(
+                    {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
+                    'activation': value,
+                    'feature_idx': idx[1],
+                })
+        return pd.DataFrame(df_rows)
+
+    @method()
+    def get_single_feature_acts(
+        self,     
+        model_acts : torch.Tensor, 
+        feature_index : int,
+    ) -> torch.Tensor:
+        return self.model.get_single_feature_acts(model_acts.to('cuda'), feature_index).cpu() #type: ignore
+
