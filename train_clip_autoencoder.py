@@ -10,10 +10,10 @@ from common import (
 )
 import aiofiles
 import torch
+from torch.nn.utils import clip_grad_norm_
 import numpy as np
-import asyncio
 from io import BytesIO
-from Laion_Processing.dataloader import LaionDataset, LaionFileLoader
+from Laion_Processing.dataloader import load_loaders
 import wandb
 from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
 from utils import load_and_scale_tensor
@@ -39,12 +39,10 @@ def train_autoencoder(
     n_epochs: int, 
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
-    with_ramp: bool,
+    with_ramp: bool = True,
     loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
     retrain_path : Optional[str] = None,
-    additional_epochs : Optional[int] = 2
 ):
-    
     if retrain_path is not None:
         model = AutoEncoderBase.load_from_checkpoint(retrain_path)
         model_dir = retrain_path
@@ -65,12 +63,14 @@ def train_autoencoder(
             beta1=0.9,
             beta2=0.999,
             dict_mult=dict_mult,
+            with_ramp=with_ramp,
+            loss_func=loss_func,
             seq_len=512,
             d_mlp=d_mlp,
             buffer_size=1000000,
             buffer_batches=25,
             device="cuda",
-            n_epochs=n_epochs,
+            n_epochs=0, # inital epochs are 0 but gradually increasing
             training_set=train_files,
             validation_set=test_files,
             type=type
@@ -85,7 +85,7 @@ def train_autoencoder(
     model_dir = f"{PATH}/laion2b_autoencoders"
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
-    
+
     wandb.init(
         # set the wandb project where this run will be logged
         project="Sparse AutoEncoder",
@@ -98,41 +98,46 @@ def train_autoencoder(
         }
     )
 
-    train_loader = LaionFileLoader(
+    train_loader , test_loader = load_loaders(
         batch_size=cfg.batch_size, 
         emb_folder=EMB_FOLDER,
-        split="train",
-        train_share=0.8
+        train_share=0.8,
+        n = model.W_dec.shape[0] 
     )
-    test_loader = LaionFileLoader(
-        batch_size=cfg.batch_size, 
-        emb_folder=EMB_FOLDER,
-        split="test",
-        train_share=0.8
-    )
+
+    eighty_percent_steps = len(train_loader) / 0.8
+    print("total steps", len(train_loader))
+    print("80 percent steps", eighty_percent_steps)
+
 
     model.to(model.cfg.device)
     
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
     step = 0
-    total_steps = len(train_loader) * cfg.n_epochs 
+    
     l1_coeff_final = 5
-    l1_ramp_steps = int(0.05 * total_steps)
+    total_steps = len(train_loader) * n_epochs 
+    #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below l1_coeff_final
+    l1_ramp = l1_coeff_final / ((total_steps // 100)*5 )
+    # we linearly increase l1_coeff from 0 to 5 
+    #over the first 5% of the total steps as per anthropic paper
 
-    model.l1_coeff = l1_coeff_final
     if retrain_path is not None:
-        _range = range(cfg.n_epochs, cfg.n_epochs + additional_epochs) # type: ignore
+        _range = range(cfg.n_epochs, cfg.n_epochs + n_epochs) 
     else:
-        _range = range(cfg.n_epochs)
+        _range = range(n_epochs)
 
-    for epoch in _range: # type: ignore
+    print("epoch range", _range)
+    print("model l1_coeff", model.l1_coeff)
+    for epoch in _range: 
+        print("epoch", epoch)
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
             # Update l1_coeff linearly over the first 5% of the total steps
             if with_ramp:
-                if step <= l1_ramp_steps:
-                    model.l1_coeff = (l1_coeff_final / l1_ramp_steps) * step #linearly increase l1_coeff
+                if model.l1_coeff <= l1_coeff_final:
+                    model.l1_coeff += l1_ramp 
 
             batch = batch.to(model.cfg.device)
             #we have scaled the embeddings by 100 to make them larger and easier to work with
@@ -140,25 +145,31 @@ def train_autoencoder(
             optimizer.zero_grad()
             result = model.forward(batch, method=loss_func) # type: ignore
             result.loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=1) 
+            # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
+            optimizer.step()
             optimizer.step()
             
             #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
-            if step % 10 == 0:
+            if step % 100 == 0:
                 wandb.log({
                     "l1_coeff": model.l1_coeff,
                     **result.format_loss()
                 })
+            if step % 1000 == 0:
+                print("step", step)
+                print("l1_coeff", model.l1_coeff)
+                print("results", result.format_loss())
             
-
-        basename = cfg.create_basename(epoch)
+        cfg.n_steps = step
+        cfg.l1_coeff = model.l1_coeff
+        
+        basename = cfg.create_basename()
         model_path = f'{model_dir}/{basename}'
         os.makedirs(model_path, exist_ok=True)
         print("saving model at", model_path)
         torch.save(model.state_dict(), f"{model_path}/model.pt")
         with open(f"{model_path}/config.json", "w") as f:
-            cfg.n_steps = step
-            cfg.loss_func = loss_func
-            
             f.write(cfg.model_dump_json())
         vol.commit()
         print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
@@ -166,10 +177,13 @@ def train_autoencoder(
         model.eval()
         with torch.no_grad():
             print(f"evaluation epoch {epoch}\n")
-            for batch in tqdm(test_loader, desc="Testing"):
+            for batch in tqdm(test_loader[:1000], desc="Testing"): # we only use fraction
                 batch = batch.to(model.cfg.device)
                 result = model.forward(batch, method="with_loss")
                 wandb.log({**result.format_loss(), "l1_coeff": model.l1_coeff})
+
+        cfg.n_epochs += 1
+
 
 async def save_activations_async(path: str, activations: torch.Tensor):
     buffer = BytesIO()

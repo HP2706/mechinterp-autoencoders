@@ -134,7 +134,16 @@ class AutoEncoderPipeLine:
     @method()
     @torch.no_grad()
     def gen_img_spectre(self, feature_idx : int, strength : float, image_embedding: torch.Tensor):
+        # we scale by 100 and normalize by sqrt(dict_mult*embedding_dim)
+        # we scale clip embeddings to norm 100 for stability as is done in Data preprocessing 
+        # in Laion_preprocessing/dataloader.py
+        image_embedding = image_embedding * 100 
+        emb_mean_norm = torch.mean(torch.norm(image_embedding, dim=-1, p=2))  # Compute L2 norm of each row
+        desired_norm = torch.sqrt(torch.tensor(self.autoencoder.W_dec.shape[1]).float())
+        scaling_factor = desired_norm / emb_mean_norm
+        image_embedding = image_embedding * scaling_factor  # Scale the dataset
         image_embedding = image_embedding.to("cuda")
+
         feature_activations = self.autoencoder.forward(image_embedding.clone(), method='with_acts')
 
         edited_feature_activations = feature_activations.clone()

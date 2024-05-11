@@ -25,8 +25,10 @@ class LaionDataset(Dataset):
         with_filenames : bool = False,
         train_share : float = 0.8,
         return_tuple: bool = False,
+        n : Optional[float] = None,
     ):
         check_inputs(locals())
+        self.n_sqrt = np.sqrt(n) if n is not None else None
         self.with_filenames = with_filenames
         emb_paths = [os.path.join(emb_folder, f) for f in os.listdir(emb_folder)]
         if len(emb_paths) == 0:
@@ -92,10 +94,23 @@ class LaionDataset(Dataset):
         metadata_df = pd.read_parquet(self.metadata_paths[idx])
         return tensor, metadata_df
             
+    def scale_dataset(self, X : torch.Tensor, n : int):
+        '''computes the expected norm of the dataset row (dim=-1) and normalized to n_sqrt'''
+        norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
+        mean_norm = torch.mean(norms) 
+        desired_norm = torch.sqrt(torch.tensor(n).float())
+        scaling_factor = desired_norm / mean_norm
+        X_scaled = X * scaling_factor  # Scale the dataset
+        return X_scaled
+
     def load_next_file(self):
         self.current_file_index += 1
         if self.current_file_index < len(self.emb_paths):
             self.data = load_and_scale_tensor(self.emb_paths[self.current_file_index])
+
+            if self.n_sqrt:
+                self.data = self.scale_dataset(self.data, self.n_sqrt)
+
             if self.return_tuple:
                 self.metadata_df = pd.read_parquet(self.metadata_paths[self.current_file_index])
         else:
@@ -161,7 +176,8 @@ class LaionFileLoader:
         batch_size: int, 
         emb_folder: str,
         split : Literal['train', 'test'],
-        train_share : float = 0.8,
+        n : Optional[float] = None,
+        train_share : float = 0.8, 
     ):
         self.dataset = LaionDataset(
             emb_folder=emb_folder, 
@@ -169,6 +185,7 @@ class LaionFileLoader:
             return_tuple=False,
             split=split,
             train_share=train_share,
+            n=n
         )
         self.dataloader = DataLoader(
             self.dataset, 
@@ -176,8 +193,12 @@ class LaionFileLoader:
             shuffle=False,
         )
 
+    
     def __iter__(self):
         return iter(self.dataloader)
+    
+    def compute_mean_l1_norm(self):
+        return torch.mean(torch.norm(self.dataset.data, p=2, dim=-1))
     
     def __getitem__(self, idx: Union[int, slice]) -> torch.Tensor:
         if isinstance(idx, int):
@@ -198,3 +219,31 @@ class LaionFileLoader:
     ]:
         for batch in self.dataloader:
             yield batch
+
+
+def load_loaders(
+    batch_size: int,
+    emb_folder: str,
+    train_share : float = 0.8,
+    n : Optional[float] = None,
+) -> tuple[LaionFileLoader, LaionFileLoader]:
+    '''
+    Returns a tuple of (train loader, test loader)
+    '''
+    return (
+        LaionFileLoader(
+        batch_size=batch_size,
+        emb_folder=emb_folder,
+        split='train',
+        train_share=train_share,
+        n=n
+        ),
+        LaionFileLoader(
+            batch_size=batch_size,
+            emb_folder=emb_folder,
+            split='test',
+            train_share=train_share,
+            n=n
+        )
+    )
+
