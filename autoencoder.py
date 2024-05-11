@@ -15,7 +15,7 @@ from utils import get_device
 #internal imports
 from mechninterp_utils import mean_ablate_hook
 from typing import overload, Protocol
-from common import stub, vol, image, PATH
+from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 from modal import gpu, enter, method
 
 
@@ -75,6 +75,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
     buffer_mult: int
     num_tokens: Optional[int] = None
     l1_coeff: float
+    with_ramp : bool = False
     lr : float
     beta1: float
     beta2: float
@@ -96,11 +97,14 @@ class AutoencoderConfig(AutoencoderModelConfig):
                 raise ValueError("Gated Autoencoder does not support 'with_new_loss' loss function")
         return v
 
-
-    def create_basename(self, epoch: Optional[int] = None)->str:
-        epoch = epoch if epoch is not None else self.n_epochs
-        return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_lr_{self.lr}_dict_mult_{self.dict_mult}_epoch_{epoch}'
-
+    def create_basename(self)->str:
+        with_ramp_str = f'_with_l1_coeff_ramp' if self.with_ramp else ''
+        with_loss_func = f'_{self.loss_func}'
+        return (
+            f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_'
+            f'lr_{self.lr}_dict_mult_{self.dict_mult}_'
+            f'epoch_{self.n_epochs}{with_ramp_str}{with_loss_func}'
+        ) # group string for readability
 
 
 class AutoEncoderBase(nn.Module, ABC):
@@ -181,16 +185,25 @@ class AutoEncoder(AutoEncoderBase):
         super().__init__(cfg)
         d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.W_enc = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
+
+        #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes
+
         self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
+        norms = torch.norm(self.W_dec, dim=0, keepdim=True)
+        desired_norms = torch.rand(1, cfg.d_mlp, dtype=cfg.dtype) * 0.95 + 0.05  # Random norms between 0.05 and 1
+        self.W_dec.data = self.W_dec.data * (desired_norms / norms)
+
+        self.W_enc = nn.Parameter(self.W_dec.data.t().clone())
+       
         self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) # initialize to zero
         self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
-        self.W_dec.data[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
         self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
         self.device = get_device()
 
         self.to(self.device) # move to device
+
+
 
     @classmethod
     @overload
@@ -273,11 +286,7 @@ class AutoEncoder(AutoEncoderBase):
             return x_reconstruct
         elif method == 'with_new_loss':
             l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            l1_loss = torch.sum(
-                torch.abs(acts) 
-                * 
-                torch.norm(self.W_dec, dim=0, p=2)
-            )
+            l1_loss = self.l1_coeff * torch.sum(torch.abs(acts) * torch.norm(self.W_dec, dim=-1))
             loss = l2_loss + l1_loss
             return AutoencoderResult(
                 loss=loss, 
@@ -340,8 +349,8 @@ class GatedAutoEncoder(AutoEncoderBase):
 
         # Initialize W_mag as a vector of learnable parameters
         self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to to zero?
-        self.W_mag = torch.exp(self.r_mag)[None, :] * self.W_gate
-        self.W_mag = nn.Parameter(self.W_mag)
+        weight_init = torch.exp(self.r_mag)[None, :] * self.W_gate
+        self.W_mag = nn.Parameter(weight_init)
         self.device = get_device()
         self.to(self.device)
 
@@ -449,65 +458,65 @@ class GatedAutoEncoder(AutoEncoderBase):
 
 import tqdm
 from utils import filter_non_zero_batch
+from Laion_Processing.dataloader import LaionDataset
+from typing import List
+import pandas as pd
 
 @stub.cls(
     image = image,
-    volumes={PATH: vol},   
-    timeout=10*60, #10 minutes
-    concurrency_limit=20,
-    container_idle_timeout=30, #30 seconds
+    volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
+    timeout=60*60,
     _allow_background_volume_commits=True,
-    gpu=gpu.T4()    
+    gpu=gpu.A10G()    
 )
 class AutoEncoderWrapper:
-    def __init__(self, checkpoint_path: str):
+    def __init__(self, checkpoint_path: str, dataset_kwargs: dict):
         self.model = AutoEncoderBase.load_from_checkpoint(checkpoint_path)
+        self.dataset = LaionDataset(**dataset_kwargs)
+   
 
     @method()
-    @torch.no_grad()
-    def embed_and_filter_dataframe(
-        self, 
-        tensor: Tensor, 
-        df_metadata: pd.DataFrame,
-    ) -> pd.DataFrame:
-        assert isinstance(tensor, torch.Tensor), f"tensor must be a torch.Tensor got {type(tensor)}"
-        assert isinstance(df_metadata, pd.DataFrame), f"df_metadata must be a pandas DataFrame got {type(df_metadata)}"
-        assert tensor.shape[0] == len(df_metadata), f"tensor and df_metadata must have the same number of rows got {tensor.shape[0]} and {len(df_metadata)}"
+    def create_acts_dataset(
+        self,
+        n_files : int = 5,
+    ) -> List[pd.DataFrame]:
+        dataframes : List[pd.DataFrame] = []
+        nrows = 0
 
-        df_rows = []
-        batch_size = 1024
-        for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
-            scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
-            acts = self.model.forward(scaled_batch, 'with_acts')
-            non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
-            
-            #if there are no non-zero activations, we skip the batch because 
-            # it is all zeros or below the activation threshold
-            if non_zero_indices.nelement() == 0:
-                continue
-            
-            # Get non-zero activations and their indices for the entire batch
-            non_zero_activations = acts[non_zero_indices]
-            non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
-            original_indices = (non_zero_indices + j).tolist()
-            
-            # Extract the activation values using these indices
-            activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
-    
-            #this might become the bottleneck
-            for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
-                df_rows.append(
-                    {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
-                    'activation': value,
-                    'feature_idx': idx[1],
-                })
-        return pd.DataFrame(df_rows)
+        for (tensor, df_metadata) in tqdm.tqdm(
+            self.dataset.iter_files(max_count=n_files), 
+            total=n_files,
+            desc="Processing Files"
+        ):            
+            with torch.no_grad():
+                df_rows = []
+                batch_size = 1024
+                for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
+                    scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
+                    acts = self.model.forward(scaled_batch, 'with_acts')
+                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
+                    #if there are no non-zero activations, we skip the batch because 
+                    # it is all zeros or below the activation threshold
+                    if non_zero_indices.nelement() == 0:
+                        continue
+                    
+                    # Get non-zero activations and their indices for the entire batch
+                    non_zero_activations = acts[non_zero_indices]
+                    non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
+                    original_indices = (non_zero_indices + j).tolist()
+                    
+                    # Extract the activation values using these indices
+                    activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
+                    for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
+                        df_rows.append(
+                            {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
+                            'activation': value,
+                            'feature_idx': idx[1],
+                            'data_idx': original_indices[idx[0]]+nrows,
+                        })
 
-    @method()
-    def get_single_feature_acts(
-        self,     
-        model_acts : torch.Tensor, 
-        feature_index : int,
-    ) -> torch.Tensor:
-        return self.model.get_single_feature_acts(model_acts.to('cuda'), feature_index).cpu() #type: ignore
+            dataframes.append(pd.DataFrame(df_rows))
+            nrows += len(df_metadata)
+        
+        return dataframes
 

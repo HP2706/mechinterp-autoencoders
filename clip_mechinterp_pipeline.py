@@ -19,7 +19,13 @@ from typing import Any, Dict, List, Literal, Optional, Type, Union
 from utils import filter_valid_image_urls
 import time
 from datamodels import PredictActivation
-from autoencoder import AutoEncoderWrapper
+from autoencoder import (
+    AutoEncoder, 
+    GatedAutoEncoder,
+    AutoEncoderBase,
+    AutoencoderConfig,
+    AutoEncoderWrapper
+)
 
 from common import (
     image, 
@@ -56,7 +62,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 @stub.cls(
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},
     image = image,
-    timeout=10*60*60, #10 hours    
+    timeout=10*60*60, #10 hours 
 )
 class ClipMechInterpPipeline:
     def __init__(
@@ -68,8 +74,7 @@ class ClipMechInterpPipeline:
         **dataset_kwargs,
     ):
 
-
-        self.model = AutoEncoderWrapper(auto_encoder_path_dir)
+        self.model = AutoEncoderWrapper(auto_encoder_path_dir, dataset_kwargs)
         self.interpretability_model_name = interpretability_model_name
         self.model_path = auto_encoder_path_dir
         self.dataset_name = dataset_name
@@ -157,63 +162,25 @@ class ClipMechInterpPipeline:
             shutil.rmtree(dirname)
             vol.commit()
 
-    @method()
-    #NOTE for debugging
-    def check_activations(self):
-
-        for (tensor, df_metadata) in tqdm.tqdm(
-            self.dataset.iter_files(max_count=1), 
-        ):      
-            batch_size = 512
-            step = 0
-
-            for j in range(0, tensor.shape[0], batch_size):
-                batch = tensor[j:j+batch_size].to(self.device)
-                data = self.model.forward.remote(batch, 'with_loss')
-                activations = data.acts
-                recons_loss = (data.x_reconstruct - (batch- batch.mean(dim=0))).pow(2).mean() 
-                print("\nrecons_loss", recons_loss)
-                print("mean norm", batch.norm(dim=1).mean())
-                print("\nmax", activations.max(), "min", activations.min(), "mean", activations.mean())
-                # Get the max activation for each index across the batch
-                max_activations = activations.max(dim=0)[0]
-                # Compute the mean of these max activations
-                mean_max_activations = max_activations.mean()
-                print("\nmean_max_activations", mean_max_activations)
-                print("\nmean_max_activations.item()", mean_max_activations.item())
-                step += 1
-
-                if step > 5:
-                    break
-
     def create_acts_filename(self, index : Index) -> str:
         if index == 'all':
             return f"{self.acts_dir}/{self.dataset_name}_acts_all.parquet"
         else:
             return f"{self.acts_dir}/{self.dataset_name}_acts_{index}.parquet"
-
+        
     @method()
     def create_acts_dataset(
         self,
         n_files : int = 5,
-        save_html_vis : bool = True
     ) -> None:
         dataframes : List[pd.DataFrame] = []
-
-        for (df) in tqdm.tqdm(
-            self.model.embed_and_filter_dataframe.starmap(
-                self.dataset.iter_files(max_count=n_files)
-            ), 
-            total=n_files,
-            desc="Processing Files"
-        ):            
-            dataframes.append(df)
+        print("creating acts dataset")
+        dataframes = self.model.create_acts_dataset.remote(n_files)
 
         self.quantize_and_save(
             dataframes, 
             self.create_acts_filename('all'), 
-            'all', 
-            save_html_vis
+            'all'
         )
 
     def quantize_and_save(
