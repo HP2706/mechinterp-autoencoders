@@ -16,16 +16,32 @@ from io import BytesIO
 from Laion_Processing.dataloader import load_loaders
 import wandb
 from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
-from utils import load_and_scale_tensor
+from utils import load_tensor
 from modal import gpu
 import modal
 import os
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 from utils import remove_keys
 
 from torch.optim import AdamW
 from tqdm import tqdm
 
+
+
+def save_model(
+    model : Union[GatedAutoEncoder, AutoEncoder], 
+    cfg: AutoencoderConfig,
+    model_dir : str
+):
+    basename = cfg.create_basename()
+    model_path = f'{model_dir}/{basename}'
+    os.makedirs(model_path, exist_ok=True)
+    print("saving model at", model_path)
+    torch.save(model.state_dict(), f"{model_path}/model.pt")
+    with open(f"{model_path}/config.json", "w") as f:
+        f.write(cfg.model_dump_json())
+    vol.commit()
+    print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
 
 @stub.function(
     image = image,
@@ -36,9 +52,11 @@ from tqdm import tqdm
     _allow_background_volume_commits=True
 )
 def train_autoencoder(
-    n_epochs: int, 
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
+    steps: int = 2*10**5, 
+    save_interval : int = 10**4, # we save the model every save_interval steps
+    test_steps : int = 50**4,
     with_ramp: bool = True,
     loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
     retrain_path : Optional[str] = None,
@@ -73,6 +91,7 @@ def train_autoencoder(
             n_epochs=0, # inital epochs are 0 but gradually increasing
             training_set=train_files,
             validation_set=test_files,
+            n_steps=0,
             type=type
         )
 
@@ -82,7 +101,7 @@ def train_autoencoder(
             model = AutoEncoder(cfg)
 
 
-    model_dir = f"{PATH}/laion2b_autoencoders"
+    model_dir = f"{PATH}/laion2b_autoencoders/{cfg.folder_name}"
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
 
@@ -102,35 +121,26 @@ def train_autoencoder(
         batch_size=cfg.batch_size, 
         emb_folder=EMB_FOLDER,
         train_share=0.8,
-        n = model.W_dec.shape[0] 
+        d_hidden = model.W_dec.shape[0],
+        n_counts=(None, 1)
     )
-
-    eighty_percent_steps = len(train_loader) / 0.8
-    print("total steps", len(train_loader))
-    print("80 percent steps", eighty_percent_steps)
-
 
     model.to(model.cfg.device)
     
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
-    step = 0
+    if retrain_path is None:
+        step = 0
+    else:
+        step = model.metadata_cfg.n_steps 
     
     l1_coeff_final = 5
-    total_steps = len(train_loader) * n_epochs 
     #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below l1_coeff_final
-    l1_ramp = l1_coeff_final / ((total_steps // 100)*5 )
+    l1_ramp = l1_coeff_final / ((steps // 100)*5 )
     # we linearly increase l1_coeff from 0 to 5 
     #over the first 5% of the total steps as per anthropic paper
-
-    if retrain_path is not None:
-        _range = range(cfg.n_epochs, cfg.n_epochs + n_epochs) 
-    else:
-        _range = range(n_epochs)
-
-    print("epoch range", _range)
-    print("model l1_coeff", model.l1_coeff)
-    for epoch in _range: 
-        print("epoch", epoch)
+    print("step", step)
+    print("l1 coeff", model.l1_coeff)
+    while step < steps:
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
@@ -140,7 +150,7 @@ def train_autoencoder(
                     model.l1_coeff += l1_ramp 
 
             batch = batch.to(model.cfg.device)
-            #we have scaled the embeddings by 100 to make them larger and easier to work with
+            #we have scaled the embeddings by 10 to make them larger and easier to work with
 
             optimizer.zero_grad()
             result = model.forward(batch, method=loss_func) # type: ignore
@@ -151,38 +161,27 @@ def train_autoencoder(
             optimizer.step()
             
             #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
-            if step % 100 == 0:
-                wandb.log({
-                    "l1_coeff": model.l1_coeff,
-                    **result.format_loss()
-                })
-            if step % 1000 == 0:
-                print("step", step)
-                print("l1_coeff", model.l1_coeff)
-                print("results", result.format_loss())
-            
-        cfg.n_steps = step
-        cfg.l1_coeff = model.l1_coeff
-        
-        basename = cfg.create_basename()
-        model_path = f'{model_dir}/{basename}'
-        os.makedirs(model_path, exist_ok=True)
-        print("saving model at", model_path)
-        torch.save(model.state_dict(), f"{model_path}/model.pt")
-        with open(f"{model_path}/config.json", "w") as f:
-            f.write(cfg.model_dump_json())
-        vol.commit()
-        print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
+            wandb.log({
+                "l1_coeff": model.l1_coeff,
+                **result.format_loss()
+            })
 
-        model.eval()
-        with torch.no_grad():
-            print(f"evaluation epoch {epoch}\n")
-            for batch in tqdm(test_loader[:1000], desc="Testing"): # we only use fraction
-                batch = batch.to(model.cfg.device)
-                result = model.forward(batch, method="with_loss")
-                wandb.log({**result.format_loss(), "l1_coeff": model.l1_coeff})
 
-        cfg.n_epochs += 1
+            if step % save_interval == 0:
+                print("saving model at step", step)
+                save_model(model, cfg, model_dir)
+            cfg.n_steps = step
+            cfg.l1_coeff = model.l1_coeff
+
+            if step % test_steps == 0:
+                model.eval()
+                with torch.no_grad():
+                    for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
+                        batch = batch.to(model.cfg.device)
+                        result = model.forward(batch, method="with_loss")
+                        wandb.log({f'test_{key}': value for key, value in result.format_loss().items()})
+
+            cfg.n_epochs += 1
 
 
 async def save_activations_async(path: str, activations: torch.Tensor):
@@ -213,7 +212,7 @@ def get_recons_loss(
     losses = []
     for file in tqdm(autoencoder.metadata_cfg.validation_set):
         try:
-            all_tokens = load_and_scale_tensor(file)
+            all_tokens = load_tensor(file)
         except:
             print("error loading file", file)
             continue

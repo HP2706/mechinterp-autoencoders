@@ -6,7 +6,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import Generator, Literal, Optional, List, Tuple, Union
 from pydantic import BaseModel
-from utils import load_and_scale_tensor
+from utils import load_tensor
 
 def check_inputs(kwargs):
     split = kwargs.get('split', None)
@@ -24,11 +24,12 @@ class LaionDataset(Dataset):
         split : Literal['train', 'test'],
         with_filenames : bool = False,
         train_share : float = 0.8,
+        n_count : Optional[int] = None,
         return_tuple: bool = False,
-        n : Optional[float] = None,
+        d_hidden : Optional[float] = None,
     ):
         check_inputs(locals())
-        self.n_sqrt = np.sqrt(n) if n is not None else None
+        self.n_sqrt = np.sqrt(d_hidden) if d_hidden is not None else None
         self.with_filenames = with_filenames
         emb_paths = [os.path.join(emb_folder, f) for f in os.listdir(emb_folder)]
         if len(emb_paths) == 0:
@@ -56,6 +57,11 @@ class LaionDataset(Dataset):
             if metadata_paths is not None:
                 self.metadata_paths = metadata_paths[int(len(metadata_paths)*train_share):]
 
+        if n_count:
+            self.emb_paths = self.emb_paths[:min(n_count, len(self.emb_paths))]
+            if metadata_paths is not None:
+                self.metadata_paths = self.metadata_paths[:min(n_count, len(self.metadata_paths))]
+
         self.return_tuple = return_tuple
         self.current_file_index = -1
         self.data: Optional[torch.Tensor] = None
@@ -70,7 +76,7 @@ class LaionDataset(Dataset):
         count = 0
         for i in range(len(self.emb_paths)):
             try:
-                tensors = load_and_scale_tensor(self.emb_paths[i])
+                tensors = load_tensor(self.emb_paths[i])
                 df = pd.read_parquet(self.metadata_paths[i])
                 yield (tensors, df)
             except ValueError as e:
@@ -90,7 +96,7 @@ class LaionDataset(Dataset):
         return self.metadata_df
 
     def get_data_by_idx(self, idx: int) -> Tuple[torch.Tensor, pd.DataFrame]:
-        tensor = load_and_scale_tensor(self.emb_paths[idx])
+        tensor = load_tensor(self.emb_paths[idx])
         metadata_df = pd.read_parquet(self.metadata_paths[idx])
         return tensor, metadata_df
             
@@ -106,7 +112,7 @@ class LaionDataset(Dataset):
     def load_next_file(self):
         self.current_file_index += 1
         if self.current_file_index < len(self.emb_paths):
-            self.data = load_and_scale_tensor(self.emb_paths[self.current_file_index])
+            self.data = load_tensor(self.emb_paths[self.current_file_index])
 
             if self.n_sqrt:
                 self.data = self.scale_dataset(self.data, self.n_sqrt)
@@ -170,13 +176,14 @@ class LaionDataset(Dataset):
             else:
                 return torch.stack(embeddings)
 
-class LaionFileLoader:
+class LaionDataLoader:
     def __init__(
         self, 
         batch_size: int, 
         emb_folder: str,
         split : Literal['train', 'test'],
-        n : Optional[float] = None,
+        n_count : Optional[int] = None,
+        d_hidden : Optional[float] = None,
         train_share : float = 0.8, 
     ):
         self.dataset = LaionDataset(
@@ -185,7 +192,8 @@ class LaionFileLoader:
             return_tuple=False,
             split=split,
             train_share=train_share,
-            n=n
+            n_count=n_count,
+            d_hidden=d_hidden
         )
         self.dataloader = DataLoader(
             self.dataset, 
@@ -193,7 +201,7 @@ class LaionFileLoader:
             shuffle=False,
         )
 
-    
+
     def __iter__(self):
         return iter(self.dataloader)
     
@@ -225,25 +233,28 @@ def load_loaders(
     batch_size: int,
     emb_folder: str,
     train_share : float = 0.8,
-    n : Optional[float] = None,
-) -> tuple[LaionFileLoader, LaionFileLoader]:
+    d_hidden : Optional[float] = None,
+    n_counts : Tuple[Optional[int], Optional[int]] = (None, None)
+) -> tuple[LaionDataLoader, LaionDataLoader]:
     '''
     Returns a tuple of (train loader, test loader)
     '''
     return (
-        LaionFileLoader(
+        LaionDataLoader(
         batch_size=batch_size,
         emb_folder=emb_folder,
         split='train',
         train_share=train_share,
-        n=n
+        d_hidden=d_hidden,
+        n_count=n_counts[0]
         ),
-        LaionFileLoader(
+        LaionDataLoader(
             batch_size=batch_size,
             emb_folder=emb_folder,
             split='test',
             train_share=train_share,
-            n=n
+            d_hidden=d_hidden,
+            n_count=n_counts[1]
         )
     )
 

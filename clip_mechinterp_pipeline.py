@@ -19,14 +19,7 @@ from typing import Any, Dict, List, Literal, Optional, Type, Union
 from utils import filter_valid_image_urls
 import time
 from datamodels import PredictActivation
-from autoencoder import (
-    AutoEncoder, 
-    GatedAutoEncoder,
-    AutoEncoderBase,
-    AutoencoderConfig,
-    AutoEncoderWrapper
-)
-
+from autoencoder_modal_wrapper import AutoEncoderWrapper
 from common import (
     image, 
     stub, 
@@ -172,6 +165,7 @@ class ClipMechInterpPipeline:
     def create_acts_dataset(
         self,
         n_files : int = 5,
+        index : Index = 'all'
     ) -> None:
         dataframes : List[pd.DataFrame] = []
         print("creating acts dataset")
@@ -179,8 +173,8 @@ class ClipMechInterpPipeline:
 
         self.quantize_and_save(
             dataframes, 
-            self.create_acts_filename('all'), 
-            'all'
+            filename=self.create_acts_filename(index), 
+            index=index,
         )
 
     def quantize_and_save(
@@ -191,11 +185,15 @@ class ClipMechInterpPipeline:
         num_bins : int = 9
     ) -> None:
         
-        df = pd.concat(dataframes)        
+        for (i, subdf) in enumerate(dataframes):
+            print("columns subdf", i, subdf.columns, subdf.head(5))
+        df = pd.concat(dataframes)      
+        print("merged df head", df.head(5))
+        print("columns", df.columns)
+        print("index", index)
         if index != 'all':
             df = df[df['feature_idx'] == index]
-
-        # Calculate min and max per feature_idx
+        
         min_activations = df.groupby('feature_idx')['activation'].agg('min').sort_index()
         max_activations = df.groupby('feature_idx')['activation'].agg('max').sort_index()
 

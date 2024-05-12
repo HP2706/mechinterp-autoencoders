@@ -13,7 +13,7 @@ from abc import ABC, abstractmethod
 from mechninterp_utils import utils
 from utils import get_device
 #internal imports
-from mechninterp_utils import mean_ablate_hook
+from mechninterp_utils import mean_ablate_hook, compute_normalized_mse
 from typing import overload, Protocol
 from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 from modal import gpu, enter, method
@@ -27,6 +27,7 @@ class GatedAutoEncoderResult(BaseModel):
     L_Reconstruct: Tensor
     L_Sparsity: Tensor
     L_aux: Tensor
+    normalized_mse : Tensor
 
     class Config:
         arbitrary_types_allowed = True
@@ -36,7 +37,8 @@ class GatedAutoEncoderResult(BaseModel):
             "L_Reconstruct": self.L_Reconstruct.item(),
             "L_Sparsity": self.L_Sparsity.item(),
             "L_aux": self.L_aux.item(),
-            "total_loss": self.loss.item()
+            "loss": self.loss.item(),
+            "normalized_mse": self.normalized_mse.item()
         }
 
 class AutoencoderResult(BaseModel):
@@ -45,6 +47,7 @@ class AutoencoderResult(BaseModel):
     acts: Tensor
     l2_loss: Tensor
     l1_loss: Tensor
+    normalized_mse : Tensor
 
     class Config:
         arbitrary_types_allowed = True
@@ -53,7 +56,8 @@ class AutoencoderResult(BaseModel):
         return {
             "l2_loss": self.l2_loss.item(),
             "l1_loss": self.l1_loss.item(),
-            "total_loss": self.loss.item()
+            "loss": self.loss.item(),
+            "normalized_mse": self.normalized_mse.item()
         }
 
 class AutoencoderModelConfig(BaseModel):
@@ -68,7 +72,10 @@ class AutoencoderModelConfig(BaseModel):
     @property 
     def dtype(self):
         return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
-
+    
+    @property
+    def folder_name(self):
+        return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_dict_mult_{self.dict_mult}'
 
 class AutoencoderConfig(AutoencoderModelConfig):
     batch_size: int
@@ -84,7 +91,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
     buffer_size: int
     buffer_batches: int
     n_epochs: int
-    n_steps: Optional[int] = None
+    n_steps: int
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
     loss_func : Optional[Literal['with_loss', 'with_new_loss']] = None
@@ -101,9 +108,9 @@ class AutoencoderConfig(AutoencoderModelConfig):
         with_ramp_str = f'_with_l1_coeff_ramp' if self.with_ramp else ''
         with_loss_func = f'_{self.loss_func}'
         return (
-            f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_'
-            f'lr_{self.lr}_dict_mult_{self.dict_mult}_'
-            f'epoch_{self.n_epochs}{with_ramp_str}{with_loss_func}'
+            f'{self.folder_name}_'
+            f'lr_{self.lr}_'
+            f'steps_{self.n_steps}{with_ramp_str}{with_loss_func}'
         ) # group string for readability
 
 
@@ -203,8 +210,6 @@ class AutoEncoder(AutoEncoderBase):
 
         self.to(self.device) # move to device
 
-
-
     @classmethod
     @overload
     def load_from_checkpoint(
@@ -234,7 +239,7 @@ class AutoEncoder(AutoEncoderBase):
         json_path : Optional[str] = None
     ) -> 'AutoEncoder': 
         
-        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
+        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path) #type: ignore
 
     def get_single_feature_acts(
         self,     
@@ -263,40 +268,55 @@ class AutoEncoder(AutoEncoderBase):
     def forward(
         self,
         x: Tensor, 
-        method: Literal['with_acts', 'with_loss', 'reconstruct', 'with_new_loss'] = 'with_loss'
+        method: Literal['with_acts', 'with_loss', 'reconstruct', 'with_new_loss'] = 'with_loss',
+        normalized_forward: bool = False,
     ) -> Union[Tensor, AutoencoderResult]:
-        
-        x_center = x - self.b_dec
-        acts = F.relu(x_center @ self.W_enc + self.b_enc)
+        if normalized_forward:
+            W_enc =  self.W_enc*torch.norm(self.W_dec)
+            b_enc = self.b_enc*torch.norm(self.W_dec)
+            W_dec = self.W_dec / torch.norm(self.W_dec)
+            b_dec = self.b_dec
+        else:
+            W_enc = self.W_enc
+            b_enc = self.b_enc
+            W_dec = self.W_dec
+            b_dec = self.b_dec
+
+        x_center = x - b_dec
+        acts = F.relu(x_center @ W_enc + b_enc)
         if method == 'with_acts':
             return acts
-        x_reconstruct = acts @ self.W_dec + self.b_dec
+        x_reconstruct = acts @ W_dec + b_dec
         if method == 'with_loss':
             l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
             l1_loss = self.l1_coeff * (acts.float().abs().sum())
             loss = l2_loss + l1_loss
+            
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
                 l2_loss=l2_loss, 
-                l1_loss=l1_loss
+                l1_loss=l1_loss,
+                normalized_mse=compute_normalized_mse(x, x_reconstruct)
             )
         elif method == 'reconstruct':
             return x_reconstruct
         elif method == 'with_new_loss':
             l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            l1_loss = self.l1_coeff * torch.sum(torch.abs(acts) * torch.norm(self.W_dec, dim=-1))
+            l1_loss = self.l1_coeff * torch.sum(torch.abs(acts) * torch.norm(W_dec, dim=-1))
             loss = l2_loss + l1_loss
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
                 l2_loss=l2_loss, 
-                l1_loss=l1_loss
+                l1_loss=l1_loss,
+                normalized_mse=compute_normalized_mse(x, x_reconstruct)
             )
         else:
             return x_reconstruct
+
 
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):
@@ -450,73 +470,10 @@ class GatedAutoEncoder(AutoEncoderBase):
                 acts=acts, 
                 L_Reconstruct=L_Reconstruct, 
                 L_Sparsity=L_Sparsity, 
-                L_aux=L_aux
+                L_aux=L_aux,
+                normalized_mse=compute_normalized_mse(x, x_reconstruct)
             )
         else:
             return x_reconstruct
         
-
-import tqdm
-from utils import filter_non_zero_batch
-from Laion_Processing.dataloader import LaionDataset
-from typing import List
-import pandas as pd
-
-@stub.cls(
-    image = image,
-    volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
-    timeout=60*60,
-    _allow_background_volume_commits=True,
-    gpu=gpu.A10G()    
-)
-class AutoEncoderWrapper:
-    def __init__(self, checkpoint_path: str, dataset_kwargs: dict):
-        self.model = AutoEncoderBase.load_from_checkpoint(checkpoint_path)
-        self.dataset = LaionDataset(**dataset_kwargs)
-   
-
-    @method()
-    def create_acts_dataset(
-        self,
-        n_files : int = 5,
-    ) -> List[pd.DataFrame]:
-        dataframes : List[pd.DataFrame] = []
-        nrows = 0
-
-        for (tensor, df_metadata) in tqdm.tqdm(
-            self.dataset.iter_files(max_count=n_files), 
-            total=n_files,
-            desc="Processing Files"
-        ):            
-            with torch.no_grad():
-                df_rows = []
-                batch_size = 1024
-                for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
-                    scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
-                    acts = self.model.forward(scaled_batch, 'with_acts')
-                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
-                    #if there are no non-zero activations, we skip the batch because 
-                    # it is all zeros or below the activation threshold
-                    if non_zero_indices.nelement() == 0:
-                        continue
-                    
-                    # Get non-zero activations and their indices for the entire batch
-                    non_zero_activations = acts[non_zero_indices]
-                    non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
-                    original_indices = (non_zero_indices + j).tolist()
-                    
-                    # Extract the activation values using these indices
-                    activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
-                    for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
-                        df_rows.append(
-                            {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
-                            'activation': value,
-                            'feature_idx': idx[1],
-                            'data_idx': original_indices[idx[0]]+nrows,
-                        })
-
-            dataframes.append(pd.DataFrame(df_rows))
-            nrows += len(df_metadata)
-        
-        return dataframes
 
