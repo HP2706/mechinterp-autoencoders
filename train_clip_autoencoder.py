@@ -46,7 +46,7 @@ def save_model(
 @stub.function(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
-    timeout=10*60*60, #10 hours
+    timeout=5*60*60, #3 hours
     gpu=gpu.A10G(),    
     secrets=[modal.Secret.from_name("my-wandb-secret")],
     _allow_background_volume_commits=True
@@ -54,7 +54,7 @@ def save_model(
 def train_autoencoder(
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
-    steps: int = 2*10**5, 
+    steps: int = 2*10**5, # 200 k steps as per anthropic paper
     save_interval : int = 10**4, # we save the model every save_interval steps
     test_steps : int = 50**4,
     with_ramp: bool = True,
@@ -76,7 +76,7 @@ def train_autoencoder(
             seed=42,
             batch_size=4096, #2048 or 4096
             buffer_mult=10,
-            lr=5e-5, #anthropic suggested 5e-5
+            lr=4e-4, #anthropic suggested 5e-5
             l1_coeff=0, # initially 0 but progressively increases to 5
             beta1=0.9,
             beta2=0.999,

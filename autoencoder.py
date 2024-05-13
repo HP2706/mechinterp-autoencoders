@@ -6,7 +6,7 @@ from click import Option
 import torch
 from torch import Tensor
 import torch.nn as nn
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 from torch.nn import functional as F
 from typing import Tuple, Union, Literal, List, Any, Type, cast
 from abc import ABC, abstractmethod
@@ -19,46 +19,64 @@ from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 from modal import gpu, enter, method
 
 
-class GatedAutoEncoderResult(BaseModel):
-    #loss, x_reconstruct, acts, L_Reconstruct, L_Sparsity, L_aux
+def compute_l0_norm(x: Tensor) -> Tensor:
+    return (x.ne(0).float()).mean()
+
+def compute_mean_absolute_error(x: Tensor, y: Tensor) -> Tensor:
+    return (torch.abs(x - y)).mean()
+
+def compute_mse(x: Tensor, y: Tensor) -> Tensor:
+    return (x - y).pow(2).mean()
+
+def compute_l1_sparsity(x: Tensor) -> Tensor:
+    return x.abs().sum()
+
+class BasicStats(BaseModel):
     loss: Tensor
     x_reconstruct: Tensor
     acts: Tensor
-    L_Reconstruct: Tensor
-    L_Sparsity: Tensor
-    L_aux: Tensor
-    normalized_mse : Tensor
+    l2_loss: Tensor = Field(..., description="mean squared error")
+    l1_loss: Tensor = Field(..., description="mean absolute error")
+    l_sparsity: Tensor = Field(..., description="the sum of the absolute values of the activations")
+    l0_norm: Tensor = Field(..., description="average number of non-zero entries in the activations")
+    normalized_mse : Tensor 
 
     class Config:
         arbitrary_types_allowed = True
 
     def format_loss(self):
         return {
-            "L_Reconstruct": self.L_Reconstruct.item(),
-            "L_Sparsity": self.L_Sparsity.item(),
-            "L_aux": self.L_aux.item(),
             "loss": self.loss.item(),
-            "normalized_mse": self.normalized_mse.item()
-        }
-
-class AutoencoderResult(BaseModel):
-    loss: Tensor
-    x_reconstruct: Tensor
-    acts: Tensor
-    l2_loss: Tensor
-    l1_loss: Tensor
-    normalized_mse : Tensor
-
-    class Config:
-        arbitrary_types_allowed = True
-
-    def format_loss(self):
-        return {
             "l2_loss": self.l2_loss.item(),
             "l1_loss": self.l1_loss.item(),
-            "loss": self.loss.item(),
-            "normalized_mse": self.normalized_mse.item()
+            "l0_norm": self.l0_norm.item(),
+            "normalized_mse": self.normalized_mse.item(),
+            "l_sparsity": self.l_sparsity.item()
         }
+
+
+class GatedAutoEncoderResult(BasicStats):
+    #loss, x_reconstruct, acts, L_Reconstruct, L_Sparsity, L_aux
+    L_aux: Tensor
+
+    class Config:
+        arbitrary_types_allowed = True
+
+    def format_loss(self):
+        base_loss = super().format_loss()  # Call the superclass method
+        return {
+            **base_loss,
+            "L_aux": self.L_aux.item(), 
+        }
+
+class AutoencoderResult(BasicStats):
+    #TODO might add fields
+    class Config:
+        arbitrary_types_allowed = True
+
+    def format_loss(self):
+        return super().format_loss()
+        
 
 class AutoencoderModelConfig(BaseModel):
     type: Literal['autoencoder', 'gated_autoencoder']
@@ -286,32 +304,37 @@ class AutoEncoder(AutoEncoderBase):
         acts = F.relu(x_center @ W_enc + b_enc)
         if method == 'with_acts':
             return acts
+        
         x_reconstruct = acts @ W_dec + b_dec
         if method == 'with_loss':
-            l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            l1_loss = self.l1_coeff * (acts.float().abs().sum())
-            loss = l2_loss + l1_loss
+            l2_loss = compute_mse(x_reconstruct, x)
+            L_sparse = self.l1_coeff * compute_l1_sparsity(acts)
+            loss = l2_loss + L_sparse
             
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
                 l2_loss=l2_loss, 
-                l1_loss=l1_loss,
+                l_sparsity=L_sparse,
+                l1_loss=compute_mean_absolute_error(x, x_reconstruct),
+                l0_norm=compute_l0_norm(acts),
                 normalized_mse=compute_normalized_mse(x, x_reconstruct)
             )
         elif method == 'reconstruct':
             return x_reconstruct
         elif method == 'with_new_loss':
-            l2_loss = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-            l1_loss = self.l1_coeff * torch.sum(torch.abs(acts) * torch.norm(W_dec, dim=-1))
-            loss = l2_loss + l1_loss
+            l2_loss = compute_mse(x_reconstruct, x)
+            L_sparse = self.l1_coeff * (acts.abs() * torch.norm(W_dec, dim=-1)).sum() # alternativ sparsity metric
+            loss = l2_loss + L_sparse
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
                 l2_loss=l2_loss, 
-                l1_loss=l1_loss,
+                l1_loss=compute_mean_absolute_error(x, x_reconstruct),
+                l_sparsity=L_sparse,
+                l0_norm=compute_l0_norm(acts),
                 normalized_mse=compute_normalized_mse(x, x_reconstruct)
             )
         else:
@@ -448,8 +471,7 @@ class GatedAutoEncoder(AutoEncoderBase):
             return x_reconstruct
         elif method == 'with_loss':
             #Reconstruct loss
-            L_Reconstruct = (x_reconstruct.float() - x.float()).pow(2).sum(-1).mean(0)
-
+            l2 = compute_mse(x_reconstruct, x)
             # Computing Sparsity loss
             via_gate_feature_magnitudes = self.relu(gate_center)
             L_Sparsity = self.l1_coeff * (via_gate_feature_magnitudes.float().sum())
@@ -459,19 +481,21 @@ class GatedAutoEncoder(AutoEncoderBase):
                 W_dec_frozen = self.W_dec.detach()
                 b_dec_frozen = self.b_dec.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
-            L_aux = (x - via_gate_reconstruction).pow(2).sum(-1).mean(0)
+            L_aux = compute_mse(x, via_gate_reconstruction)
 
             # Summing up the losses
-            loss = L_Reconstruct + L_Sparsity + L_aux
+            loss = l2 + L_Sparsity + L_aux
 
             return GatedAutoEncoderResult(
                 loss=loss, 
+                l2_loss=l2,
+                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
+                l_sparsity=L_Sparsity,
+                l0_norm=compute_l0_norm(acts),
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
-                L_Reconstruct=L_Reconstruct, 
-                L_Sparsity=L_Sparsity, 
                 L_aux=L_aux,
-                normalized_mse=compute_normalized_mse(x, x_reconstruct)
+                normalized_mse=compute_normalized_mse(x_reconstruct, x)
             )
         else:
             return x_reconstruct
