@@ -54,9 +54,9 @@ def save_model(
 def train_autoencoder(
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
-    steps: int = 2*10**5, # 200 k steps as per anthropic paper
+    steps: int = 100*10**3, # 100 k steps as per anthropic paper
     save_interval : int = 10**4, # we save the model every save_interval steps
-    test_steps : int = 50**4,
+    test_steps : int = 25*10**3,
     with_ramp: bool = True,
     loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
     retrain_path : Optional[str] = None,
@@ -76,7 +76,7 @@ def train_autoencoder(
             seed=42,
             batch_size=4096, #2048 or 4096
             buffer_mult=10,
-            lr=4e-4, #anthropic suggested 5e-5
+            lr=10e-3, #anthropic suggested 
             l1_coeff=0, # initially 0 but progressively increases to 5
             beta1=0.9,
             beta2=0.999,
@@ -138,8 +138,6 @@ def train_autoencoder(
     l1_ramp = l1_coeff_final / ((steps // 100)*5 )
     # we linearly increase l1_coeff from 0 to 5 
     #over the first 5% of the total steps as per anthropic paper
-    print("step", step)
-    print("l1 coeff", model.l1_coeff)
     while step < steps:
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
@@ -157,7 +155,7 @@ def train_autoencoder(
             result.loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1) 
             # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
-            optimizer.step()
+            model.remove_parallel_component()
             optimizer.step()
             
             #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
@@ -179,18 +177,19 @@ def train_autoencoder(
                     for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
                         batch = batch.to(model.cfg.device)
                         result = model.forward(batch, method="with_loss")
-                        wandb.log({f'test_{key}': value for key, value in result.format_loss().items()})
+                        wandb.log(
+                            {
+                                f'test_{key}': value for key, value in result.format_loss().items()
+                            }
+                        )
 
             cfg.n_epochs += 1
 
+def create_hist(
+    acts : torch.Tensor
+):
+    '''creates a historgam plotting ..'''
 
-async def save_activations_async(path: str, activations: torch.Tensor):
-    buffer = BytesIO()
-    np.save(buffer, activations.numpy(), allow_pickle=False)
-    buffer.seek(0)  # Move to the start of the buffer
-    async with aiofiles.open(path, 'wb') as f:
-        await f.write(buffer.read())
-    dataset_vol.commit()
 
 @stub.function(
     image = image,

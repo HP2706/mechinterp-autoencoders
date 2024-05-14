@@ -2,14 +2,6 @@ import torch
 from functools import partial
 from transformer_lens import utils
 from torchmetrics.regression import SpearmanCorrCoef
-from jaxtyping import Float
-
-def compute_normalized_mse(x : torch.Tensor, x_reconstruct : torch.Tensor) -> torch.Tensor:
-    '''normalizes input vectors to 1 before computing mse'''
-    x_norm = x / torch.norm(x, dim=1, keepdim=True)
-    x_reconstruct_norm = x_reconstruct / torch.norm(x_reconstruct, dim=1, keepdim=True)
-    return (x_norm - x_reconstruct_norm).pow(2).mean()
-
 
 def compute_proxy(proba_distb : torch.Tensor, feature_tokens : torch.Tensor): #NOT finished
     # shape of proba_distb is [batch, seq_len, vocab_size]

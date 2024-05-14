@@ -1,35 +1,46 @@
 import json
 import pandas as pd
+from typing_extensions import Self
 import os
 from typing import Optional
 from click import Option
 import torch
 from torch import Tensor
 import torch.nn as nn
-from pydantic import BaseModel, field_validator, Field
+from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
-from typing import Tuple, Union, Literal, List, Any, Type, cast
+from typing import Tuple, Union, Literal, List, Any, Type, cast, TypeVar
 from abc import ABC, abstractmethod
 from mechninterp_utils import utils
 from utils import get_device
-#internal imports
-from mechninterp_utils import mean_ablate_hook, compute_normalized_mse
+from mechninterp_utils import mean_ablate_hook
 from typing import overload, Protocol
 from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 from modal import gpu, enter, method
 
+def compute_l0_norm(x: torch.Tensor) -> torch.Tensor:
+    '''the mean l0 norm of the activations over the batch'''
+    #x : shape(batch_size, dim)
+    assert len(x.shape) == 2
+    nonzero_per_activation = x.ne(0).float().sum(dim=1)
+    return nonzero_per_activation.mean(0)
 
-def compute_l0_norm(x: Tensor) -> Tensor:
-    return (x.ne(0).float()).mean()
+def compute_mean_absolute_error(x: Tensor, ground_truth: Tensor) -> Tensor:
+    return (torch.abs(x - ground_truth)).mean()
 
-def compute_mean_absolute_error(x: Tensor, y: Tensor) -> Tensor:
-    return (torch.abs(x - y)).mean()
-
-def compute_mse(x: Tensor, y: Tensor) -> Tensor:
-    return (x - y).pow(2).mean()
+def compute_mse(x: Tensor, ground_truth: Tensor) -> Tensor:
+    return (x - ground_truth).pow(2).mean()
 
 def compute_l1_sparsity(x: Tensor) -> Tensor:
-    return x.abs().sum()
+    return x.abs().sum(1).mean(0)
+
+def compute_normalized_mse(x : torch.Tensor, ground_truth : torch.Tensor) -> torch.Tensor:
+    '''normalized mean squared error by '''
+    return ((x-ground_truth).pow(2) / (ground_truth**2).sum(dim=-1, keepdim=True)).sqrt().mean()
+
+def compute_avg_num_firing(x: Tensor) -> Tensor:
+    return (x > 0).float().sum(dim=1).mean(0)
+
 
 class BasicStats(BaseModel):
     loss: Tensor
@@ -96,6 +107,7 @@ class AutoencoderModelConfig(BaseModel):
         return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_dict_mult_{self.dict_mult}'
 
 class AutoencoderConfig(AutoencoderModelConfig):
+    type: Literal['autoencoder', 'gated_autoencoder']
     batch_size: int
     buffer_mult: int
     num_tokens: Optional[int] = None
@@ -112,24 +124,49 @@ class AutoencoderConfig(AutoencoderModelConfig):
     n_steps: int
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
-    loss_func : Optional[Literal['with_loss', 'with_new_loss']] = None
+    loss_func : Optional[Literal['with_loss', 'with_new_loss']] = 'with_loss'
 
-    @field_validator('loss_func')
-    @classmethod
-    def check_loss_func(cls, v):
-        if v is not None:
-            if v == 'with_new_loss' and cls.type == 'gated_autoencoder':
-                raise ValueError("Gated Autoencoder does not support 'with_new_loss' loss function")
-        return v
+    @model_validator(mode='after')
+    def check_loss_func(self, data)-> Self:
+        if self.loss_func == 'with_new_loss' and self.type == 'gated_autoencoder':
+            raise ValueError("Gated Autoencoder does not support 'with_new_loss' loss function")
+        return data
 
     def create_basename(self)->str:
-        with_ramp_str = f'_with_l1_coeff_ramp' if self.with_ramp else ''
+        with_ramp_str = '_with_l1_coeff_ramp' if self.with_ramp else ''
         with_loss_func = f'_{self.loss_func}'
         return (
             f'{self.folder_name}_'
             f'lr_{self.lr}_'
             f'steps_{self.n_steps}{with_ramp_str}{with_loss_func}'
         ) # group string for readability
+
+
+    @classmethod
+    def default(cls)-> 'AutoencoderConfig':
+        return cls(
+            batch_size=1,
+            buffer_mult=1,
+            lr=0.001,
+            beta1=0.9,
+            beta2=0.999,
+            seq_len=1,
+            buffer_size=1,
+            buffer_batches=1,
+            n_epochs=1,
+            n_steps=1,
+            type='autoencoder',
+            loss_func='with_loss',
+            dict_mult=1,
+            d_mlp=1024,
+            l1_coeff=0.1,
+            seed=0,
+            enc_dtype='fp32',
+            device='cuda'
+        )
+
+
+T = TypeVar('T', bound='AutoEncoderBase')
 
 
 class AutoEncoderBase(nn.Module, ABC):
@@ -204,7 +241,24 @@ class AutoEncoderBase(nn.Module, ABC):
         model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=device))
         return model
 
-#inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
+
+    @torch.no_grad()
+    def remove_parallel_component(self) -> None:
+        parallel_component = (self.W_dec.grad * self.W_dec).sum(dim=1, keepdim=True)
+        self.W_dec.grad -= parallel_component * self.W_dec
+
+    @torch.no_grad()
+    def remove_parallel_component_einsum(self) -> None:
+        parallel_component = torch.einsum("ij,ij->i", self.W_dec.grad, self.W_dec)
+        self.W_dec.grad -= torch.einsum("i,ij->ij", parallel_component, self.W_dec)
+
+
+    @classmethod
+    @abstractmethod
+    def default(cls: Type[T]) -> T:
+        """Should be implemented to return an instance of the calling class."""
+        pass
+    #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
 class AutoEncoder(AutoEncoderBase):
     def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__(cfg)
@@ -227,6 +281,10 @@ class AutoEncoder(AutoEncoderBase):
         self.device = get_device()
 
         self.to(self.device) # move to device
+
+    @classmethod
+    def default(cls: Type[T]) -> T:
+        return cls(AutoencoderConfig.default())
 
     @classmethod
     @overload
@@ -308,8 +366,8 @@ class AutoEncoder(AutoEncoderBase):
         x_reconstruct = acts @ W_dec + b_dec
         if method == 'with_loss':
             l2_loss = compute_mse(x_reconstruct, x)
-            L_sparse = self.l1_coeff * compute_l1_sparsity(acts)
-            loss = l2_loss + L_sparse
+            L_sparse = compute_l1_sparsity(acts)
+            loss = l2_loss + (self.l1_coeff * L_sparse)
             
             return AutoencoderResult(
                 loss=loss, 
@@ -317,61 +375,28 @@ class AutoEncoder(AutoEncoderBase):
                 acts=acts, 
                 l2_loss=l2_loss, 
                 l_sparsity=L_sparse,
-                l1_loss=compute_mean_absolute_error(x, x_reconstruct),
+                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
                 l0_norm=compute_l0_norm(acts),
-                normalized_mse=compute_normalized_mse(x, x_reconstruct)
+                normalized_mse=compute_normalized_mse(x_reconstruct, x)
             )
         elif method == 'reconstruct':
             return x_reconstruct
         elif method == 'with_new_loss':
             l2_loss = compute_mse(x_reconstruct, x)
-            L_sparse = self.l1_coeff * (acts.abs() * torch.norm(W_dec, dim=-1)).sum() # alternativ sparsity metric
-            loss = l2_loss + L_sparse
+            L_sparse = (acts.abs() * torch.norm(W_dec, dim=-1)).sum() # alternativ sparsity metric
+            loss = l2_loss + (self.l1_coeff * L_sparse)
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
                 l2_loss=l2_loss, 
-                l1_loss=compute_mean_absolute_error(x, x_reconstruct),
+                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
                 l_sparsity=L_sparse,
                 l0_norm=compute_l0_norm(acts),
-                normalized_mse=compute_normalized_mse(x, x_reconstruct)
+                normalized_mse=compute_normalized_mse(x_reconstruct, x)
             )
         else:
             return x_reconstruct
-
-
-    @torch.no_grad()
-    def remove_parallel_component_of_grads(self):
-        W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
-        W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
-        self.W_dec.grad -= W_dec_grad_proj
-
-    @classmethod
-    def load_from_hf(cls, version, device : str):
-        """
-        Loads the saved autoencoder from HuggingFace.
-
-        Version is expected to be an int, or "run1" or "run2"
-
-        version 25 is the final checkpoint of the first autoencoder run,
-        version 47 is the final checkpoint of the second autoencoder run.
-        """
-        if version=="run1":
-            version = 25
-        elif version=="run2":
-            version = 47
-
-
-        cfg : dict = utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}_cfg.json") # type: ignore
-        cfg["buffer_size"] = cfg["batch_size"] * cfg["buffer_mult"] 
-        cfg["buffer_batches"] = cfg["buffer_size"] // cfg["seq_len"] 
-        cfg["device"] = device 
-        valid_cfg = AutoencoderModelConfig(**cfg) 
-        self = cls(cfg=valid_cfg)
-        self.load_state_dict(utils.download_file_from_hf("NeelNanda/sparse_autoencoder", f"{version}.pt", force_is_torch=True)) # type: ignore
-        return self
-
 
 #from paper https://arxiv.org/pdf/2404.16014
 class GatedAutoEncoder(AutoEncoderBase):
@@ -396,6 +421,10 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.W_mag = nn.Parameter(weight_init)
         self.device = get_device()
         self.to(self.device)
+
+    @classmethod
+    def default(cls: Type[T]) -> T:
+        return cls(AutoencoderConfig.default())
 
     @classmethod
     @overload
@@ -474,7 +503,7 @@ class GatedAutoEncoder(AutoEncoderBase):
             l2 = compute_mse(x_reconstruct, x)
             # Computing Sparsity loss
             via_gate_feature_magnitudes = self.relu(gate_center)
-            L_Sparsity = self.l1_coeff * (via_gate_feature_magnitudes.float().sum())
+            L_Sparsity = via_gate_feature_magnitudes.float().sum()
 
             # Computing L_aux with frozen decoder
             with torch.no_grad():
@@ -484,7 +513,7 @@ class GatedAutoEncoder(AutoEncoderBase):
             L_aux = compute_mse(x, via_gate_reconstruction)
 
             # Summing up the losses
-            loss = l2 + L_Sparsity + L_aux
+            loss = l2 + (self.l1_coeff * L_Sparsity) + L_aux
 
             return GatedAutoEncoderResult(
                 loss=loss, 

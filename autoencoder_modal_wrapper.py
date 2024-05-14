@@ -63,7 +63,6 @@ class AutoEncoderWrapper:
                             'feature_idx': idx[1],
                             'data_idx': original_indices[idx[0]]+nrows,
                         })
-                        print("df rows", df_rows[-1])
 
             dataframes.append(pd.DataFrame(df_rows))
             nrows += len(df_metadata)

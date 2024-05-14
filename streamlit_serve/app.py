@@ -17,7 +17,9 @@ def main():
     # Select a feature index
     path = 'autoencoder_d_hidden_6144_lr_5e-05_dict_mult_8_epoch_1'
     path = st.selectbox('Select Model', models)
-    path = f'{models_path}/{path}/activations/laion_acts_all.parquet'
+
+    model = st.selectbox('select version', os.listdir(f'{models_path}/{path}'))
+    path = f'{models_path}/{path}/{model}/activations/laion_acts_all.parquet'
     with st.spinner('Loading data...'):
         
         df = pd.read_parquet(path)
@@ -36,8 +38,8 @@ def main():
         if len(quant_df) == 0:
             continue
 
-        ten_random_samples = quant_df.sample(min(5, len(quant_df)), replace=False)
-        for idx, row in ten_random_samples.iterrows():
+        #ten_random_samples = quant_df.sample(min(5, len(quant_df)), replace=False)
+        for idx, row in quant_df.iterrows():
             st.image(row['url'], caption=f"{row['caption']}, quantized_activation : {quantization} activation: {row['activation']}")
 
 if __name__ == "__main__":
