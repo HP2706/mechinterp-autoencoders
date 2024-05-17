@@ -365,28 +365,30 @@ class AutoEncoder(AutoEncoderBase):
         return feature_acts.unsqueeze(-1) #[batch, 1]
 
     @overload
-    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct']) -> Tensor: ...
+    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct'], normalize_weights: bool = False) -> Tensor: ...
     @overload
-    def forward(self, x: Tensor, method: Literal['with_loss']) -> AutoencoderResult: ...
+    def forward(self, x: Tensor, method: Literal['with_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
     @overload
-    def forward(self, x: Tensor, method: Literal['with_new_loss']) -> AutoencoderResult: ...
+    def forward(self, x: Tensor, method: Literal['with_new_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
 
     def forward(
         self,
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct', 'with_new_loss'] = 'with_loss',
-        normalized_forward: bool = False,
+        normalize_weights: bool = False
     ) -> Union[Tensor, AutoencoderResult]:
-        if normalized_forward:
-            W_enc =  self.W_enc*torch.norm(self.W_dec)
-            b_enc = self.b_enc*torch.norm(self.W_dec)
-            W_dec = self.W_dec / torch.norm(self.W_dec)
-            b_dec = self.b_dec
-        else:
-            W_enc = self.W_enc
-            b_enc = self.b_enc
-            W_dec = self.W_dec
-            b_dec = self.b_dec
+
+        W_enc = self.W_enc
+        b_enc = self.b_enc
+        W_dec = self.W_dec
+        b_dec = self.b_dec
+
+        if normalize_weights:
+            norm_factor = torch.norm(W_dec, dim=0, keepdim=True)
+            W_enc = W_enc * norm_factor
+            b_enc = b_enc * norm_factor
+            #b_dec remains unchanged
+            W_dec = W_dec / norm_factor
 
         x_center = x - b_dec
         acts = self.relu(x_center @ W_enc + b_enc)
@@ -424,7 +426,8 @@ class AutoEncoder(AutoEncoderBase):
             )
         elif method == 'reconstruct':
             return x_reconstruct
-       
+        else:
+            raise ValueError(f"Invalid method: {method}")
 
 #from paper https://arxiv.org/pdf/2404.16014
 class GatedAutoEncoder(AutoEncoderBase):
