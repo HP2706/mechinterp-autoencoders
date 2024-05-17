@@ -20,3 +20,4 @@ litellm
 anthropic
 logfire
 google-generativeai
+plotly

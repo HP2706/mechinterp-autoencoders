@@ -17,15 +17,14 @@ from Laion_Processing.dataloader import load_loaders
 import wandb
 from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
 from utils import load_tensor
+from mechninterp_utils import hist
 from modal import gpu
 import modal
 import os
 from typing import Literal, Optional, Union
-from utils import remove_keys
 
 from torch.optim import AdamW
 from tqdm import tqdm
-
 
 
 def save_model(
@@ -54,13 +53,19 @@ def save_model(
 def train_autoencoder(
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
-    steps: int = 100*10**3, # 100 k steps as per anthropic paper
+    steps: int = 10**5, # 100 k steps as per anthropic paper
     save_interval : int = 10**4, # we save the model every save_interval steps
     test_steps : int = 25*10**3,
     with_ramp: bool = True,
+    max_l_coef : float = 5,
     loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
     retrain_path : Optional[str] = None,
+    resampling_interval : Optional[int] = 10**4,
 ):
+    if with_ramp and loss_func == 'with_loss':
+        print("with_ramp does not work for the with_loss loss function disabling it")
+        with_ramp = False
+
     if retrain_path is not None:
         model = AutoEncoderBase.load_from_checkpoint(retrain_path)
         model_dir = retrain_path
@@ -76,8 +81,8 @@ def train_autoencoder(
             seed=42,
             batch_size=4096, #2048 or 4096
             buffer_mult=10,
-            lr=10e-3, #anthropic suggested 
-            l1_coeff=0, # initially 0 but progressively increases to 5
+            lr=0.0012, 
+            l1_coeff=0 if with_ramp else 10e-3, 
             beta1=0.9,
             beta2=0.999,
             dict_mult=dict_mult,
@@ -100,15 +105,24 @@ def train_autoencoder(
         else:
             model = AutoEncoder(cfg)
 
+    def resample_at_step_idx()->bool:
+        if resampling_interval is None:
+            return False
+        else:
+            return step % resampling_interval == 0    
+
 
     model_dir = f"{PATH}/laion2b_autoencoders/{cfg.folder_name}"
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
 
+
+    wandb.login(key=os.getenv('WANDB_API_KEY'))
     wandb.init(
         # set the wandb project where this run will be logged
         project="Sparse AutoEncoder",
         # track hyperparameters and run metadata
+        name = cfg.folder_name,
         config={
             "learning_rate": cfg.lr,
             "architecture": "AutoEncoder",
@@ -121,30 +135,34 @@ def train_autoencoder(
         batch_size=cfg.batch_size, 
         emb_folder=EMB_FOLDER,
         train_share=0.8,
-        d_hidden = model.W_dec.shape[0],
+        d_hidden = model.W_dec.shape[0] if cfg.updated_anthropic_method else None,
         n_counts=(None, 1)
     )
 
     model.to(model.cfg.device)
-    
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
     if retrain_path is None:
         step = 0
     else:
         step = model.metadata_cfg.n_steps 
     
-    l1_coeff_final = 5
-    #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below l1_coeff_final
-    l1_ramp = l1_coeff_final / ((steps // 100)*5 )
+    last_resampling_step_idx = step
+
+
+    #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below max_l_coef
+    l1_ramp = max_l_coef / ((steps // 100)*5 )
     # we linearly increase l1_coeff from 0 to 5 
     #over the first 5% of the total steps as per anthropic paper
+
+    running_frequency_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.int)
+
     while step < steps:
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
             # Update l1_coeff linearly over the first 5% of the total steps
             if with_ramp:
-                if model.l1_coeff <= l1_coeff_final:
+                if model.l1_coeff <= max_l_coef:
                     model.l1_coeff += l1_ramp 
 
             batch = batch.to(model.cfg.device)
@@ -152,17 +170,27 @@ def train_autoencoder(
 
             optimizer.zero_grad()
             result = model.forward(batch, method=loss_func) # type: ignore
+
+            running_frequency_counter += result.did_fire
+
             result.loss.backward()
             clip_grad_norm_(model.parameters(), max_norm=1) 
             # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
-            model.remove_parallel_component()
+            
+            model.remove_parallel_component_of_grads()
             optimizer.step()
             
             #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
-            wandb.log({
+            metrics = {
                 "l1_coeff": model.l1_coeff,
-                **result.format_loss()
-            })
+                **result.format_data()
+            }
+
+            if not cfg.updated_anthropic_method:
+                with torch.no_grad():
+                    # Renormalize W_dec to have unit norm
+                    norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
+                    model.W_dec.data /= (norms + 1e-6) 
 
 
             if step % save_interval == 0:
@@ -170,6 +198,28 @@ def train_autoencoder(
                 save_model(model, cfg, model_dir)
             cfg.n_steps = step
             cfg.l1_coeff = model.l1_coeff
+
+            if resample_at_step_idx():
+                current_frequency_counter = running_frequency_counter.to(cfg.device) / (cfg.batch_size * (step - last_resampling_step_idx))
+
+                running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
+                #from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b)
+                fig = hist(
+                    torch.max(current_frequency_counter.cpu(), torch.FloatTensor([1e-10])).log10().cpu(),
+                    # Show proportion on y axis
+                    histnorm="percent",
+                    title = "Histogram of SAE Neuron Firing Frequency (Proportions of all Neurons)",
+                    xaxis_title = "Log10(Frequency)",
+                    yaxis_title = "Percent (changed!) of Neurons",
+                    return_fig = True,
+                    # Do not show legend
+                    showlegend = False
+                )
+                metrics["frequency_histogram"] = fig
+
+                last_resampling_step_idx = step
+
+            wandb.log(metrics)
 
             if step % test_steps == 0:
                 model.eval()
@@ -179,16 +229,11 @@ def train_autoencoder(
                         result = model.forward(batch, method="with_loss")
                         wandb.log(
                             {
-                                f'test_{key}': value for key, value in result.format_loss().items()
+                                f'test_{key}': value for key, value in result.format_data().items()
                             }
                         )
 
             cfg.n_epochs += 1
-
-def create_hist(
-    acts : torch.Tensor
-):
-    '''creates a historgam plotting ..'''
 
 
 @stub.function(

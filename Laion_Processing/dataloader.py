@@ -1,12 +1,11 @@
 import os
 import torch
 from typing import Any, overload
-import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import Generator, Literal, Optional, List, Tuple, Union
-from pydantic import BaseModel
 from utils import load_tensor
+import math 
 
 def check_inputs(kwargs):
     split = kwargs.get('split', None)
@@ -29,7 +28,7 @@ class LaionDataset(Dataset):
         d_hidden : Optional[float] = None,
     ):
         check_inputs(locals())
-        self.n_sqrt = np.sqrt(d_hidden) if d_hidden is not None else None
+        self.d_hidden = d_hidden
         self.with_filenames = with_filenames
         emb_paths = [os.path.join(emb_folder, f) for f in os.listdir(emb_folder)]
         if len(emb_paths) == 0:
@@ -100,12 +99,12 @@ class LaionDataset(Dataset):
         metadata_df = pd.read_parquet(self.metadata_paths[idx])
         return tensor, metadata_df
             
-    def scale_dataset(self, X : torch.Tensor, n : int):
-        '''computes the expected norm of the dataset row (dim=-1) and normalized to n_sqrt'''
+    def scale_dataset(self, X: torch.Tensor, n: float):
+        '''Computes the expected norm of the dataset row (dim=-1) and normalizes to sqrt(target_norm).'''
+        n_sqrt = math.sqrt(n)
         norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
-        mean_norm = torch.mean(norms) 
-        desired_norm = torch.sqrt(torch.tensor(n).float())
-        scaling_factor = desired_norm / mean_norm
+        mean_norm = torch.mean(norms).float()
+        scaling_factor = n_sqrt / mean_norm
         X_scaled = X * scaling_factor  # Scale the dataset
         return X_scaled
 
@@ -114,8 +113,8 @@ class LaionDataset(Dataset):
         if self.current_file_index < len(self.emb_paths):
             self.data = load_tensor(self.emb_paths[self.current_file_index])
 
-            if self.n_sqrt:
-                self.data = self.scale_dataset(self.data, self.n_sqrt)
+            if self.d_hidden:
+                self.data = self.scale_dataset(self.data, self.d_hidden)
 
             if self.return_tuple:
                 self.metadata_df = pd.read_parquet(self.metadata_paths[self.current_file_index])

@@ -41,10 +41,12 @@ class AutoEncoderWrapper:
                 for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
                     scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
                     acts = self.model.forward(scaled_batch, 'with_acts')
-                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
+                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=None)
+                    
                     #if there are no non-zero activations, we skip the batch because 
                     # it is all zeros or below the activation threshold
                     if non_zero_indices.nelement() == 0:
+                        print("no non-zero activations skipping")
                         continue
                     
                     # Get non-zero activations and their indices for the entire batch
@@ -63,8 +65,10 @@ class AutoEncoderWrapper:
                             'feature_idx': idx[1],
                             'data_idx': original_indices[idx[0]]+nrows,
                         })
-
-            dataframes.append(pd.DataFrame(df_rows))
+            if len(df_rows) > 0:
+                dataframes.append(pd.DataFrame(df_rows))
+            else:
+                print("no rows in batch")
             nrows += len(df_metadata)
         
         print("dataframes modal autoencoder", dataframes)
