@@ -25,6 +25,7 @@ from typing import Literal, Optional, Union
 
 from torch.optim import AdamW
 from tqdm import tqdm
+from utils import get_device
 
 
 def save_model(
@@ -92,12 +93,13 @@ def train_autoencoder(
             d_mlp=d_mlp,
             buffer_size=1000000,
             buffer_batches=25,
-            device="cuda",
+            device=get_device(), # type: ignore
             n_epochs=0, # inital epochs are 0 but gradually increasing
             training_set=train_files,
             validation_set=test_files,
             n_steps=0,
-            type=type
+            type=type,
+            updated_anthropic_method=True if loss_func=='with_new_loss' else False
         )
 
         if type == "gated_autoencoder":
@@ -180,12 +182,12 @@ def train_autoencoder(
             model.remove_parallel_component_of_grads()
             optimizer.step()
             
-            #data = remove_keys(result.model_dump(), ['x_reconstruct', 'acts'])
             metrics = {
                 "l1_coeff": model.l1_coeff,
                 **result.format_data()
             }
 
+            print("cfg.updated_anthropic_method", cfg.updated_anthropic_method)
             if not cfg.updated_anthropic_method:
                 with torch.no_grad():
                     # Renormalize W_dec to have unit norm

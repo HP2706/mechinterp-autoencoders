@@ -396,13 +396,6 @@ class AutoEncoder(AutoEncoderBase):
             return acts
         
         x_reconstruct = acts @ W_dec + b_dec
-        print("acts @ W_dec", (acts @ W_dec).sum(1).mean())
-        print("b_dec", b_dec.sum())
-        print("l1 diff b_dec-x-reconstruct", (b_dec - x_reconstruct).sum())
-        print("self.W_enc", self.W_enc.sum())
-        print("self.b_enc", self.b_enc.sum())
-        print("self.W_dec", self.W_dec.sum())
-        print("self.b_dec", self.b_dec.sum())
         if method in ['with_loss', 'with_new_loss']:
             l2_loss = compute_mse(x_reconstruct, x)
             if method == 'with_loss':
@@ -557,15 +550,6 @@ class GatedAutoEncoder(AutoEncoderBase):
                 b_dec_frozen = self.b_dec.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
             L_aux = compute_mse(x, via_gate_reconstruction)
-
-            # Summing up the losses
-            print("acts @ W_dec", (acts @ self.W_dec).sum(1).mean())
-            print("b_dec", self.b_dec.sum())
-            print("l1 diff b_dec-x-reconstruct", (self.b_dec - x_reconstruct).sum())
-            print("self.W_enc", self.W_gate.sum())
-            print("self.b_enc", self.b_gate.sum())
-            print("self.W_dec", self.W_dec.sum())
-            print("self.b_dec", self.b_dec.sum())
             loss = l2 + (self.l1_coeff * L_Sparsity) + L_aux
 
             return GatedAutoEncoderResult(
