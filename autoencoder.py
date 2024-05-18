@@ -14,13 +14,24 @@ from abc import ABC, abstractmethod
 from utils import get_device
 from typing import overload, Protocol
 from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
+from _types import Loss_Method, Methods
 
 def compute_did_fire(acts : Tensor)-> Tensor:
     '''compute count of how often specific feature was nonzero across the batch'''
     return (acts > 0).long().sum(dim=0).cpu()
 
-def compute_avg_num_firing(x: Tensor) -> Tensor:
-    return (x > 0).float().sum(dim=1).mean(0)
+def compute_mean_firing_percentage(x : Tensor)-> Tensor:
+    '''compute the mean firing percentage of the neurons across the batch'''
+    return (x > 0).float().mean(dim=(0,1))
+
+def compute_mean_firing_per_batch(x : Tensor)-> Tensor:
+    '''compute the mean firing percentage of the neurons across the batch'''
+    return (x > 0).float().mean(dim=(0,1))
+
+def compute_avg_num_firing_per_neuron(x: Tensor) -> Tensor:
+    #compute average number of times a neuron fires across the batch
+    return (x > 0).float().sum(dim=1)
+
 
 def compute_l0_norm(x: torch.Tensor) -> torch.Tensor:
     '''the mean l0 norm of the activations over the batch'''
@@ -46,30 +57,39 @@ class BasicStats(BaseModel):
     loss: Tensor
     x_reconstruct: Tensor
     acts: Tensor
+    acts_sum : Tensor = Field(..., description="the mean of the sum of the activations over the batch")
     l2_loss: Tensor = Field(..., description="mean squared error")
     l1_loss: Tensor = Field(..., description="mean absolute error")
     l_sparsity: Tensor = Field(..., description="the sum of the absolute values of the activations")
     l0_norm: Tensor = Field(..., description="average number of non-zero entries in the activations")
     normalized_mse : Tensor 
+    weight_stats : Optional[dict[str, float]] = Field(
+        default=None, 
+        description="the norms and sums of all the weights"
+    )
+    mean_firing_percentage : Tensor = Field(..., description="the mean firing percentage of the neurons across the batch")
+
     did_fire : Tensor = Field(..., description="test with ones and zeros for whether metric for whether activation fired or not")
     avg_num_firing : Tensor = Field(..., description="average number of times a neuron fires")
-    weight_stats : dict[str, float] = Field(..., description="the norms and sums of all the weights")
-
 
     class Config:
         arbitrary_types_allowed = True
 
     def format_data(self):
-        return {
-            "loss": self.loss.item(),
-            "l2_loss": self.l2_loss.item(),
-            "l1_loss": self.l1_loss.item(),
-            "l0_norm": self.l0_norm.item(),
-            "normalized_mse": self.normalized_mse.item(),
-            "l_sparsity": self.l_sparsity.item(),
-            "avg_num_firing": self.avg_num_firing.item(),
-            **self.weight_stats
-        }
+        data = self.model_dump()
+        data.pop('weight_stats')
+        if self.weight_stats is not None:
+            data.update(self.weight_stats)
+        formatted_results = {}
+        for key, value in data.items():
+            if isinstance(value, Tensor):
+                if value.shape == ():
+                    formatted_results[key] = value.item()
+            elif value is None:
+                continue
+            else:
+                formatted_results[key] = value
+        return formatted_results
 
 
 class GatedAutoEncoderResult(BasicStats):
@@ -131,7 +151,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
     n_steps: int
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
-    loss_func : Optional[Literal['with_loss', 'with_new_loss']] = 'with_loss'
+    loss_func : Optional[Loss_Method] = 'with_loss'
 
     @model_validator(mode='after')
     def check_loss_func(self, data)-> Self:
@@ -182,7 +202,7 @@ class AutoEncoderBase(nn.Module, ABC):
         self.cfg = cfg
 
     @abstractmethod
-    def forward(self, x: Tensor, method: str) -> Any:
+    def forward(self, x: Tensor, method: Methods) -> Any:
         """
         Abstract forward method that must be implemented by subclasses.
         The method parameter can dictate the behavior of the forward pass.
@@ -374,7 +394,7 @@ class AutoEncoder(AutoEncoderBase):
     def forward(
         self,
         x: Tensor, 
-        method: Literal['with_acts', 'with_loss', 'reconstruct', 'with_new_loss'] = 'with_loss',
+        method: Methods = 'with_loss',
         normalize_weights: bool = False
     ) -> Union[Tensor, AutoencoderResult]:
 
@@ -384,11 +404,11 @@ class AutoEncoder(AutoEncoderBase):
         b_dec = self.b_dec
 
         if normalize_weights:
-            norm_factor = torch.norm(W_dec, dim=0, keepdim=True)
+            #with torch.no_grad(): ?
+            norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
             W_enc = W_enc * norm_factor
-            b_enc = b_enc * norm_factor
-            #b_dec remains unchanged
-            W_dec = W_dec / norm_factor
+            b_enc = b_enc * norm_factor  # Ensure b_enc is correctly broadcasted
+            W_dec = W_dec / norm_factor  # Normalize W_dec directly
 
         x_center = x - b_dec
         acts = self.relu(x_center @ W_enc + b_enc)
@@ -408,14 +428,16 @@ class AutoEncoder(AutoEncoderBase):
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
+                acts_sum=acts.sum(1).mean(),
                 l2_loss=l2_loss, 
                 l_sparsity=L_sparse,
                 l1_loss=compute_mean_absolute_error(x_reconstruct, x),
                 l0_norm=compute_l0_norm(acts),
                 normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
-                avg_num_firing=compute_avg_num_firing(acts),
-                weight_stats=self.get_weight_data()
+                mean_firing_percentage=compute_mean_firing_percentage(acts),
+                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
+                #weight_stats=self.get_weight_data(),
             )
         elif method == 'reconstruct':
             return x_reconstruct
@@ -440,7 +462,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
 
         # Initialize W_mag as a vector of learnable parameters
-        self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to to zero?
+        self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to zero?
         weight_init = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(weight_init)
         self.device = get_device()
@@ -560,11 +582,13 @@ class GatedAutoEncoder(AutoEncoderBase):
                 l0_norm=compute_l0_norm(acts),
                 x_reconstruct=x_reconstruct, 
                 acts=acts, 
+                acts_sum=acts.sum(),
                 L_aux=L_aux,
                 normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
-                avg_num_firing=compute_avg_num_firing(acts),
-                weight_stats=self.get_weight_data()
+                mean_firing_percentage=compute_mean_firing_per_batch(acts),
+                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
+                #weight_stats=self.get_weight_data()
             )
         else:
             return x_reconstruct

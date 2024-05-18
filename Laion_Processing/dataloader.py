@@ -5,7 +5,7 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import Generator, Literal, Optional, List, Tuple, Union
 from utils import load_tensor
-import math 
+from mechninterp_utils import scale_dataset
 
 def check_inputs(kwargs):
     split = kwargs.get('split', None)
@@ -67,7 +67,6 @@ class LaionDataset(Dataset):
         self.metadata_df: Optional[pd.DataFrame] = None
         self.load_next_file()
 
-
     def iter_files(
         self, 
         max_count : Optional[int] = None
@@ -76,6 +75,8 @@ class LaionDataset(Dataset):
         for i in range(len(self.emb_paths)):
             try:
                 tensors = load_tensor(self.emb_paths[i])
+                if self.d_hidden:
+                    tensors = scale_dataset(tensors, self.d_hidden)
                 df = pd.read_parquet(self.metadata_paths[i])
                 yield (tensors, df)
             except ValueError as e:
@@ -98,15 +99,6 @@ class LaionDataset(Dataset):
         tensor = load_tensor(self.emb_paths[idx])
         metadata_df = pd.read_parquet(self.metadata_paths[idx])
         return tensor, metadata_df
-            
-    def scale_dataset(self, X: torch.Tensor, n: float):
-        '''Computes the expected norm of the dataset row (dim=-1) and normalizes to sqrt(target_norm).'''
-        n_sqrt = math.sqrt(n)
-        norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
-        mean_norm = torch.mean(norms).float()
-        scaling_factor = n_sqrt / mean_norm
-        X_scaled = X * scaling_factor  # Scale the dataset
-        return X_scaled
 
     def load_next_file(self):
         self.current_file_index += 1
@@ -114,7 +106,7 @@ class LaionDataset(Dataset):
             self.data = load_tensor(self.emb_paths[self.current_file_index])
 
             if self.d_hidden:
-                self.data = self.scale_dataset(self.data, self.d_hidden)
+                self.data = scale_dataset(self.data, self.d_hidden)
 
             if self.return_tuple:
                 self.metadata_df = pd.read_parquet(self.metadata_paths[self.current_file_index])
@@ -203,10 +195,7 @@ class LaionDataLoader:
 
     def __iter__(self):
         return iter(self.dataloader)
-    
-    def compute_mean_l1_norm(self):
-        return torch.mean(torch.norm(self.dataset.data, p=2, dim=-1))
-    
+
     def __getitem__(self, idx: Union[int, slice]) -> torch.Tensor:
         if isinstance(idx, int):
             return self.dataloader.dataset[idx]

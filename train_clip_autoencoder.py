@@ -8,7 +8,7 @@ from common import (
     LAION_DATASET_PATH,
     dataset_vol
 )
-import aiofiles
+import time
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
@@ -26,6 +26,7 @@ from typing import Literal, Optional, Union
 from torch.optim import AdamW
 from tqdm import tqdm
 from utils import get_device
+from _types import Loss_Method
 
 
 def save_model(
@@ -46,7 +47,7 @@ def save_model(
 @stub.function(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
-    timeout=5*60*60, #3 hours
+    timeout=10*60*60, #3 hours
     gpu=gpu.A10G(),    
     secrets=[modal.Secret.from_name("my-wandb-secret")],
     _allow_background_volume_commits=True
@@ -59,7 +60,7 @@ def train_autoencoder(
     test_steps : int = 25*10**3,
     with_ramp: bool = True,
     max_l_coef : float = 5,
-    loss_func: Literal['with_new_loss', 'with_loss'] = 'with_loss',
+    loss_func: Loss_Method = 'with_loss',
     retrain_path : Optional[str] = None,
     resampling_interval : Optional[int] = 10**4,
 ):
@@ -71,6 +72,7 @@ def train_autoencoder(
         model = AutoEncoderBase.load_from_checkpoint(retrain_path)
         model_dir = retrain_path
         print("retraining model")
+        print("additional training steps", steps-model.metadata_cfg.n_steps)
         cfg = model.metadata_cfg
     else:
         d_mlp = 768 
@@ -146,7 +148,8 @@ def train_autoencoder(
     if retrain_path is None:
         step = 0
     else:
-        step = model.metadata_cfg.n_steps 
+        step = model.metadata_cfg.n_steps + 1
+        #this is to avoid resaving and reevaluating the same model
     
     last_resampling_step_idx = step
 
@@ -162,6 +165,7 @@ def train_autoencoder(
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
             step += 1
+            t0 = time.time()
             # Update l1_coeff linearly over the first 5% of the total steps
             if with_ramp:
                 if model.l1_coeff <= max_l_coef:
@@ -181,19 +185,18 @@ def train_autoencoder(
             
             model.remove_parallel_component_of_grads()
             optimizer.step()
-            
+
             metrics = {
                 "l1_coeff": model.l1_coeff,
+                "time_per_step": time.time() - t0,
                 **result.format_data()
             }
 
-            print("cfg.updated_anthropic_method", cfg.updated_anthropic_method)
             if not cfg.updated_anthropic_method:
                 with torch.no_grad():
                     # Renormalize W_dec to have unit norm
                     norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
                     model.W_dec.data /= (norms + 1e-6) 
-
 
             if step % save_interval == 0:
                 print("saving model at step", step)
@@ -218,8 +221,8 @@ def train_autoencoder(
                     showlegend = False
                 )
                 metrics["frequency_histogram"] = fig
-
                 last_resampling_step_idx = step
+                torch.cuda.empty_cache()
 
             wandb.log(metrics)
 
@@ -234,7 +237,6 @@ def train_autoencoder(
                                 f'test_{key}': value for key, value in result.format_data().items()
                             }
                         )
-
             cfg.n_epochs += 1
 
 

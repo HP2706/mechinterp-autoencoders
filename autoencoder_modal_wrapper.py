@@ -18,7 +18,10 @@ from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 class AutoEncoderWrapper:
     def __init__(self, checkpoint_path: str, dataset_kwargs: dict):
         self.model = AutoEncoderBase.load_from_checkpoint(checkpoint_path)
-        self.dataset = LaionDataset(**dataset_kwargs)
+        if self.model.cfg.updated_anthropic_method:
+            self.dataset = LaionDataset(**dataset_kwargs, d_hidden=self.model.W_dec.shape[0])
+        else:
+            self.dataset = LaionDataset(**dataset_kwargs)
    
     @method()
     def create_acts_dataset(
@@ -27,7 +30,6 @@ class AutoEncoderWrapper:
     ) -> List[pd.DataFrame]:
         dataframes : List[pd.DataFrame] = []
         nrows = 0
-
 
 
         for (tensor, df_metadata) in tqdm.tqdm(
@@ -41,7 +43,7 @@ class AutoEncoderWrapper:
                 for j in tqdm.tqdm(range(0, len(tensor), batch_size)):
                     scaled_batch = tensor[j:j+batch_size].to(self.model.cfg.device)
                     acts = self.model.forward(scaled_batch, 'with_acts')
-                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=None)
+                    non_zero_indices, _ = filter_non_zero_batch(acts, threshold=1e-3)
                     
                     #if there are no non-zero activations, we skip the batch because 
                     # it is all zeros or below the activation threshold
@@ -52,12 +54,10 @@ class AutoEncoderWrapper:
                     # Get non-zero activations and their indices for the entire batch
                     non_zero_activations = acts[non_zero_indices]
                     non_zero_positions = (non_zero_activations != 0).nonzero(as_tuple=False)
+
                     original_indices = (non_zero_indices + j).tolist()
-                    
                     # Extract the activation values using these indices
                     activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
-                    print("activation values", activation_values.shape)
-                    print("non zero positions", non_zero_positions.shape)
                     for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
                         df_rows.append(
                             {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
