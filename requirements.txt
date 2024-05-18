@@ -20,4 +20,6 @@ litellm
 anthropic
 logfire
 google-generativeai
+install-jdk
+pyspark
 plotly

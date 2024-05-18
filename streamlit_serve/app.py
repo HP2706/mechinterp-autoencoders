@@ -81,7 +81,6 @@ def main():
     st.plotly_chart(plot_feature_idx_frequency(df))
 
     filtered_df = get_counted_df(df)
-    print("filtered_df columns", filtered_df.columns)
     min_count = st.slider('Minimum count threshold for features', min_value=1, max_value=int(filtered_df['count'].max()), value=10)
     active_features = get_active_features_filtered(filtered_df, min_count, 'geq')
     st.write(f"Active features: {len(active_features)}, percentage: {len(active_features)/total_features}")

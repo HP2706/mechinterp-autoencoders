@@ -100,6 +100,75 @@ def scale_dataset(X: torch.Tensor, n: float):
     X_scaled = X * scaling_factor  # Scale the dataset
     return X_scaled
 
+def anthropic_resample(
+    indices: torch.Tensor,
+    val_dataset: Dataset,
+    model: Union[AutoEncoder, GatedAutoEncoder],
+    optimizer: torch.optim.Optimizer,
+    anthropic_resample_batches: int = 100,
+    batch_size: int = 4096,
+    sample_size: int = 819200,
+    resample_factor: float = 0.2,
+):
+    
+    anthropic_iterator = range(0, anthropic_resample_batches, batch_size)
+    anthropic_iterator = tqdm(anthropic_iterator, desc="Anthropic loss calculating")
+    global_loss_increases = torch.zeros((sample_size,), dtype=model.cfg.dtype, device=model.cfg.device)
+    d_in = model.W_enc.shape[0]
+    global_input_activations = torch.zeros((sample_size, d_in), dtype=model.cfg.dtype, device=model.cfg.device)
+
+    for batch_idx in anthropic_iterator:
+        normal_activations: torch.Tensor = val_dataset[batch_size:batch_idx+batch_size]
+        print("batch", normal_activations.shape)
+        x_reconstruct = model.forward(normal_activations, method='with_loss').x_reconstruct 
+        loss = (x_reconstruct - normal_activations).pow(2) # we don't take the mean 
+        changes_in_loss_dist = Categorical(
+            torch.nn.functional.relu(loss) / torch.nn.functional.relu(loss).sum(dim=1, keepdim=True)
+        )
+
+        samples = changes_in_loss_dist.sample()
+        assert samples.shape == (batch_size,), f"{samples.shape=}; {batch_size=}"
+
+        global_loss_increases[
+            batch_idx: batch_idx + batch_size
+        ] = loss[torch.arange(batch_size), samples]
+        global_input_activations[
+            batch_idx: batch_idx + batch_size
+        ] = normal_activations[torch.arange(batch_size), samples]
+
+    sample_indices = torch.multinomial(
+        global_loss_increases / global_loss_increases.sum(),
+        len(indices), 
+        replacement=False,
+    )
+
+    # Replace W_dec with normalized versions of these
+    model.W_dec.data[indices, :] = (
+        (
+            global_input_activations[sample_indices]
+            / torch.norm(global_input_activations[sample_indices], dim=1, keepdim=True)
+        )
+        .to(model.dtype)
+        .to(model.device)
+    )
+
+    # Set W_enc equal to W_dec.T in these indices, first
+    model.W_enc.data[:, indices] = model.W_dec.data[indices, :].T
+
+    # Renormalize the encoder vector
+    alive_neurons = indices[indices > 0]
+    mean_norm = torch.mean(torch.norm(model.W_enc.data[:, alive_neurons], dim=0))
+    model.W_enc.data[:, indices] *= (resample_factor * mean_norm / torch.norm(model.W_enc.data[:, indices], dim=0))
+
+    # Set the corresponding encoder bias element to zero
+    model.b_enc.data[indices] = 0.0
+
+    # Reset the Adam optimizer parameters for every modified weight and bias term
+    for param in [model.W_dec, model.W_enc, model.b_enc]:
+        if param in optimizer.state:
+            del optimizer.state[param]
+
+
 #for antrhopic interpretability paper
 def torch_spearman_correlation(
     predicted : torch.Tensor, 

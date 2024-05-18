@@ -70,7 +70,7 @@ class LaionDataset(Dataset):
     def iter_files(
         self, 
         max_count : Optional[int] = None
-    )-> Generator[Tuple[torch.Tensor, pd.DataFrame], None, None]:
+    )-> Generator[Tuple[Tuple[str, torch.Tensor], Tuple[str, pd.DataFrame]], None, None]:
         count = 0
         for i in range(len(self.emb_paths)):
             try:
@@ -78,7 +78,7 @@ class LaionDataset(Dataset):
                 if self.d_hidden:
                     tensors = scale_dataset(tensors, self.d_hidden)
                 df = pd.read_parquet(self.metadata_paths[i])
-                yield (tensors, df)
+                yield ((self.emb_paths[i], tensors), (self.metadata_paths[i], df))
             except ValueError as e:
                 print(e)
                 print("file", self.emb_paths[i], "is not a valid numpy shape", "and ")

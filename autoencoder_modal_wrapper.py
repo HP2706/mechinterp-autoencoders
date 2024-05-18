@@ -29,9 +29,8 @@ class AutoEncoderWrapper:
         n_files : int = 5,
     ) -> List[pd.DataFrame]:
         dataframes : List[pd.DataFrame] = []
-        nrows = 0
 
-        for (tensor, df_metadata) in tqdm.tqdm(
+        for ((tensor_path, tensor), (metadata_path, df_metadata)) in tqdm.tqdm(
             self.dataset.iter_files(max_count=n_files), 
             total=n_files,
             desc="Processing Files"
@@ -59,17 +58,18 @@ class AutoEncoderWrapper:
                     activation_values = non_zero_activations[non_zero_positions[:, 0], non_zero_positions[:, 1]]
                     for idx, value in zip(non_zero_positions.tolist(), activation_values.tolist()):
                         df_rows.append(
-                            {**df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
-                            'activation': value,
-                            'feature_idx': idx[1],
-                            'data_idx': original_indices[idx[0]]+nrows,
-                        })
+                            {
+                                **df_metadata.iloc[original_indices[idx[0]]].to_dict(), 
+                                'activation': value,
+                                'feature_idx': idx[1],
+                                'idx_in_file': original_indices[idx[0]],
+                                'emb_path' : tensor_path,
+                                'metadata_path' : metadata_path
+                            }
+                        )
             if len(df_rows) > 0:
                 dataframes.append(pd.DataFrame(df_rows))
             else:
                 print("no rows in batch")
-            nrows += len(df_metadata)
-        
-        print("dataframes modal autoencoder", dataframes)
         return dataframes
 
