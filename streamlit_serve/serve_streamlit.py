@@ -4,7 +4,7 @@ import modal
 from common import vol, PATH
 from pathlib import Path
 
-image = modal.Image.debian_slim().pip_install("streamlit", "numpy", "pandas")
+image = modal.Image.debian_slim().pip_install("streamlit", "numpy", "pandas", "plotly")
 
 app = modal.App(
     name="example-modal-streamlit", image=image, volumes={PATH : vol}

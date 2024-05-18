@@ -1,12 +1,19 @@
+from _types import Methods
+import pandas as pd
+from autoencoder import compute_mse
+from torch.distributions.multinomial import Categorical
 import torch
+from tqdm import tqdm
+import math
 from functools import partial
 from transformer_lens import utils
+from torch.utils.data import Dataset, Subset, DataLoader
 from typing import Union
 from autoencoder import AutoEncoder, GatedAutoEncoder
 from torchmetrics.regression import SpearmanCorrCoef
 import numpy as np
 import plotly.express as px
-from plotly.subplots import make_subplots
+from _types import Loss_Method
 
 #code for plotting histogram taken from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b
 # Define a set of arguments which are passed to fig.update_layout (rather than just being included in e.g. px.imshow)
@@ -82,77 +89,16 @@ def hist(tensor : torch.Tensor, renderer=None, **kwargs):
     else:
         fig.show(renderer=renderer, config=CONFIG_STATIC if static else CONFIG)
 
-def anthropic_resample(
-    self,
-    indices,
-    model : Union[AutoEncoder, GatedAutoEncoder]
-):
-    #TODO implement this 
-    
-    anthropic_iterator = range(0, self.cfg["anthropic_resample_batches"], self.cfg["batch_size"])
-    total_size = len(anthropic_iterator) * self.cfg["batch_size"] * self.cfg["seq_len"]
-    anthropic_iterator = tqdm(anthropic_iterator, desc="Anthropic loss calculating")
-    global_loss_increases = torch.zeros((self.cfg["anthropic_resample_batches"],), dtype=self.dtype, device=self.device)
-    global_input_activations = torch.zeros((self.cfg["anthropic_resample_batches"], self.d_in), dtype=self.dtype, device=self.device)
-
-    for refill_batch_idx_start in anthropic_iterator:
-        #TODO get test set
 
 
-        # Do a forwards pass, including calculating loss increase
-
-        normal_loss = None
-
-        normal_loss = normal_loss.cpu()
-        changes_in_loss = sae_loss - normal_loss
-        changes_in_loss_dist = Categorical(
-            torch.nn.functional.relu(changes_in_loss) / torch.nn.functional.relu(changes_in_loss).sum(dim=1, keepdim=True)
-        )
-        samples = changes_in_loss_dist.sample()
-        assert samples.shape == (self.cfg["batch_size"],), f"{samples.shape=}; {self.cfg['batch_size']=}"
-        
-        global_loss_increases[
-            refill_batch_idx_start: refill_batch_idx_start + self.cfg["batch_size"]
-        ] = changes_in_loss[torch.arange(self.cfg["batch_size"]), samples]
-        global_input_activations[
-            refill_batch_idx_start: refill_batch_idx_start + self.cfg["batch_size"]
-        ] = normal_activations[torch.arange(self.cfg["batch_size"]), samples]
-
-    sample_indices = torch.multinomial(
-        global_loss_increases / global_loss_increases.sum(),
-        len(indices), 
-        replacement=False,
-    )
-
-    # Replace W_dec with normalized versions of these
-    self.W_dec.data[indices, :] = (
-        (
-            global_input_activations[sample_indices]
-            / torch.norm(global_input_activations[sample_indices], dim=1, keepdim=True)
-        )
-        .to(self.dtype)
-        .to(self.device)
-    )
-
-    # Set W_enc equal to W_dec.T in these indices, first
-    self.W_enc.data[:, indices] = self.W_dec.data[indices, :].T
-
-    # Then, change norms to be equal to a factor (0.2 in Anthropic) times the average norm of all the other columns, if other columns exist
-    if indices.shape[0] < self.d_sae:
-        sum_of_all_norms = torch.norm(self.W_enc.data, dim=0).sum()
-        sum_of_all_norms -= len(indices)
-        average_norm = sum_of_all_norms / (self.d_sae - len(indices))
-        metrics["resample_norm_thats_hopefully_less_or_around_one"] = average_norm.item()
-        self.W_enc.data[:, indices] *= self.cfg["resample_factor"] * average_norm
-
-        # Set biases to resampledvalue
-        relevant_biases = self.b_enc.data[indices].mean()
-        self.b_enc.data[indices] = relevant_biases * self.cfg["bias_resample_factor"]
-
-    else:
-        self.W_enc.data[:, indices] *= self.cfg["resample_factor"]
-
-        self.b_enc.data[indices] = - 5.0
+def scale_dataset(X: torch.Tensor, n: float):
+    '''Computes the expected norm of the dataset row (dim=-1) and normalizes to sqrt(target_norm).'''
+    n_sqrt = math.sqrt(n)
+    norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
+    mean_norm = torch.mean(norms).float()
+    scaling_factor = n_sqrt / mean_norm
+    X_scaled = X * scaling_factor  # Scale the dataset
+    return X_scaled
 
 #for antrhopic interpretability paper
 def torch_spearman_correlation(

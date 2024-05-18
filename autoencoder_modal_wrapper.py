@@ -31,7 +31,6 @@ class AutoEncoderWrapper:
         dataframes : List[pd.DataFrame] = []
         nrows = 0
 
-
         for (tensor, df_metadata) in tqdm.tqdm(
             self.dataset.iter_files(max_count=n_files), 
             total=n_files,
