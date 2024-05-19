@@ -27,7 +27,6 @@ streamlit_script_mount = modal.Mount.from_local_file(
 # Inside the container, we will run the Streamlit server in a background subprocess using
 # `subprocess.Popen`. We also expose port 8000 using the `@web_server` decorator.
 
-
 @app.function(
     allow_concurrent_inputs=100,
     mounts=[streamlit_script_mount],
@@ -37,22 +36,3 @@ def run():
     target = shlex.quote(str(streamlit_script_remote_path))
     cmd = f"streamlit run {target} --server.port 8000 --server.enableCORS=false --server.enableXsrfProtection=false"
     subprocess.Popen(cmd, shell=True)
-
-
-# ## Iterate and Deploy
-#
-# While you're iterating on your screamlit app, you can run it "ephemerally" with `modal serve`. This will
-# run a local process that watches your files and updates the app if anything changes.
-#
-# ```shell
-# modal serve serve_streamlit.py
-# ```
-#
-# Once you're happy with your changes, you can deploy your application with
-#
-# ```shell
-# modal deploy serve_streamlit.py
-# ```
-#
-# If successful, this will print a URL for your app, that you can navigate to from
-# your browser 🎉 .

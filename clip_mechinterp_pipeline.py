@@ -15,11 +15,11 @@ from utils import (
     filter_non_zero_batch,
 )
 import json
-from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
-from utils import filter_valid_image_urls, flatten_lst
+from typing import Any, Dict, List, Literal, Optional, Tuple, Tuple, Type, Union
+from utils import filter_valid_image_urls, flatten_lst, flatten_lst
 import time
 from datamodels import PredictActivation
-from autoencoder_modal_wrapper import AutoEncoderWrapper
+from gpu_pipeline import GpuPipeline
 from common import (
     image, 
     stub, 
@@ -67,7 +67,7 @@ class ClipMechInterpPipeline:
         **dataset_kwargs,
     ):
 
-        self.model = AutoEncoderWrapper(auto_encoder_path_dir, dataset_kwargs)
+        self.model = GpuPipeline(auto_encoder_path_dir, dataset_kwargs)
         self.interpretability_model_name = interpretability_model_name
         self.model_path = auto_encoder_path_dir
         self.dataset_name = dataset_name
@@ -161,12 +161,24 @@ class ClipMechInterpPipeline:
         else:
             return f"{self.acts_dir}/{self.dataset_name}_acts_{index}.parquet"
     
-    def get_activating_embeddings(self, feature_idx : int) -> pd.DataFrame:
+    @method()
+    def get_cosine_sim(self, feature_idx: int):
+        df = self.get_activating_embeddings(feature_idx)
+        sub_set = self.dataset.data.sample(n=1000)  # type: ignore
+        print("sub_set shape", sub_set.shape)
+
+        # Ensure none of the idx_in_file are in the samples subset
+        df_indices = set(df['idx_in_file'])
+        sub_set = sub_set[~sub_set['idx_in_file'].isin(df_indices)]
+
+        return self.model.get_cosine_sim.remote(df, sub_set)
+
+    def get_activating_embeddings(self, feature_idx: int) -> pd.DataFrame:
         acts_filename = self.create_acts_filename('all')
         df = pd.read_parquet(acts_filename)
 
         df_feature = df[df['feature_idx'] == feature_idx]
-        #start pyspark job that takes in df_feat and returns a df of embeddings
+        # Start PySpark job that takes in df_feature and returns a df of embeddings
         from pyspark.sql import SparkSession
         import numpy as np
 
@@ -178,29 +190,33 @@ class ClipMechInterpPipeline:
         print("grouped_indices", grouped_indices)
 
         # Initialize Spark session
-        spark = SparkSession.builder \
-            .appName("Collect Vectors") \
-            .getOrCreate()
+        spark = (
+            SparkSession.builder 
+            .appName("Collect Vectors") 
+            .getOrCreate() #type: ignore
+        )
 
         # Function to load vectors from .npy file based on indices
-        def load_vectors(file_path : str, indices : List[int]) -> List[Tuple[str, List[int], torch.Tensor]]:
+        def load_vectors(file_path: str, indices: List[int]) -> List[Tuple[int, torch.Tensor]]:
             vectors = np.load(file_path)
-            return [(file_path, indices, torch.tensor(vectors[indices]))]
-        
-        file_index_pairs = [(file, indices) for file, indices in grouped_indices.items()] #convert to list of tuples
+            return [(idx, torch.tensor(vectors[idx])) for idx in indices]
+
+        file_index_pairs = [(file, indices) for file, indices in grouped_indices.items()]  # Convert to list of tuples
 
         rdd = spark.sparkContext.parallelize(file_index_pairs)
 
-        vectors_rdd = rdd.flatMap(lambda x: load_vectors(x[0], x[1]))
-        collected_vectors = flatten_lst(vectors_rdd.collect())
+        vectors_rdd = rdd.flatMap(lambda x: [(x[0], idx, vec) for idx, vec in load_vectors(x[0], x[1])])
+        collected_vectors = vectors_rdd.collect()
         spark.stop()
-        
-        return pd.DataFrame({
-            'emb_path' : [x[0] for x in collected_vectors],
-            'idx_in_file' : [x[1] for x in collected_vectors],
-            'activation' : [x[2] for x in collected_vectors]
-        })        
 
+        # Create a DataFrame from the collected vectors
+        collected_df = pd.DataFrame(collected_vectors, columns=['emb_path', 'idx_in_file', 'embedding'])
+
+        # Merge the original df_feature with the collected_df on 'emb_path' and 'idx_in_file'
+        merged_df = pd.merge(df_feature, collected_df, on=['emb_path', 'idx_in_file'])
+        df = merged_df[['emb_path', 'idx_in_file', 'activation', 'embedding']]
+        print(df.head(5))
+        return df
 
     @method()
     def create_acts_dataset(

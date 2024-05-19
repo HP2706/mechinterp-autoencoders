@@ -273,6 +273,11 @@ class AutoEncoderBase(nn.Module, ABC):
         model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=device))
         return model
 
+    @abstractmethod
+    @torch.no_grad()
+    def decode(self, acts : Tensor) -> Tensor:
+        pass
+
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):
         W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
@@ -443,6 +448,9 @@ class AutoEncoder(AutoEncoderBase):
             return x_reconstruct
         else:
             raise ValueError(f"Invalid method: {method}")
+        
+    def decode(self, acts : Tensor) -> Tensor:
+        return acts @ self.W_dec + self.b_dec
 
 #from paper https://arxiv.org/pdf/2404.16014
 class GatedAutoEncoder(AutoEncoderBase):
@@ -593,4 +601,5 @@ class GatedAutoEncoder(AutoEncoderBase):
         else:
             return x_reconstruct
         
-
+    def decode(self, acts : Tensor) -> Tensor:
+        return acts @ self.W_dec + self.b_dec

@@ -15,7 +15,7 @@ from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
     _allow_background_volume_commits=True,
     gpu=gpu.A10G()    
 )
-class AutoEncoderWrapper:
+class GpuPipeline:
     def __init__(self, checkpoint_path: str, dataset_kwargs: dict):
         self.model = AutoEncoderBase.load_from_checkpoint(checkpoint_path)
         if self.model.cfg.updated_anthropic_method:
@@ -72,4 +72,55 @@ class AutoEncoderWrapper:
             else:
                 print("no rows in batch")
         return dataframes
+    
+    @method()
+    def get_cosine_sim(self, df : pd.DataFrame, sub_set : torch.Tensor)->tuple[float, float]:
+        print("dataframe", df.head())
+
+        import torch.nn.functional as F
+        emb_tensor = torch.vstack(df['embedding'].tolist())
+        mean_norm = torch.norm(emb_tensor, p=2, dim=1).mean()
+
+        random_tensor = torch.randn(emb_tensor.shape) 
+        #normalize to have mean norm as emb_tensor
+        random_tensor = random_tensor / torch.norm(random_tensor, p=2, dim=1, keepdim=True) * mean_norm
+
+        # Compute pairwise cosine similarity
+        cosine_sim_matrix = F.cosine_similarity(emb_tensor.unsqueeze(1), emb_tensor.unsqueeze(0), dim=2)
+        cosine_sim_random_matrix = F.cosine_similarity(emb_tensor.unsqueeze(1), random_tensor.unsqueeze(0), dim=2)
+        cosine_sim_dataset_sub_matrix = F.cosine_similarity(sub_set.unsqueeze(1), emb_tensor.unsqueeze(0), dim=2)
+
+        # Mask the diagonal (self-similarity)
+        mask = torch.eye(cosine_sim_matrix.size(0), dtype=torch.bool)
+        cosine_sim_matrix = cosine_sim_matrix.masked_fill(mask, 0)
+        cosine_sim_random_matrix = cosine_sim_random_matrix.masked_fill(mask, 0)
+        print("cosine sim matrix", cosine_sim_matrix.shape)
+        print("cosine sim random matrix", cosine_sim_random_matrix.shape)
+        # Compute the mean of the non-diagonal elements
+        mean_cosine_sim = cosine_sim_matrix.sum() / (cosine_sim_matrix.size(0) * (cosine_sim_matrix.size(1) - 1))
+        mean_cosine_sim_random = cosine_sim_random_matrix.sum() / (cosine_sim_random_matrix.size(0) * (cosine_sim_random_matrix.size(1) - 1))
+
+
+        """ 
+        #TODO FIX THIS
+        import torch
+        import torch.nn.functional as F
+
+        a = torch.randn((100, 10))
+        b = torch.randn((1000, 10))
+        cosine_sim_matrix = F.cosine_similarity(a.unsqueeze(1), b.unsqueeze(0), dim=2)
+        print(cosine_sim_matrix.shape)
+
+
+        # Create a mask with the same shape as cosine_sim_matrix
+        mask = torch.eye(cosine_sim_matrix.size(0), cosine_sim_matrix.size(1), dtype=torch.bool)
+        cosine_sim_matrix = cosine_sim_matrix.masked_fill(mask, 0)
+        mean_cosine_sim = cosine_sim_matrix.sum() / (cosine_sim_matrix.size(0) * (cosine_sim_matrix.size(1) - 1))
+        print(mean_cosine_sim) """
+
+        print("mean cosine sim between act and random: ", mean_cosine_sim_random)
+        print("mean cosine sim between act and itself: ", mean_cosine_sim)
+        return (mean_cosine_sim_random, mean_cosine_sim)
+
+
 

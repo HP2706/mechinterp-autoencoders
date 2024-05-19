@@ -21,8 +21,7 @@ def flatten_lst(lst: List[List[T]]) -> List[T]:
 
 def format_image_anthropic(img: Union[Image.Image, str]) -> dict:
     if isinstance(img, str):
-        image1_url = "https://upload.wikimedia.org/wikipedia/commons/a/a7/Camponotus_flavomarginatus_ant.jpg"
-        img = Image.open(io.BytesIO(requests.get(image1_url).content))
+        img = Image.open(io.BytesIO(requests.get(img).content))
         
     buffered = io.BytesIO()
     img.save(buffered, format="JPEG")

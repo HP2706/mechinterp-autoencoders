@@ -89,20 +89,6 @@ def main():
     features = get_active_features_filtered(filtered_df, min_count, 'eq')
     st.table(features)
 
-    top_10_features = df['feature_idx'].value_counts().head(10)
-    bottom_10_features = df['feature_idx'].value_counts().tail(10)
-
-    top_10_features.columns = ['feature_idx', 'count']
-    bottom_10_features.columns = ['feature_idx', 'count']
-
-    st.write("Top 10 feature_idx counts")
-    st.table(top_10_features)
-
-    st.write("Bottom 10 feature_idx counts")
-    st.table(bottom_10_features)
-
-
-
     feature_index = st.selectbox('Select Feature Index', df['feature_idx'].unique())
 
     # Filter dataframe based on selected feature index
