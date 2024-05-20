@@ -1,6 +1,8 @@
 import json
 import math
-import pandas as pd
+from re import I
+from torch.optim import Optimizer
+from tqdm import tqdm
 from typing_extensions import Self
 import os
 from typing import Optional
@@ -207,6 +209,10 @@ class AutoEncoderBase(nn.Module, ABC):
     def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__()
         self.cfg = cfg
+
+
+    @abstractmethod
+    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):...
 
     @property
     def d_sae(self):
@@ -468,6 +474,23 @@ class AutoEncoder(AutoEncoderBase):
         
     def decode(self, acts : Tensor) -> Tensor:
         return acts @ self.W_dec + self.b_dec
+    
+    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
+        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
+            for v_key in ["exp_avg", "exp_avg_sq"]:
+                if dict_idx == 0:
+                    assert k.data.shape == (self.d_sae, self.d_in), f"expected shape (self.d_sae, self.d_in) got {k.data.shape}"
+                    v[v_key][indices, :] = 0.0
+                elif dict_idx == 1:
+                    assert k.data.shape == (self.d_in, self.d_sae), f"expected shape (self.d_in,) got {k.data.shape}"
+                    v[v_key][:, indices] = 0.0
+                elif dict_idx == 2:
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.d_in, self.d_sae) got {k.data.shape}"
+                    v[v_key][indices] = 0.0
+                elif dict_idx == 3:
+                    assert k.data.shape == (self.d_in,), f"expected shape (self.d_sae,) got {k.data.shape}"
+                else:
+                    raise ValueError(f"Unexpected dict_idx {dict_idx}")
 
 #from paper https://arxiv.org/pdf/2404.16014
 class GatedAutoEncoder(AutoEncoderBase):
@@ -622,6 +645,30 @@ class GatedAutoEncoder(AutoEncoderBase):
             )
         else:
             return x_reconstruct
+        
+
+    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
+        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
+            for v_key in ["exp_avg", "exp_avg_sq"]:
+                if dict_idx == 0:
+                    assert k.data.shape == (768, 1536), f"expected shape (768, 1536) got {k.data.shape}"
+                    v[v_key][:, indices] = 0.0
+                elif dict_idx == 1:
+                    assert k.data.shape == (1536,), f"expected shape (1536,) got {k.data.shape}"
+                    v[v_key][indices] = 0.0
+                elif dict_idx == 2:
+                    assert k.data.shape == (1536,), f"expected shape (1536,) got {k.data.shape}"
+                    v[v_key][indices] = 0.0
+                elif dict_idx == 3:
+                    assert k.data.shape == (1536, 768), f"expected shape (1536, 768) got {k.data.shape}"
+                    v[v_key][indices, :] = 0.0
+                elif dict_idx == 4:
+                    assert k.data.shape == (768,), f"expected shape (768,) got {k.data.shape}"
+                elif dict_idx == 5:
+                    assert k.data.shape == (768, 1536), f"expected shape (768, 1536) got {k.data.shape}"
+                    v[v_key][:, indices]
+                else:
+                    raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
     def decode(self, acts : Tensor) -> Tensor:
         return acts @ self.W_dec + self.b_dec

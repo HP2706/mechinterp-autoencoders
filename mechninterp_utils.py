@@ -196,21 +196,8 @@ def anthropic_resample(
     #taken from https://github.com/ArthurConmy/sae
     indices = indices.to(model.device)
     #TODO this does not work for GATEDAUTOENCODER!!
-    for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
-        for v_key in ["exp_avg", "exp_avg_sq"]:
-            if dict_idx == 0:
-                assert k.data.shape == (model.d_sae, model.d_in), f"expected shape (model.d_sae, model.d_in) got {k.data.shape}"
-                v[v_key][indices, :] = 0.0
-            elif dict_idx == 1:
-                assert k.data.shape == (model.d_in, model.d_sae), f"expected shape (model.d_in,) got {k.data.shape}"
-                v[v_key][:, indices] = 0.0
-            elif dict_idx == 2:
-                assert k.data.shape == (model.d_sae,), f"expected shape (model.d_in, model.d_sae) got {k.data.shape}"
-                v[v_key][indices] = 0.0
-            elif dict_idx == 3:
-                assert k.data.shape == (model.d_in,), f"expected shape (model.d_sae,) got {k.data.shape}"
-            else:
-                raise ValueError(f"Unexpected dict_idx {dict_idx}")
+    
+    model.zero_optim_grads(optimizer=optimizer, indices=indices)
 
     print("checking everything is set correctly")
     # Check that the opt is really updated
