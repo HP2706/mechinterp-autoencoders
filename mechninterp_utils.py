@@ -1,19 +1,20 @@
 from _types import Methods
 import pandas as pd
 from autoencoder import compute_mse
-from torch.distributions.multinomial import Categorical
 import torch
 from tqdm import tqdm
 import math
 from functools import partial
 from transformer_lens import utils
 from torch.utils.data import Dataset, Subset, DataLoader
-from typing import Union
+from typing import Union, Optional
 from autoencoder import AutoEncoder, GatedAutoEncoder
 from torchmetrics.regression import SpearmanCorrCoef
 import numpy as np
 import plotly.express as px
 from _types import Loss_Method
+from torch.distributions import Categorical
+from datamodels import AnthropicResample
 
 #code for plotting histogram taken from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b
 # Define a set of arguments which are passed to fig.update_layout (rather than just being included in e.g. px.imshow)
@@ -100,41 +101,54 @@ def scale_dataset(X: torch.Tensor, n: float):
     X_scaled = X * scaling_factor  # Scale the dataset
     return X_scaled
 
+@torch.no_grad()
 def anthropic_resample(
     indices: torch.Tensor,
-    val_dataset: Dataset,
+    val_dataset: DataLoader,
     model: Union[AutoEncoder, GatedAutoEncoder],
     optimizer: torch.optim.Optimizer,
-    anthropic_resample_batches: int = 100,
-    batch_size: int = 4096,
-    sample_size: int = 819200,
+    resampling_dataset_size: int,
+    sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
     resample_factor: float = 0.2,
-):
-    
-    anthropic_iterator = range(0, anthropic_resample_batches, batch_size)
-    anthropic_iterator = tqdm(anthropic_iterator, desc="Anthropic loss calculating")
-    global_loss_increases = torch.zeros((sample_size,), dtype=model.cfg.dtype, device=model.cfg.device)
-    d_in = model.W_enc.shape[0]
-    global_input_activations = torch.zeros((sample_size, d_in), dtype=model.cfg.dtype, device=model.cfg.device)
+    bias_resample_factor: float = 0.2,
+) -> AnthropicResample:
+    '''
+    An implementation of the anthropic resampling algorithm.
+    The algorithm is as follows:
+    1.At training steps 25,000, 50,000, 75,000 and 100,000, identify which neurons have not fired in any of the previous 12,500 training steps.
+    2.Compute the loss for the current model on a random subset of 819,200 inputs.
+    3.Assign each input vector a probability of being picked that is proportional to the square of the autoencoder’s loss on that input.
+    4.For each dead neuron sample an input according to these probabilities. Renormalize the input vector to have unit L2 norm and set this to be the dictionary vector for the dead autoencoder neuron.
+    5.For the corresponding encoder vector, renormalize the input vector to equal the average norm of the encoder weights for alive neurons × 0.2. Set the corresponding encoder bias element to zero.
+    6.Reset the Adam optimizer parameters for every modified weight and bias term.
+    '''
+    assert isinstance(val_dataset, DataLoader)
+    assert val_dataset.batch_size is not None
 
-    for batch_idx in anthropic_iterator:
-        normal_activations: torch.Tensor = val_dataset[batch_size:batch_idx+batch_size]
-        print("batch", normal_activations.shape)
-        x_reconstruct = model.forward(normal_activations, method='with_loss').x_reconstruct 
-        loss = (x_reconstruct - normal_activations).pow(2) # we don't take the mean 
+    global_loss_increases = torch.zeros((resampling_dataset_size,), dtype=model.cfg.dtype, device=model.cfg.device)
+    d_in = model.W_enc.shape[0]
+    global_input_activations = torch.zeros((resampling_dataset_size, d_in), dtype=model.cfg.dtype, device=model.cfg.device)
+
+    for (batch_idx, normal_activations) in enumerate(val_dataset): # , total=resampling_dataset_size):
+        if batch_idx * val_dataset.batch_size >= resampling_dataset_size:
+            break
+
+        normal_activations = normal_activations.to(model.cfg.device)
+        x_reconstruct = model.forward(normal_activations, method='reconstruct') 
+        loss = (x_reconstruct - normal_activations).pow(2).sum(1)  # Sum over features to get loss per sample
         changes_in_loss_dist = Categorical(
-            torch.nn.functional.relu(loss) / torch.nn.functional.relu(loss).sum(dim=1, keepdim=True)
+            torch.nn.functional.relu(loss) / torch.nn.functional.relu(loss).sum()
         )
 
-        samples = changes_in_loss_dist.sample()
-        assert samples.shape == (batch_size,), f"{samples.shape=}; {batch_size=}"
-
+        samples = changes_in_loss_dist.sample((val_dataset.batch_size,)) #type: ignore
+        assert samples.shape == (val_dataset.batch_size,), f"{samples.shape=}; {val_dataset.batch_size=}"
+        batch_idx = batch_idx * val_dataset.batch_size #type: ignore
         global_loss_increases[
-            batch_idx: batch_idx + batch_size
-        ] = loss[torch.arange(batch_size), samples]
+            batch_idx: batch_idx + val_dataset.batch_size
+        ] = loss[samples].cpu()
         global_input_activations[
-            batch_idx: batch_idx + batch_size
-        ] = normal_activations[torch.arange(batch_size), samples]
+            batch_idx: batch_idx + val_dataset.batch_size
+        ] = normal_activations[samples].cpu()
 
     sample_indices = torch.multinomial(
         global_loss_increases / global_loss_increases.sum(),
@@ -142,32 +156,87 @@ def anthropic_resample(
         replacement=False,
     )
 
-    # Replace W_dec with normalized versions of these
     model.W_dec.data[indices, :] = (
         (
             global_input_activations[sample_indices]
             / torch.norm(global_input_activations[sample_indices], dim=1, keepdim=True)
         )
-        .to(model.dtype)
+        .to(model.cfg.dtype)
         .to(model.device)
     )
 
     # Set W_enc equal to W_dec.T in these indices, first
     model.W_enc.data[:, indices] = model.W_dec.data[indices, :].T
+    if indices.sum() < model.d_sae:
+        all_indices = torch.arange(model.d_sae, device=indices.device)
+        alive_indices = all_indices[~torch.isin(all_indices, indices)]
+        average_alive_norm = torch.norm(model.W_enc.data[alive_indices, :], dim=0).mean() 
+        # we compute mean norm of alive features
 
-    # Renormalize the encoder vector
-    alive_neurons = indices[indices > 0]
-    mean_norm = torch.mean(torch.norm(model.W_enc.data[:, alive_neurons], dim=0))
-    model.W_enc.data[:, indices] *= (resample_factor * mean_norm / torch.norm(model.W_enc.data[:, indices], dim=0))
+        model.W_enc.data[:, indices] *= resample_factor * average_alive_norm
+        relevant_biases = model.b_enc.data[indices].mean()
 
-    # Set the corresponding encoder bias element to zero
-    model.b_enc.data[indices] = 0.0
+        # Set biases to resampled value
+        model.b_enc.data[indices] = relevant_biases * bias_resample_factor
+
+        out = AnthropicResample(
+            inactive_features=indices,
+            resample_norm=average_alive_norm.item()
+        )
+
+    else:
+        model.W_enc.data[:, indices] *= resample_factor
+        model.b_enc.data[indices] = - 5.0
+        out = AnthropicResample(
+            inactive_features=indices,
+            resample_norm=torch.norm(model.W_enc.data, dim=0).mean().item() #average norm
+        )
 
     # Reset the Adam optimizer parameters for every modified weight and bias term
-    for param in [model.W_dec, model.W_enc, model.b_enc]:
-        if param in optimizer.state:
-            del optimizer.state[param]
+    #taken from https://github.com/ArthurConmy/sae
+    indices = indices.to(model.device)
+    #TODO this does not work for GATEDAUTOENCODER!!
+    for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
+        for v_key in ["exp_avg", "exp_avg_sq"]:
+            if dict_idx == 0:
+                assert k.data.shape == (model.d_sae, model.d_in), f"expected shape (model.d_sae, model.d_in) got {k.data.shape}"
+                v[v_key][indices, :] = 0.0
+            elif dict_idx == 1:
+                assert k.data.shape == (model.d_in, model.d_sae), f"expected shape (model.d_in,) got {k.data.shape}"
+                v[v_key][:, indices] = 0.0
+            elif dict_idx == 2:
+                assert k.data.shape == (model.d_sae,), f"expected shape (model.d_in, model.d_sae) got {k.data.shape}"
+                v[v_key][indices] = 0.0
+            elif dict_idx == 3:
+                assert k.data.shape == (model.d_in,), f"expected shape (model.d_sae,) got {k.data.shape}"
+            else:
+                raise ValueError(f"Unexpected dict_idx {dict_idx}")
 
+    print("checking everything is set correctly")
+    # Check that the opt is really updated
+    for dict_idx, (k, v) in enumerate(optimizer.state.items()):
+        for v_key in ["exp_avg", "exp_avg_sq"]:
+            if dict_idx == 0:
+                if k.data.shape != (model.d_sae, model.d_in):
+                    print(
+                        "Warning: it does not seem as if resetting the Adam parameters worked, there are shapes mismatches"
+                    )
+                if v[v_key][indices, :].abs().max().item() > 1e-6:
+                    print(
+                        "Warning: it does not seem as if resetting the Adam parameters worked"
+                    )
+
+    if sched is not None:
+        # Keep on stepping till we're cfg["lr"] * cfg["sched_lr_factor"]
+        max_iters = 10**7
+        while sched.get_last_lr()[0] > model.metadata_cfg.lr * model.metadata_cfg.sched_lr_factor + 1e-9: #type: ignore
+            sched.step()
+            max_iters -= 1
+            if max_iters == 0:
+                raise ValueError("Too many iterations -- sched is messed up")
+
+        print("sched final lr", sched.get_last_lr())
+    return out
 
 #for antrhopic interpretability paper
 def torch_spearman_correlation(

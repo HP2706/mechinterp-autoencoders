@@ -10,7 +10,7 @@ import torch.nn as nn
 from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
 from typing import Tuple, Union, Literal, List, Any, Type, cast, TypeVar
-from abc import ABC, abstractmethod
+from abc import ABC, abstractmethod, abstractproperty
 from utils import get_device
 from typing import overload, Protocol
 from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
@@ -120,11 +120,15 @@ class AutoencoderModelConfig(BaseModel):
     dict_mult: int
     d_mlp: int 
     l1_coeff: float
-    seed: int
+    seed: int = 42
     enc_dtype: Literal['fp32', 'fp16'] = 'fp32'
     device: Literal['cuda', 'mps'] = 'cuda'
     updated_anthropic_method : bool = True
     
+    @property
+    def d_sae(self):
+        return self.d_mlp * self.dict_mult
+
     @property 
     def dtype(self):
         return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
@@ -152,6 +156,9 @@ class AutoencoderConfig(AutoencoderModelConfig):
     training_set : Optional[List[str]] = None
     validation_set : Optional[List[str]] = None
     loss_func : Optional[Loss_Method] = 'with_loss'
+    anthropic_resampling : bool = False
+    anthropic_resample_look_back_steps : Optional[int] = None
+    sched_lr_factor : Optional[float] = None
 
     @model_validator(mode='after')
     def check_loss_func(self, data)-> Self:
@@ -184,8 +191,8 @@ class AutoencoderConfig(AutoencoderModelConfig):
             n_steps=1,
             type='autoencoder',
             loss_func='with_loss',
-            dict_mult=1,
-            d_mlp=1024,
+            dict_mult=2,
+            d_mlp=768,
             l1_coeff=0.1,
             seed=0,
             enc_dtype='fp32',
@@ -200,6 +207,13 @@ class AutoEncoderBase(nn.Module, ABC):
     def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__()
         self.cfg = cfg
+
+    @property
+    def d_sae(self):
+        return self.cfg.d_sae
+    
+    @abstractproperty
+    def d_in(self):...
 
     @abstractmethod
     def forward(self, x: Tensor, method: Methods) -> Any:
@@ -326,6 +340,10 @@ class AutoEncoder(AutoEncoderBase):
 
         self.to(self.device) # move to device
 
+    @property
+    def d_in(self):
+        return self.W_enc.shape[0]
+
     @classmethod
     def default(cls: Type[T]) -> T:
         return cls(AutoencoderConfig.default())
@@ -370,7 +388,6 @@ class AutoEncoder(AutoEncoderBase):
             'W_dec_norm': torch.norm(self.W_dec).item(),
             'b_dec_norm': torch.norm(self.b_dec).item(),
         }
-
 
     def get_single_feature_acts(
         self,     
@@ -475,6 +492,11 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.W_mag = nn.Parameter(weight_init)
         self.device = get_device()
         self.to(self.device)
+
+    @property
+    def d_in(self):
+        return self.W_gate.shape[0]
+
 
     @classmethod
     def default(cls: Type[T]) -> T:

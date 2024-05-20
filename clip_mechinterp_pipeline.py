@@ -293,7 +293,6 @@ class ClipMechInterpPipeline:
         if sum(valid_samples) != len(all_samples): # check if all are True
             raise ValueError("Not all samples are valid, filtering doesnt work", valid_samples)
         
-        save_html(all_samples[:5], os.path.join(self.interp_vis_save_path, f"test_feature_idx_{index}.html"))
         vol.commit()
         feature_hypothesis = self.automated_interp_pipeline.explain_activation_sync(all_samples[:3])
 

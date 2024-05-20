@@ -1,8 +1,26 @@
 import os
+from click import Option
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional, Literal, Protocol, Union, overload, runtime_checkable
 from utils import format_image_anthropic, format_image_openai
 import torch
+
+class AnthropicResample(BaseModel):
+    inactive_features: torch.Tensor = Field(..., description="""
+        the indices of all features that are not 
+        active over last interval(most often 12500 consecutive steps in antrhopic paper)
+    """)
+    resample_norm : float = Field(..., description="""
+        the norm of the resampled features, 
+        that which is hopefully less or around one
+    """)
+
+    @property
+    def inactive_features_count(self) -> int:
+        return int(self.inactive_features.sum().item())
+    
+    class Config:
+        arbitrary_types_allowed = True
 
 def save_html(samples : List['FeatureSample'], filename: str):
     assert all(isinstance(elm, FeatureSample) for elm in samples), "All examples should be FeatureSample"

@@ -116,7 +116,6 @@ class LaionDataset(Dataset):
 
     def __len__(self):
         if self.data is not None:
-            print("self.emb_paths len", len(self.emb_paths))
             return self.data.shape[0] * len(self.emb_paths)
         return 0
         
@@ -193,6 +192,9 @@ class LaionDataLoader:
         )
 
 
+    def reset_batch_size(self, batch_size: int):
+        self.dataloader.batch_size = batch_size
+
     def __iter__(self):
         return iter(self.dataloader)
 
@@ -218,7 +220,7 @@ class LaionDataLoader:
 
 
 def load_loaders(
-    batch_size: int,
+    batch_size: Tuple[int, int], 
     emb_folder: str,
     train_share : float = 0.8,
     d_hidden : Optional[float] = None,
@@ -229,7 +231,7 @@ def load_loaders(
     '''
     return (
         LaionDataLoader(
-        batch_size=batch_size,
+        batch_size=batch_size[0],
         emb_folder=emb_folder,
         split='train',
         train_share=train_share,
@@ -237,7 +239,7 @@ def load_loaders(
         n_count=n_counts[0]
         ),
         LaionDataLoader(
-            batch_size=batch_size,
+            batch_size=batch_size[1],
             emb_folder=emb_folder,
             split='test',
             train_share=train_share,

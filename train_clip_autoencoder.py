@@ -1,3 +1,4 @@
+import sched
 from common import (
     stub, 
     vol, 
@@ -12,12 +13,10 @@ import time
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
-from io import BytesIO
 from Laion_Processing.dataloader import load_loaders
 import wandb
-from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, AutoencoderResult, GatedAutoEncoder, GatedAutoEncoderResult
+from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, GatedAutoEncoder
 from utils import load_tensor
-from mechninterp_utils import hist
 from modal import gpu
 import modal
 import os
@@ -27,7 +26,8 @@ from torch.optim import AdamW
 from tqdm import tqdm
 from utils import get_device
 from _types import Loss_Method
-
+from mechninterp_utils import hist, anthropic_resample #TODO MOVE THIS TO MECHINTERP UTILS
+from torch.optim.lr_scheduler import StepLR  # Add this import
 
 def save_model(
     model : Union[GatedAutoEncoder, AutoEncoder], 
@@ -55,6 +55,10 @@ def save_model(
 def train_autoencoder(
     type: Literal['autoencoder', 'gated_autoencoder'], 
     dict_mult : int,
+    anthropic_resampling : bool = False,
+    anthropic_resample_look_back_steps : int = 12500,
+    resampling_dataset_size : int = 819200, #anthropic paper uses this number
+    resampling_interval : Optional[int] = int(2.5*10**4),
     steps: int = 10**5, # 100 k steps as per anthropic paper
     save_interval : int = 10**4, # we save the model every save_interval steps
     test_steps : int = 25*10**3,
@@ -62,7 +66,7 @@ def train_autoencoder(
     max_l_coef : float = 5,
     loss_func: Loss_Method = 'with_loss',
     retrain_path : Optional[str] = None,
-    resampling_interval : Optional[int] = 10**4,
+    sched_lr_factor : Optional[float] = None
 ):
     if with_ramp and loss_func == 'with_loss':
         print("with_ramp does not work for the with_loss loss function disabling it")
@@ -101,7 +105,10 @@ def train_autoencoder(
             validation_set=test_files,
             n_steps=0,
             type=type,
-            updated_anthropic_method=True if loss_func=='with_new_loss' else False
+            updated_anthropic_method=True if loss_func=='with_new_loss' else False,
+            anthropic_resampling=anthropic_resampling,
+            anthropic_resample_look_back_steps=anthropic_resample_look_back_steps if anthropic_resampling else None,
+            sched_lr_factor=sched_lr_factor
         )
 
         if type == "gated_autoencoder":
@@ -115,6 +122,11 @@ def train_autoencoder(
         else:
             return step % resampling_interval == 0    
 
+    def anthropic_resampling_at_step_idx()->bool:
+        if anthropic_resampling:
+            return step % anthropic_resample_look_back_steps == 0
+        else:
+            return False
 
     model_dir = f"{PATH}/laion2b_autoencoders/{cfg.folder_name}"
     os.makedirs(model_dir, exist_ok=True)
@@ -135,16 +147,21 @@ def train_autoencoder(
         }
     )
 
-    train_loader , test_loader = load_loaders(
-        batch_size=cfg.batch_size, 
+    train_loader, test_loader = load_loaders(
+        batch_size=(cfg.batch_size, 4*cfg.batch_size), 
         emb_folder=EMB_FOLDER,
         train_share=0.8,
         d_hidden = model.W_dec.shape[0] if cfg.updated_anthropic_method else None,
-        n_counts=(None, 1)
+        n_counts=(None, 5)
     )
 
     model.to(model.cfg.device)
     optimizer = AdamW(model.parameters(), lr=cfg.lr)
+    
+    scheduler = StepLR(
+        optimizer, step_size=cfg.batch_size*100, gamma=sched_lr_factor
+    ) if sched_lr_factor is not None else None
+
     if retrain_path is None:
         step = 0
     else:
@@ -152,7 +169,6 @@ def train_autoencoder(
         #this is to avoid resaving and reevaluating the same model
     
     last_resampling_step_idx = step
-
 
     #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below max_l_coef
     l1_ramp = max_l_coef / ((steps // 100)*5 )
@@ -185,9 +201,12 @@ def train_autoencoder(
             
             model.remove_parallel_component_of_grads()
             optimizer.step()
+            if scheduler:
+                scheduler.step()
 
             metrics = {
                 "l1_coeff": model.l1_coeff,
+                'lr': optimizer.param_groups[0]['lr'],
                 "time_per_step": time.time() - t0,
                 **result.format_data()
             }
@@ -205,9 +224,11 @@ def train_autoencoder(
             cfg.l1_coeff = model.l1_coeff
 
             if resample_at_step_idx():
-                current_frequency_counter = running_frequency_counter.to(cfg.device) / (cfg.batch_size * (step - last_resampling_step_idx))
+                current_frequency_counter = running_frequency_counter.to(cfg.device) / (
+                    cfg.batch_size * (
+                    step - last_resampling_step_idx)
+                )
 
-                running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
                 #from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b)
                 fig = hist(
                     torch.max(current_frequency_counter.cpu(), torch.FloatTensor([1e-10])).log10().cpu(),
@@ -217,12 +238,33 @@ def train_autoencoder(
                     xaxis_title = "Log10(Frequency)",
                     yaxis_title = "Percent (changed!) of Neurons",
                     return_fig = True,
-                    # Do not show legend
                     showlegend = False
                 )
                 metrics["frequency_histogram"] = fig
-                last_resampling_step_idx = step
-                torch.cuda.empty_cache()
+                if not anthropic_resampling:
+                    running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
+            
+            if anthropic_resampling_at_step_idx():
+                print("resampling at step", step)
+                indices = (running_frequency_counter == 0).nonzero(as_tuple=False)[:, 0]
+                if len(indices) > 0:
+                    resampling_stats = anthropic_resample(
+                        indices=indices,
+                        val_dataset=test_loader.dataloader,
+                        model=model,
+                        optimizer=optimizer,
+                        sched = scheduler,
+                        resampling_dataset_size=resampling_dataset_size,
+                        resample_factor=0.2,
+                        bias_resample_factor=0.2
+                    )
+                
+                    last_resampling_step_idx = step
+                    running_frequency_counter = torch.zeros_like(running_frequency_counter)
+                    torch.cuda.empty_cache()
+                    metrics.update(resampling_stats.model_dump())
+                else:
+                    print("no indices to resample")
 
             wandb.log(metrics)
 
@@ -238,44 +280,3 @@ def train_autoencoder(
                             }
                         )
             cfg.n_epochs += 1
-
-
-@stub.function(
-    image = image,
-    volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
-    timeout=60*60, #1 hour
-    secrets=[modal.Secret.from_name("my-wandb-secret")],
-    _allow_background_volume_commits=True,
-    gpu=gpu.A10G()
-)
-def get_recons_loss(
-    model_path : str,    
-):
-    autoencoder = AutoEncoder.load_from_checkpoint(
-        model_path,
-    )
-
-    print("len validation set", len(autoencoder.metadata_cfg.validation_set)) # type: ignore
-    batch_size = 512*20
-    losses = []
-    for file in tqdm(autoencoder.metadata_cfg.validation_set):
-        try:
-            all_tokens = load_tensor(file)
-        except:
-            print("error loading file", file)
-            continue
-
-        num_batches = len(all_tokens)// (batch_size)
-        autoencoder.to(autoencoder.cfg.device)
-        autoencoder.eval()
-        for batch in tqdm(all_tokens.split(batch_size)[:num_batches]):
-            batch = batch.to(autoencoder.cfg.device)
-            with torch.no_grad():
-                result  = autoencoder.forward(batch, method="with_loss")
-            x_reconstruct = result.x_reconstruct
-            mean_ablated = batch - batch.mean(dim=0)
-            losses.append(((x_reconstruct - mean_ablated)**2).mean().item()) #mse
-    
-    print("mean loss", np.mean(losses))
-
-
