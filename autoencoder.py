@@ -1,6 +1,5 @@
 import json
 import math
-from re import I
 from torch.optim import Optimizer
 from tqdm import tqdm
 from typing_extensions import Self
@@ -11,49 +10,23 @@ from torch import Tensor
 import torch.nn as nn
 from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
-from typing import Tuple, Union, Literal, List, Any, Type, cast, TypeVar
+from typing import Callable, Union, Literal, List, Any, Type, TypeVar
 from abc import ABC, abstractmethod, abstractproperty
 from utils import get_device
-from typing import overload, Protocol
-from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
+from typing import overload
 from _types import Loss_Method, Methods
-
-def compute_did_fire(acts : Tensor)-> Tensor:
-    '''compute count of how often specific feature was nonzero across the batch'''
-    return (acts > 0).long().sum(dim=0).cpu()
-
-def compute_mean_firing_percentage(x : Tensor)-> Tensor:
-    '''compute the mean firing percentage of the neurons across the batch'''
-    return (x > 0).float().mean(dim=(0,1))
-
-def compute_mean_firing_per_batch(x : Tensor)-> Tensor:
-    '''compute the mean firing percentage of the neurons across the batch'''
-    return (x > 0).float().mean(dim=(0,1))
-
-def compute_avg_num_firing_per_neuron(x: Tensor) -> Tensor:
-    #compute average number of times a neuron fires across the batch
-    return (x > 0).float().sum(dim=1)
-
-
-def compute_l0_norm(x: torch.Tensor) -> torch.Tensor:
-    '''the mean l0 norm of the activations over the batch'''
-    #x : shape(batch_size, dim)
-    assert len(x.shape) == 2
-    nonzero_per_activation = x.ne(0).float().sum(dim=1)
-    return nonzero_per_activation.mean(0)
-
-def compute_mean_absolute_error(x: Tensor, ground_truth: Tensor) -> Tensor:
-    return (torch.abs(x - ground_truth)).mean()
-
-def compute_mse(x: Tensor, ground_truth: Tensor) -> Tensor:
-    return (x - ground_truth).pow(2).mean()
-
-def compute_l1_sparsity(x: Tensor) -> Tensor:
-    return x.abs().sum(1).mean(0)
-
-def compute_normalized_mse(x : torch.Tensor, ground_truth : torch.Tensor) -> torch.Tensor:
-    '''normalized mean squared error by '''
-    return ((x-ground_truth).pow(2) / (ground_truth**2).sum(dim=-1, keepdim=True)).sqrt().mean()
+from loss_and_stats import (
+    compute_l0_norm,
+    compute_mean_absolute_error,
+    compute_mse,
+    compute_l1_sparsity,
+    compute_normalized_mse,
+    compute_normalized_L1_loss,
+    compute_did_fire,
+    compute_mean_firing_percentage,
+    compute_avg_num_firing_per_neuron,
+    compute_mean_firing_per_batch
+)
 
 class BasicStats(BaseModel):
     loss: Tensor
@@ -62,6 +35,7 @@ class BasicStats(BaseModel):
     acts_sum : Tensor = Field(..., description="the mean of the sum of the activations over the batch")
     l2_loss: Tensor = Field(..., description="mean squared error")
     l1_loss: Tensor = Field(..., description="mean absolute error")
+    normalized_l1_loss: Tensor = Field(..., description="normalized L1 loss")
     l_sparsity: Tensor = Field(..., description="the sum of the absolute values of the activations")
     l0_norm: Tensor = Field(..., description="average number of non-zero entries in the activations")
     normalized_mse : Tensor 
@@ -115,7 +89,6 @@ class AutoencoderResult(BasicStats):
 
     def format_data(self):
         return super().format_data()
-        
 
 class AutoencoderModelConfig(BaseModel):
     type: Literal['autoencoder', 'gated_autoencoder']
@@ -123,7 +96,7 @@ class AutoencoderModelConfig(BaseModel):
     d_mlp: int 
     l1_coeff: float
     seed: int = 42
-    enc_dtype: Literal['fp32', 'fp16'] = 'fp32'
+    enc_dtype: Literal['fp32', 'fp16'] = 'fp16'
     device: Literal['cuda', 'mps'] = 'cuda'
     updated_anthropic_method : bool = True
     
@@ -209,6 +182,33 @@ class AutoEncoderBase(nn.Module, ABC):
     def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__()
         self.cfg = cfg
+
+    def initialize_weights(self):
+        d_hidden = self.cfg.d_mlp * self.cfg.dict_mult
+        self.W_enc = nn.Parameter(torch.empty(self.cfg.d_mlp,d_hidden, dtype=self.cfg.dtype))
+        torch.nn.init.kaiming_uniform_(self.W_enc, a=math.sqrt(5)) #TODO why sqrt(5)
+        self.W_dec = nn.Parameter(self.W_enc.data.t().clone())
+        with torch.no_grad():
+            # Anthropic normalize this to have unit columns
+            if not self.cfg.updated_anthropic_method:
+                #in the first autoencoder we constrain the W_DEC to unit norm     
+                #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
+                self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+            else:
+                #we initialize the weights to have a fixed L2 norm of 0.1
+                self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
+                # Initialize W_enc to self.W_dec^T
+        torch.nn.init.kaiming_uniform_(self.W_enc, a=math.sqrt(5))
+        self.W_dec.data = self.W_enc.data.t().clone()
+
+        with torch.no_grad():
+            if not self.cfg.updated_anthropic_method:
+                self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+            else:
+                self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
+
+        self.b_enc = nn.Parameter(torch.zeros(self.d_hidden, dtype=self.cfg.dtype)) # initialize to zero
+        self.b_dec = nn.Parameter(torch.zeros(self.cfg.d_mlp, dtype=self.cfg.dtype)) # initialize to zero
 
 
     @abstractmethod
@@ -310,37 +310,15 @@ class AutoEncoderBase(nn.Module, ABC):
         """Should be implemented to return an instance of the calling class."""
         pass
     #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
+
 class AutoEncoder(AutoEncoderBase):
     def __init__(self, cfg : AutoencoderModelConfig):
         super().__init__(cfg)
-        d_hidden = cfg.d_mlp * cfg.dict_mult
+        self.d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-
-        if not cfg.updated_anthropic_method:
-            #in the first autoencoder we constrain the W_DEC to unit norm     
-            #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
-            self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
-            with torch.no_grad():
-                # Anthropic normalize this to have unit columns
-                self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-            self.W_enc = nn.Parameter(self.W_dec.data.t().clone())
-        else:
-            # Initialize W_dec with fixed L2 norm of 0.1
-            self.W_dec = nn.Parameter(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype))
-            nn.init.kaiming_uniform_(self.W_dec, a=math.sqrt(5))
-            with torch.no_grad():
-                #we initialize the weights to have a fixed L2 norm of 0.1
-                self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
-            # Initialize W_enc to W_dec^T
-            self.W_enc = nn.Parameter(self.W_dec.data.t().clone())
-        
-        
-        
+        self.initialize_weights()
         self.relu = nn.ReLU()
        
-        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) # initialize to zero
-        self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
-        self.d_hidden = d_hidden
         self.l1_coeff = cfg.l1_coeff
         self.device = get_device()
 
@@ -380,7 +358,6 @@ class AutoEncoder(AutoEncoderBase):
         cls, 
         checkpoint_path : str, 
     ) -> 'AutoEncoder': 
-        
         return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path) #type: ignore
 
     def get_weight_data(self)-> dict[str, float]:
@@ -460,6 +437,7 @@ class AutoEncoder(AutoEncoderBase):
                 l2_loss=l2_loss, 
                 l_sparsity=L_sparse,
                 l1_loss=compute_mean_absolute_error(x_reconstruct, x),
+                normalized_l1_loss=compute_normalized_L1_loss(acts, x),
                 l0_norm=compute_l0_norm(acts),
                 normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
@@ -506,7 +484,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.b_gate = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
         self.b_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
 
-        self.W_dec = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
+        self.W_dec = nn.Parameter()
         self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
 
         # Initialize W_mag as a vector of learnable parameters
@@ -520,20 +498,19 @@ class GatedAutoEncoder(AutoEncoderBase):
     def d_in(self):
         return self.W_gate.shape[0]
 
-
     @classmethod
     def default(cls: Type[T]) -> T:
         return cls(AutoencoderConfig.default())
 
-    @classmethod
     @overload
+    @classmethod
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
     ) -> 'GatedAutoEncoder': ...
 
-    @classmethod
     @overload
+    @classmethod
     def load_from_checkpoint(
         cls, 
         checkpoint_path : str, 
@@ -548,7 +525,6 @@ class GatedAutoEncoder(AutoEncoderBase):
     ) -> 'GatedAutoEncoder':
         # Implementation remains the same
         return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
-
 
     def get_single_feature_acts(
         self,     
@@ -631,6 +607,7 @@ class GatedAutoEncoder(AutoEncoderBase):
                 loss=loss, 
                 l2_loss=l2,
                 l1_loss=compute_mean_absolute_error(x_reconstruct, x),
+                normalized_l1_loss=compute_normalized_L1_loss(acts, x),
                 l_sparsity=L_Sparsity,
                 l0_norm=compute_l0_norm(acts),
                 x_reconstruct=x_reconstruct, 
@@ -651,24 +628,110 @@ class GatedAutoEncoder(AutoEncoderBase):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
             for v_key in ["exp_avg", "exp_avg_sq"]:
                 if dict_idx == 0:
-                    assert k.data.shape == (768, 1536), f"expected shape (768, 1536) got {k.data.shape}"
+                    assert k.data.shape == (self.d_in, self.d_hidden), f"expected shape ({self.d_in}, {self.d_hidden}) got {k.data.shape}"
                     v[v_key][:, indices] = 0.0
                 elif dict_idx == 1:
-                    assert k.data.shape == (1536,), f"expected shape (1536,) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.d_sae,) got {k.data.shape}"
                     v[v_key][indices] = 0.0
                 elif dict_idx == 2:
-                    assert k.data.shape == (1536,), f"expected shape (1536,) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.d_sae,) got {k.data.shape}"
                     v[v_key][indices] = 0.0
                 elif dict_idx == 3:
-                    assert k.data.shape == (1536, 768), f"expected shape (1536, 768) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae, self.d_in), f"expected shape (self.d_sae, self.d_in) got {k.data.shape}"
                     v[v_key][indices, :] = 0.0
                 elif dict_idx == 4:
-                    assert k.data.shape == (768,), f"expected shape (768,) got {k.data.shape}"
+                    assert k.data.shape == (self.d_in,), f"expected shape (self.d_in,) got {k.data.shape}"
                 elif dict_idx == 5:
-                    assert k.data.shape == (768, 1536), f"expected shape (768, 1536) got {k.data.shape}"
+                    assert k.data.shape == (self.d_in, self.d_sae), f"expected shape (self.d_in, 1536) got {k.data.shape}"
                     v[v_key][:, indices]
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
     def decode(self, acts : Tensor) -> Tensor:
         return acts @ self.W_dec + self.b_dec
+
+#based on https://cdn.openai.com/papers/sparse-autoencoders.pdf
+class TopK(nn.Module):
+    def __init__(self, k: int, postact_fn: Callable = nn.ReLU()) -> None:
+        super().__init__()
+        self.k = k
+        self.postact_fn = postact_fn
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        topk = torch.topk(x, k=self.k, dim=-1)
+        values = self.postact_fn(topk.values)
+        # make all other values 0
+        result = torch.zeros_like(x)
+        result.scatter_(-1, topk.indices, values)
+        return result
+
+class TopKAutoEncoderConfig(AutoencoderModelConfig):
+    k: int
+
+class TopKAutoEncoder(AutoEncoder):
+    def __init__(self, cfg : TopKAutoEncoderConfig):
+        super().__init__(cfg)
+        self.topk = TopK(cfg.k, postact_fn=nn.ReLU())
+
+    @overload
+    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct'], normalize_weights: bool = False) -> Tensor: ...
+    @overload
+    def forward(self, x: Tensor, method: Literal['with_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
+    @overload
+    def forward(self, x: Tensor, method: Literal['with_new_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
+
+    def forward(
+        self,
+        x: Tensor, 
+        method: Methods = 'with_loss',
+        normalize_weights: bool = False
+    ) -> Union[Tensor, AutoencoderResult]:
+
+        W_enc = self.W_enc
+        b_enc = self.b_enc
+        W_dec = self.W_dec
+        b_dec = self.b_dec
+
+        if normalize_weights:
+            #with torch.no_grad(): ?
+            norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
+            W_enc = W_enc * norm_factor
+            b_enc = b_enc * norm_factor  # Ensure b_enc is correctly broadcasted
+            W_dec = W_dec / norm_factor  # Normalize W_dec directly
+
+        x_center = x - b_dec
+        acts = self.topk(x_center @ W_enc + b_enc)
+        if method == 'with_acts':
+            return acts
+        
+        x_reconstruct = acts @ W_dec + b_dec
+        if method in ['with_loss', 'with_new_loss']:
+            l2_loss = compute_mse(x_reconstruct, x)
+            if method == 'with_loss':
+                L_sparse = compute_l1_sparsity(acts)
+            else:  # method == 'with_new_loss'
+                L_sparse = (acts.abs() * torch.norm(W_dec, dim=-1)).sum()  # alternative sparsity metric
+            loss = l2_loss + (self.l1_coeff * L_sparse)
+            
+            return AutoencoderResult(
+                loss=loss, 
+                x_reconstruct=x_reconstruct, 
+                acts=acts, 
+                acts_sum=acts.sum(1).mean(),
+                l2_loss=l2_loss, 
+                l_sparsity=L_sparse,
+                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
+                normalized_l1_loss=compute_normalized_L1_loss(acts, x),
+                l0_norm=compute_l0_norm(acts),
+                normalized_mse=compute_normalized_mse(x_reconstruct, x),
+                did_fire=compute_did_fire(acts),
+                mean_firing_percentage=compute_mean_firing_percentage(acts),
+                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
+                #weight_stats=self.get_weight_data(),
+            )
+        elif method == 'reconstruct':
+            return x_reconstruct
+        else:
+            raise ValueError(f"Invalid method: {method}")
+
+
