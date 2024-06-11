@@ -90,8 +90,11 @@ class AutoencoderResult(BasicStats):
     def format_data(self):
         return super().format_data()
 
+AUTOENCODER_TYPES = Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder']
+
+
 class AutoencoderModelConfig(BaseModel):
-    type: Literal['autoencoder', 'gated_autoencoder']
+    type: AUTOENCODER_TYPES
     dict_mult: int
     d_mlp: int 
     l1_coeff: float
@@ -112,8 +115,9 @@ class AutoencoderModelConfig(BaseModel):
     def folder_name(self):
         return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_dict_mult_{self.dict_mult}'
 
-class AutoencoderConfig(AutoencoderModelConfig):
-    type: Literal['autoencoder', 'gated_autoencoder']
+class AutoencoderTrainConfig(AutoencoderModelConfig):
+    wandb_log : bool = True
+    type: AUTOENCODER_TYPES
     batch_size: int
     buffer_mult: int
     num_tokens: Optional[int] = None
@@ -152,7 +156,7 @@ class AutoencoderConfig(AutoencoderModelConfig):
 
 
     @classmethod
-    def default(cls)-> 'AutoencoderConfig':
+    def default(cls)-> 'AutoencoderTrainConfig':
         return cls(
             batch_size=1,
             buffer_mult=1,
@@ -266,7 +270,7 @@ class AutoEncoderBase(nn.Module, ABC):
             raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
 
         cls.dir_name = dir_path.split('/')[-1] 
-        cfg = AutoencoderConfig(**json.loads(open(json_path).read()))
+        cfg = AutoencoderTrainConfig(**json.loads(open(json_path).read()))
         cls.metadata_cfg = cfg
 
         device = get_device()
@@ -312,7 +316,7 @@ class AutoEncoder(AutoEncoderBase):
 
     @classmethod
     def default(cls: Type[T]) -> T:
-        return cls(AutoencoderConfig.default())
+        return cls(AutoencoderTrainConfig.default())
 
     @classmethod
     @overload
@@ -366,7 +370,7 @@ class AutoEncoder(AutoEncoderBase):
         b_enc = slice_biases(self.b_enc, feature_indices)
         W_dec = slice_weights(self.W_dec, feature_indices)
         b_dec = slice_biases(self.b_dec, feature_indices)
-        x = x[:, feature_indices]
+        x = x[:, feature_indices] if feature_indices else x
        
         
         if normalize_weights:
@@ -377,15 +381,10 @@ class AutoEncoder(AutoEncoderBase):
             W_dec = W_dec / norm_factor  # Normalize W_dec directly
 
         x_center = x - b_dec
-
-        print("x_center", x_center.shape)
-        print("W_enc", W_enc.shape)
-        print("b_enc", b_enc.shape)
-        print("(x_center @ W_enc).shape", (x_center @ W_enc).shape)
         acts = self.activation(x_center @ W_enc + b_enc)
         if method == 'with_acts':
             return acts
-        
+
         x_reconstruct = acts @ W_dec + b_dec
         if method in ['with_loss', 'with_new_loss']:
             l2_loss = compute_mse(x_reconstruct, x)
@@ -465,7 +464,7 @@ class GatedAutoEncoder(AutoEncoderBase):
 
     @classmethod
     def default(cls: Type[T]) -> T:
-        return cls(AutoencoderConfig.default())
+        return cls(AutoencoderTrainConfig.default())
 
     @overload
     @classmethod
@@ -613,11 +612,11 @@ class TopK(nn.Module):
         result.scatter_(-1, topk.indices, values)
         return result
 
-class TopKAutoEncoderConfig(AutoencoderModelConfig):
+class TopKAutoEncoderModelConfig(AutoencoderModelConfig):
     k: int
 
 class TopKAutoEncoder(AutoEncoder):
-    def __init__(self, cfg : TopKAutoEncoderConfig):
+    def __init__(self, cfg : TopKAutoEncoderModelConfig):
         super().__init__(cfg)
         self.activation = TopK(cfg.k, postact_fn=nn.ReLU())
 

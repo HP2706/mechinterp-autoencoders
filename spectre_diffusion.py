@@ -119,7 +119,7 @@ class SpectreDiffusionPipeLine:
         ).to("cuda")
 
         model_path = get_model_dir()
-        path = f'{model_path}/autoencoder_d_hidden_76800_dict_mult_100/autoencoder_d_hidden_76800_dict_mult_100_lr_0.0012_steps_79999_with_l1_coeff_ramp_with_new_loss'
+        path = f'{model_path}/autoencoder_d_hidden_7680_dict_mult_10/autoencoder_d_hidden_7680_dict_mult_10_lr_0.0012_steps_149999_with_l1_coeff_ramp_with_new_loss'
         self.autoencoder = AutoEncoderBase.load_from_checkpoint(dir_path=path).to("cuda")
 
     @torch.no_grad()

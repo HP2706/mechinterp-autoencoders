@@ -1,6 +1,6 @@
-from modal import Stub, Volume, Image, Secret
+from modal import App, Volume, Image, Secret
 
-stub = Stub(
+stub = App(
     name="autoencoder anthropic", 
     secrets=[
         Secret.from_name("my-gemini-secret"), 
@@ -74,6 +74,9 @@ image = Image.from_registry(
     "nvidia/cuda:12.1.0-base-ubuntu22.04", add_python="3.11"
 ).pip_install_from_requirements(
     "requirements.txt"
+).run_commands(
+    "apt update", # torch.compile requires c compiler
+    "apt install -y build-essential"
 ).run_function(
     download_java_run_time
 ).env(

@@ -41,4 +41,9 @@ def compute_normalized_L1_loss(
     latent_activations: Tensor,
     ground_truth: Tensor,
 ) -> Tensor:
+    """
+    :param latent_activations: output of Autoencoder.encode (shape: [batch, n_latents])
+    :param original_input: input of Autoencoder.encode (shape: [batch, n_inputs])
+    :return: normalized L1 loss (shape: [1])
+    """
     return (latent_activations.abs().sum(dim=1) / ground_truth.norm(dim=1)).mean()

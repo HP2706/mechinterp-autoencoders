@@ -1,9 +1,7 @@
-import sched
 from common import (
     stub, 
     vol, 
     image, 
-    METADATA_FOLDER,
     EMB_FOLDER,
     PATH, 
     LAION_DATASET_PATH,
@@ -15,8 +13,16 @@ from torch.nn.utils import clip_grad_norm_
 import numpy as np
 from Laion_Processing.dataloader import load_loaders
 import wandb
-from autoencoder import AutoEncoderBase, AutoencoderConfig, AutoEncoder, GatedAutoEncoder
-from utils import load_tensor
+from autoencoder import (
+    AutoEncoderBase, 
+    AutoEncoder,
+    AutoencoderResult,
+    AutoencoderTrainConfig, 
+    GatedAutoEncoder,
+    GatedAutoEncoderResult, 
+    TopKAutoEncoder,
+    TopKAutoEncoderModelConfig
+)
 from modal import gpu
 import modal
 import os
@@ -31,7 +37,7 @@ from torch.optim.lr_scheduler import StepLR  # Add this import
 
 def save_model(
     model : Union[GatedAutoEncoder, AutoEncoder], 
-    cfg: AutoencoderConfig,
+    cfg: AutoencoderTrainConfig,
     model_dir : str
 ):
     basename = cfg.create_basename()
@@ -53,10 +59,10 @@ def save_model(
     _allow_background_volume_commits=True
 )
 def train_autoencoder(
-    type: Literal['autoencoder', 'gated_autoencoder'], 
+    type: Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder'], 
     dict_mult : int,
     anthropic_resampling : bool = False,
-    anthropic_resample_look_back_steps : int = 12500,
+    anthropic_resample_look_back_steps : int = 12500,#anthropic paper uses this number
     resampling_dataset_size : int = 819200, #anthropic paper uses this number
     resampling_interval : Optional[int] = int(2.5*10**4),
     steps: int = 10**5, # 100 k steps as per anthropic paper
@@ -66,7 +72,8 @@ def train_autoencoder(
     max_l_coef : float = 5,
     loss_func: Loss_Method = 'with_loss',
     retrain_path : Optional[str] = None,
-    sched_lr_factor : Optional[float] = None
+    sched_lr_factor : Optional[float] = None,
+    wandb_log : bool = True
 ):
     if with_ramp and loss_func == 'with_loss':
         print("with_ramp does not work for the with_loss loss function disabling it")
@@ -84,7 +91,8 @@ def train_autoencoder(
         train_files = paths[:int(len(paths)*0.8)]
         test_files = paths[int(len(paths)*0.8):]
 
-        cfg = AutoencoderConfig(
+        cfg = AutoencoderTrainConfig(
+            wandb_log=wandb_log,
             seed=42,
             batch_size=4096, #2048 or 4096
             buffer_mult=10,
@@ -113,8 +121,18 @@ def train_autoencoder(
 
         if type == "gated_autoencoder":
             model = GatedAutoEncoder(cfg)
-        else:
+        elif type == "autoencoder":
             model = AutoEncoder(cfg)
+        elif type == "topk_autoencoder":
+            model_cfg = TopKAutoEncoderModelConfig(
+                k = 10, #TODO let user set
+                **cfg.model_dump()
+            )
+            model = TopKAutoEncoder(model_cfg)
+        else:
+            raise ValueError(f"type {type} not recognized")
+    
+    model = torch.compile(model)
 
     def resample_at_step_idx()->bool:
         if resampling_interval is None:
@@ -132,20 +150,20 @@ def train_autoencoder(
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
 
-
-    wandb.login(key=os.getenv('WANDB_API_KEY'))
-    wandb.init(
-        # set the wandb project where this run will be logged
-        project="Sparse AutoEncoder",
-        # track hyperparameters and run metadata
-        name = cfg.folder_name,
-        config={
-            "learning_rate": cfg.lr,
-            "architecture": "AutoEncoder",
-            "dataset": "Laion2B",
-            "epochs": cfg.n_epochs,
-        }
-    )
+    if wandb_log:
+        wandb.login(key=os.getenv('WANDB_API_KEY'))
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="Sparse AutoEncoder",
+            # track hyperparameters and run metadata
+            name = cfg.folder_name,
+            config={
+                "learning_rate": cfg.lr,
+                "architecture": "AutoEncoder",
+                "dataset": "Laion2B",
+                "epochs": cfg.n_epochs,
+            }
+        )
 
     train_loader, test_loader = load_loaders(
         batch_size=(cfg.batch_size, 4*cfg.batch_size), 
@@ -177,6 +195,7 @@ def train_autoencoder(
 
     running_frequency_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.int)
 
+    times = []
     while step < steps:
         model.train()
         for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
@@ -191,8 +210,8 @@ def train_autoencoder(
             #we have scaled the embeddings by 10 to make them larger and easier to work with
 
             optimizer.zero_grad()
-            result = model.forward(batch, method=loss_func) # type: ignore
-
+            with torch.autocast(model.cfg.device):
+                result : Union[AutoencoderResult, GatedAutoEncoderResult] = model.forward(batch, method=loss_func) # type: ignore
             running_frequency_counter += result.did_fire
 
             result.loss.backward()
@@ -204,10 +223,18 @@ def train_autoencoder(
             if scheduler:
                 scheduler.step()
 
+            torch.cuda.synchronize()
+            times.append(time.time() - t0)
+            if len(times) > 100:
+                mean_time = np.mean(times)
+                times = []
+            else:
+                mean_time = np.mean(times) if times else None
+
             metrics = {
                 "l1_coeff": model.l1_coeff,
                 'lr': optimizer.param_groups[0]['lr'],
-                "time_per_step": time.time() - t0,
+                'time_per_step': mean_time,
                 **result.format_data()
             }
 
@@ -246,6 +273,8 @@ def train_autoencoder(
             
             if anthropic_resampling_at_step_idx():
                 print("resampling at step", step)
+                if cfg.wandb_log:
+                    wandb.log({'resample_step' : step})
                 indices = (running_frequency_counter == 0).nonzero(as_tuple=False)[:, 0]
                 if len(indices) > 0:
                     resampling_stats = anthropic_resample(
@@ -266,17 +295,20 @@ def train_autoencoder(
                 else:
                     print("no indices to resample")
 
-            wandb.log(metrics)
+            if cfg.wandb_log:
+                wandb.log(metrics)
 
             if step % test_steps == 0:
                 model.eval()
                 with torch.no_grad():
                     for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
                         batch = batch.to(model.cfg.device)
-                        result = model.forward(batch, method="with_loss")
-                        wandb.log(
-                            {
+                        result : Union[AutoencoderResult, GatedAutoEncoderResult] = model.forward(batch, method="with_loss")
+                        if cfg.wandb_log:
+                            wandb.log(
+                                {
                                 f'test_{key}': value for key, value in result.format_data().items()
-                            }
-                        )
+                            }) 
+                        else:
+                            print(result.format_data())
             cfg.n_epochs += 1
