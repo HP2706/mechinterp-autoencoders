@@ -12,7 +12,7 @@ from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
 from typing import Callable, Union, Literal, List, Any, Type, TypeVar
 from abc import ABC, abstractmethod, abstractproperty
-from utils import get_device
+from utils import get_device, slice_weights, slice_biases
 from typing import overload
 from _types import Loss_Method, Methods
 from loss_and_stats import (
@@ -231,18 +231,6 @@ class AutoEncoderBase(nn.Module, ABC):
 
     @torch.no_grad()
     @abstractmethod
-    def get_single_feature_acts(
-        self,     
-        model_acts : torch.Tensor, 
-        feature_index : int,
-    ) -> torch.Tensor:
-        """
-        Returns the activations of a single feature.
-        """
-        pass
-
-    @torch.no_grad()
-    @abstractmethod
     def get_weight_data(self)-> dict[str, float]:
         pass
 
@@ -293,11 +281,6 @@ class AutoEncoderBase(nn.Module, ABC):
         model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=device))
         return model
 
-    @abstractmethod
-    @torch.no_grad()
-    def decode(self, acts : Tensor) -> Tensor:
-        pass
-
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):
         W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
@@ -317,8 +300,7 @@ class AutoEncoder(AutoEncoderBase):
         self.d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         self.initialize_weights()
-        self.relu = nn.ReLU()
-       
+        self.activation = nn.ReLU()
         self.l1_coeff = cfg.l1_coeff
         self.device = get_device()
 
@@ -372,42 +354,21 @@ class AutoEncoder(AutoEncoderBase):
             'b_dec_norm': torch.norm(self.b_dec).item(),
         }
 
-    def get_single_feature_acts(
-        self,     
-        model_acts : torch.Tensor, 
-        feature_index : int,
-    ) -> torch.Tensor:
-        '''gets the activation values for a specific feature index(index of the hidden layer)'''
-
-        if model_acts.device != self.cfg.device:
-            model_acts = model_acts.to(self.device)
-
-        feature_in = self.W_enc[:, feature_index]
-        feature_bias = self.b_enc[feature_index]
-        feature_acts = F.relu((model_acts - self.b_dec) @ feature_in + feature_bias) # shape (batch, seq_len)
-        feature_acts = feature_acts.cpu()
-    
-        return feature_acts.unsqueeze(-1) #[batch, 1]
-
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct'], normalize_weights: bool = False) -> Tensor: ...
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_new_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
-
     def forward(
-        self,
+        self, 
         x: Tensor, 
-        method: Methods = 'with_loss',
-        normalize_weights: bool = False
+        method: Literal['with_acts', 'with_loss', 'reconstruct'],
+        normalize_weights: bool = False,
+        feature_indices: Optional[slice] = None
     ) -> Union[Tensor, AutoencoderResult]:
-
-        W_enc = self.W_enc
-        b_enc = self.b_enc
-        W_dec = self.W_dec
-        b_dec = self.b_dec
-
+        
+        W_enc = slice_weights(self.W_enc, feature_indices)
+        b_enc = slice_biases(self.b_enc, feature_indices)
+        W_dec = slice_weights(self.W_dec, feature_indices)
+        b_dec = slice_biases(self.b_dec, feature_indices)
+        x = x[:, feature_indices]
+       
+        
         if normalize_weights:
             #with torch.no_grad(): ?
             norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
@@ -416,7 +377,12 @@ class AutoEncoder(AutoEncoderBase):
             W_dec = W_dec / norm_factor  # Normalize W_dec directly
 
         x_center = x - b_dec
-        acts = self.relu(x_center @ W_enc + b_enc)
+
+        print("x_center", x_center.shape)
+        print("W_enc", W_enc.shape)
+        print("b_enc", b_enc.shape)
+        print("(x_center @ W_enc).shape", (x_center @ W_enc).shape)
+        acts = self.activation(x_center @ W_enc + b_enc)
         if method == 'with_acts':
             return acts
         
@@ -442,8 +408,7 @@ class AutoEncoder(AutoEncoderBase):
                 normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
                 mean_firing_percentage=compute_mean_firing_percentage(acts),
-                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
-                #weight_stats=self.get_weight_data(),
+                avg_num_firing=compute_avg_num_firing_per_neuron(acts)
             )
         elif method == 'reconstruct':
             return x_reconstruct
@@ -476,7 +441,6 @@ class GatedAutoEncoder(AutoEncoderBase):
         super().__init__(cfg)
         d_hidden = cfg.d_mlp * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.relu = nn.ReLU()
         # Initialize parameters for the gated autoencoder
         self.l1_coeff = cfg.l1_coeff
         self.W_gate = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
@@ -491,6 +455,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to zero?
         weight_init = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(weight_init)
+        self.activation = nn.ReLU()
         self.device = get_device()
         self.to(self.device)
 
@@ -526,24 +491,6 @@ class GatedAutoEncoder(AutoEncoderBase):
         # Implementation remains the same
         return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
 
-    def get_single_feature_acts(
-        self,     
-        model_acts : torch.Tensor, 
-        feature_index : int,
-    ) -> torch.Tensor:
-        '''gets the activation values for a specific feature index (index of the hidden layer)'''
-
-        if model_acts.device != self.device:
-            model_acts = model_acts.to(self.device)
-
-        model_acts_centered = model_acts - self.b_dec
-        gate_activation = model_acts_centered @ self.W_gate[:, feature_index] + self.b_gate[feature_index]
-        active_feature = (gate_activation > 0).float()
-        feature_magnitude = self.relu(model_acts_centered @ self.W_mag[:, feature_index] + self.b_mag[feature_index])
-        feature_activation = active_feature * feature_magnitude
-
-        return feature_activation.unsqueeze(-1) #[batch, 1]
-
     def get_weight_data(self)-> dict[str, float]:
         return {
             'W_gate_sum': self.W_gate.sum().item(),
@@ -560,45 +507,50 @@ class GatedAutoEncoder(AutoEncoderBase):
             'b_dec_norm': torch.norm(self.b_dec).item(),
         }
 
-
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct']) -> Tensor: ...
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_loss']) -> GatedAutoEncoderResult: ...
-
     def forward(
         self, 
         x: Tensor, 
-        method: Literal['with_acts', 'with_loss', 'reconstruct']
+        method: Literal['with_acts', 'with_loss', 'reconstruct'],
+        normalize_weights: bool = False,
+        feature_indices: Optional[slice] = None
     ) -> Union[Tensor, GatedAutoEncoderResult]:
 
-        x_center = x - self.b_dec
-        gate_center = x_center @ self.W_gate + self.b_gate
+        W_gate = slice_weights(self.W_gate, feature_indices)
+        b_gate = slice_biases(self.b_gate, feature_indices)
+        W_mag = slice_weights(self.W_mag, feature_indices)
+        b_mag = slice_biases(self.b_mag, feature_indices)
+        W_dec = slice_weights(self.W_dec, feature_indices)
+        b_dec = slice_biases(self.b_dec, feature_indices)
+        x = x[:, feature_indices]
+        
+        x_center = x - b_dec
+
+        gate_center = x_center @ W_gate + b_gate
         active_features = (gate_center > 0).float()
 
-        feature_magnitudes = self.relu(x_center @ self.W_mag + self.b_mag)
+        feature_magnitudes = self.activation(x_center @ W_mag + b_mag)
 
         # Computing final activations
         acts = active_features * feature_magnitudes
 
         # Reconstructing x
-        x_reconstruct = acts @ self.W_dec + self.b_dec
- 
+        x_reconstruct = acts @ W_dec + b_dec
+
         if method == 'with_acts':
             return acts
         elif method == 'reconstruct':
             return x_reconstruct
         elif method == 'with_loss':
-            #Reconstruct loss
+            # Reconstruct loss
             l2 = compute_mse(x_reconstruct, x)
             # Computing Sparsity loss
-            via_gate_feature_magnitudes = self.relu(gate_center)
+            via_gate_feature_magnitudes = self.activation(gate_center)
             L_Sparsity = via_gate_feature_magnitudes.float().sum()
 
             # Computing L_aux with frozen decoder
             with torch.no_grad():
-                W_dec_frozen = self.W_dec.detach()
-                b_dec_frozen = self.b_dec.detach()
+                W_dec_frozen = W_dec.detach()
+                b_dec_frozen = b_dec.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_dec_frozen)
             L_aux = compute_mse(x, via_gate_reconstruction)
             loss = l2 + (self.l1_coeff * L_Sparsity) + L_aux
@@ -618,11 +570,10 @@ class GatedAutoEncoder(AutoEncoderBase):
                 did_fire=compute_did_fire(acts),
                 mean_firing_percentage=compute_mean_firing_per_batch(acts),
                 avg_num_firing=compute_avg_num_firing_per_neuron(acts),
-                #weight_stats=self.get_weight_data()
+                # weight_stats=self.get_weight_data()
             )
         else:
-            return x_reconstruct
-        
+            raise ValueError(f"Invalid method: {method}")
 
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
@@ -647,9 +598,6 @@ class GatedAutoEncoder(AutoEncoderBase):
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
-    def decode(self, acts : Tensor) -> Tensor:
-        return acts @ self.W_dec + self.b_dec
-
 #based on https://cdn.openai.com/papers/sparse-autoencoders.pdf
 class TopK(nn.Module):
     def __init__(self, k: int, postact_fn: Callable = nn.ReLU()) -> None:
@@ -671,67 +619,6 @@ class TopKAutoEncoderConfig(AutoencoderModelConfig):
 class TopKAutoEncoder(AutoEncoder):
     def __init__(self, cfg : TopKAutoEncoderConfig):
         super().__init__(cfg)
-        self.topk = TopK(cfg.k, postact_fn=nn.ReLU())
+        self.activation = TopK(cfg.k, postact_fn=nn.ReLU())
 
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_acts', 'reconstruct'], normalize_weights: bool = False) -> Tensor: ...
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
-    @overload
-    def forward(self, x: Tensor, method: Literal['with_new_loss'], normalize_weights: bool = False) -> AutoencoderResult: ...
-
-    def forward(
-        self,
-        x: Tensor, 
-        method: Methods = 'with_loss',
-        normalize_weights: bool = False
-    ) -> Union[Tensor, AutoencoderResult]:
-
-        W_enc = self.W_enc
-        b_enc = self.b_enc
-        W_dec = self.W_dec
-        b_dec = self.b_dec
-
-        if normalize_weights:
-            #with torch.no_grad(): ?
-            norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
-            W_enc = W_enc * norm_factor
-            b_enc = b_enc * norm_factor  # Ensure b_enc is correctly broadcasted
-            W_dec = W_dec / norm_factor  # Normalize W_dec directly
-
-        x_center = x - b_dec
-        acts = self.topk(x_center @ W_enc + b_enc)
-        if method == 'with_acts':
-            return acts
-        
-        x_reconstruct = acts @ W_dec + b_dec
-        if method in ['with_loss', 'with_new_loss']:
-            l2_loss = compute_mse(x_reconstruct, x)
-            if method == 'with_loss':
-                L_sparse = compute_l1_sparsity(acts)
-            else:  # method == 'with_new_loss'
-                L_sparse = (acts.abs() * torch.norm(W_dec, dim=-1)).sum()  # alternative sparsity metric
-            loss = l2_loss + (self.l1_coeff * L_sparse)
-            
-            return AutoencoderResult(
-                loss=loss, 
-                x_reconstruct=x_reconstruct, 
-                acts=acts, 
-                acts_sum=acts.sum(1).mean(),
-                l2_loss=l2_loss, 
-                l_sparsity=L_sparse,
-                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
-                normalized_l1_loss=compute_normalized_L1_loss(acts, x),
-                l0_norm=compute_l0_norm(acts),
-                normalized_mse=compute_normalized_mse(x_reconstruct, x),
-                did_fire=compute_did_fire(acts),
-                mean_firing_percentage=compute_mean_firing_percentage(acts),
-                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
-                #weight_stats=self.get_weight_data(),
-            )
-        elif method == 'reconstruct':
-            return x_reconstruct
-        else:
-            raise ValueError(f"Invalid method: {method}")
-
-
+   

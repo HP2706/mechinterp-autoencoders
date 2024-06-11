@@ -12,9 +12,21 @@ import base64
 from PIL import Image
 import io
 import requests
+from torch import Tensor
 
 T = TypeVar("T")
 B = TypeVar('B')
+
+def slice_weights(weights: Tensor, feature_indices: Optional[slice]) -> Tensor:
+    if feature_indices is not None:
+        return weights[feature_indices, feature_indices]
+    return weights
+
+def slice_biases(biases: Tensor, feature_indices: Optional[slice]) -> Tensor:
+    if feature_indices is not None:
+        return biases[feature_indices]
+    return biases
+
 
 def flatten_lst(lst: List[List[T]]) -> List[T]:
     return [item for sublist in lst for item in sublist]
