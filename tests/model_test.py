@@ -1,17 +1,21 @@
 from typing import List, Literal, Tuple, Type, Union
+import shutil
 import unittest
 from tqdm import tqdm
 import pytest
 import torch
-from utils import get_device
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '')))
+
+from training_config import AutoencoderTrainConfig
 from autoencoder import (
     AutoEncoder,
-    AutoencoderModelConfig,
+    AutoEncoderBaseConfig,
     GatedAutoEncoder,
     TopKAutoEncoder,
-    TopKAutoEncoderModelConfig
+    TopKAutoEncoderConfig
 )
-
 
 def generate_random_frequency_counter(size, decay=0.9):
     ema = torch.zeros(size)
@@ -23,12 +27,12 @@ def generate_random_frequency_counter(size, decay=0.9):
 
 def run_nan_check_test(autoencoder_class, config_instance):
     n_steps = 100
-    d_mlp = config_instance.d_mlp
+    d_input = config_instance.d_input
     n_tries = 10
     print(autoencoder_class.__name__, autoencoder_class, config_instance)
 
-    if isinstance(config_instance, TopKAutoEncoderModelConfig):
-        ema_frequency_counter = generate_random_frequency_counter(d_mlp).to(config_instance.device)
+    if isinstance(config_instance, TopKAutoEncoderConfig):
+        ema_frequency_counter = generate_random_frequency_counter(d_input).to(config_instance.device)
 
     for _try in tqdm(range(n_tries)):
         model = autoencoder_class(config_instance)
@@ -36,12 +40,12 @@ def run_nan_check_test(autoencoder_class, config_instance):
             assert not torch.isnan(param).any(), f"NaN after initialization found in param for {name}, {param}"
 
         optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
-        data = torch.randn((10, d_mlp)).to(model.cfg.device).to(model.W_dec.dtype)
+        data = torch.randn((10, d_input)).to(model.cfg.device).to(model.W_dec.dtype)
         if torch.isnan(data).any():
             raise ValueError("NaN found in data")
 
         for _ in range(n_steps):
-            if isinstance(config_instance, TopKAutoEncoderModelConfig):
+            if isinstance(config_instance, TopKAutoEncoderConfig):
                 res = model.forward(
                     data, 
                     method='with_loss', 
@@ -81,41 +85,41 @@ def test_check_nans():
     autoencoder_configs : List[
         Tuple[
             Union[Type[TopKAutoEncoder], Type[GatedAutoEncoder], Type[AutoEncoder]], 
-            AutoencoderModelConfig
+            AutoEncoderBaseConfig
         ]
     ] = []
 
     for device in devices:
-        """ autoencoder_configs.append(
-            (TopKAutoEncoder, TopKAutoEncoderModelConfig(
+        autoencoder_configs.append(
+            (TopKAutoEncoder, TopKAutoEncoderConfig(
             seed=42,
             l1_coeff=10e-3, 
             dict_mult=2,
-            d_mlp=1,
+            d_input=1,
             device=device, 
             type='gated_autoencoder',
             k=1,
             k_aux=1,
             updated_anthropic_method=True,
             ))
-        ) """
-        """ autoencoder_configs.append(
-            (GatedAutoEncoder, AutoencoderModelConfig(
+        )
+        autoencoder_configs.append(
+            (GatedAutoEncoder, AutoEncoderBaseConfig(
                 seed=42,
                 l1_coeff=10e-3, 
                 dict_mult=2,
-                d_mlp=1,
+                d_input=1,
                 device=device, 
                 type='gated_autoencoder',
                 updated_anthropic_method=True,
             ))
-        ) """
+        )
         autoencoder_configs.append(
-            (AutoEncoder, AutoencoderModelConfig(
+            (AutoEncoder, AutoEncoderBaseConfig(
             seed=42,
             l1_coeff=10e-3, 
             dict_mult=2,
-            d_mlp=1,
+            d_input=1,
             device=device, 
             type='autoencoder',
             updated_anthropic_method=True,
@@ -126,5 +130,23 @@ def test_check_nans():
         print(f"Running nan check test for {autoencoder_class.__name__} on {config_instance.device}")
         run_nan_check_test(autoencoder_class, config_instance)
 
+
+@pytest.mark.usefixtures
+def test_load_from_checkpoint():
+    model = TopKAutoEncoder(TopKAutoEncoderConfig(
+        seed=42,
+        l1_coeff=10e-3, 
+        dict_mult=2,
+        d_input=1,
+        device='cpu', 
+        type='gated_autoencoder',
+        k=1,
+        k_aux=1,
+        updated_anthropic_method=True,
+    ))
+    model.save_model(AutoencoderTrainConfig.dummy_default(), 'test_model_dir')
+    model.load_from_checkpoint(model.model_path)
+    shutil.rmtree('test_model_dir')
+
 if __name__ == '__main__':
-    unittest.main()
+    pytest.main()

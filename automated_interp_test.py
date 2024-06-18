@@ -5,7 +5,7 @@ from openai import OpenAI, AsyncOpenAI
 from datamodels import ActivationHypothesis, FeatureDescription, FeatureSample, ImageContent, TextContent, InconclusiveHypothesis, save_html
 
 Models = Literal['gpt-4-turbo', 'claude-3-opus-20240229', 'gemini/gemini-1.5-pro-latest']
-async def test_vision_prompt(model :Models):
+async def vision_prompt(model :Models):
     mapping : dict[Models, str]= {
         'gpt-4-turbo': 'openai',
         'claude-3-opus-20240229': 'anthropic',

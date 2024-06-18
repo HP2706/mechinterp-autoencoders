@@ -1,8 +1,5 @@
 from typing import Literal
 
-from traitlets import default
-
-
 def main():
     import os
     import sys

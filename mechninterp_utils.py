@@ -1,6 +1,6 @@
-from _types import Methods
+from _types import Methods, Loss_Method
 import pandas as pd
-from autoencoder import TopKAutoEncoder, compute_mse
+from loss_and_stats import compute_normalized_mse
 import torch
 from tqdm import tqdm
 import math
@@ -8,11 +8,10 @@ from functools import partial
 from transformer_lens import utils
 from torch.utils.data import Dataset, Subset, DataLoader
 from typing import Union, Optional
-from autoencoder import AutoEncoder, GatedAutoEncoder
+from autoencoder import AutoEncoder, GatedAutoEncoder, TopKAutoEncoder
 from torchmetrics.regression import SpearmanCorrCoef
 import numpy as np
 import plotly.express as px
-from _types import Loss_Method
 from torch.distributions import Categorical
 from datamodels import AnthropicResample
 

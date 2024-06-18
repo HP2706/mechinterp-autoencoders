@@ -1,5 +1,6 @@
 import json
-import math
+import inspect
+from modal import method
 from torch.optim import Optimizer
 from tqdm import tqdm
 from typing_extensions import Self
@@ -11,6 +12,7 @@ from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
 from typing import Callable, Union, Literal, List, Any, Type, TypeVar
 from abc import ABC, abstractmethod, abstractproperty
+from training_config import AutoencoderTrainConfig
 from utils import slice_weights, slice_biases
 from typing import overload
 from _types import Loss_Method, Methods
@@ -23,6 +25,9 @@ from loss_and_stats import (
     compute_normalized_mse,
     compute_avg_num_firing_per_neuron,
 )
+
+AUTOENCODER_TYPES = Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder']
+AUTOENCODER_CLASS = Union['GatedAutoEncoder', 'AutoEncoder', 'TopKAutoEncoder']
 
 class BasicStats(BaseModel):
     loss: Tensor
@@ -39,8 +44,8 @@ class BasicStats(BaseModel):
         description="the norms and sums of all the weights"
     )
     did_fire : Tensor = Field(..., description="test with ones and zeros for whether metric for whether activation fired or not")
-    
     avg_num_firing_per_neuron : Tensor 
+
     class Config:
         arbitrary_types_allowed = True
 
@@ -81,13 +86,10 @@ class AutoencoderResult(BasicStats):
     def format_data(self):
         return super().format_data()
 
-AUTOENCODER_TYPES = Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder']
-
-
-class AutoencoderModelConfig(BaseModel):
+class AutoEncoderBaseConfig(BaseModel):
     type: AUTOENCODER_TYPES
     dict_mult: int
-    d_mlp: int 
+    d_input: int 
     l1_coeff: float
     seed: int = 42
     enc_dtype: Literal['fp32', 'fp16'] = 'fp16'
@@ -96,116 +98,54 @@ class AutoencoderModelConfig(BaseModel):
     
     @property
     def d_sae(self):
-        return self.d_mlp * self.dict_mult
+        return self.d_input * self.dict_mult
 
     @property 
     def dtype(self):
         return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
     
     @property
-    def folder_name(self):
-        return f'{self.type}_d_hidden_{self.d_mlp * self.dict_mult}_dict_mult_{self.dict_mult}'
+    def folder_name(self) -> str:
+        return f'{self.type}_d_hidden_{self.d_input * self.dict_mult}_dict_mult_{self.dict_mult}'
 
-class AutoencoderTrainConfig(AutoencoderModelConfig):
-    wandb_log : bool = True
-    normalize_w_dec : bool = Field(...,description="""
-        normalize the wdec to unit norm after each step necessary to 
-        avoid gameability of sparsity metric
-        """
-    )
-    type: AUTOENCODER_TYPES
-    batch_size: int
-    buffer_mult: int
-    num_tokens: Optional[int] = None
-    l1_coeff: float
-    with_ramp : bool = False
-    lr : float
-    beta1: float
-    beta2: float
-    seq_len: int
-    batch_size: int
-    buffer_size: int
-    buffer_batches: int
-    n_epochs: int
-    n_steps: int
-    training_set : Optional[List[str]] = None
-    validation_set : Optional[List[str]] = None
-    loss_func : Optional[Loss_Method] = 'with_loss'
-    anthropic_resampling : bool = False
-    anthropic_resample_look_back_steps : Optional[int] = None
-    sched_lr_factor : Optional[float] = None
-
-    @model_validator(mode='after')
-    def check_loss_func(self, data)-> Self:
-        if self.loss_func == 'with_new_loss' and self.type == 'gated_autoencoder':
-            raise ValueError("Gated Autoencoder does not support 'with_new_loss' loss function")
-        return data
-
-    def create_basename(self)->str:
-        with_ramp_str = '_with_l1_coeff_ramp' if self.with_ramp else ''
-        with_loss_func = f'_{self.loss_func}'
+    def create_folder_name(
+        self, 
+        train_cfg : AutoencoderTrainConfig
+    ) -> str:
+        with_ramp_str = '_with_l1_coeff_ramp' if train_cfg.with_ramp else ''
+        with_loss_func = f'_{train_cfg.loss_func}'
         return (
             f'{self.folder_name}_'
-            f'lr_{self.lr}_'
-            f'steps_{self.n_steps}{with_ramp_str}{with_loss_func}'
-        ) # group string for readability
-
-
-    @classmethod
-    def default(cls)-> 'AutoencoderTrainConfig':
-        return cls(
-            batch_size=1,
-            buffer_mult=1,
-            lr=0.001,
-            beta1=0.9,
-            beta2=0.999,
-            seq_len=1,
-            buffer_size=1,
-            buffer_batches=1,
-            n_epochs=1,
-            n_steps=1,
-            type='autoencoder',
-            loss_func='with_loss',
-            dict_mult=2,
-            d_mlp=768,
-            l1_coeff=0.1,
-            seed=0,
-            normalize_w_dec=True,
-            enc_dtype='fp32',
-            device='cuda'
+            f'lr_{train_cfg.lr}_'
+            f'steps_{train_cfg.n_steps}{with_ramp_str}{with_loss_func}'
         )
 
 T = TypeVar('T', bound='AutoEncoderBase')
 
 class AutoEncoderBase(nn.Module, ABC):
-    def __init__(self, cfg : AutoencoderModelConfig):
+    def __init__(self, cfg : AutoEncoderBaseConfig):
         super().__init__()
         self.cfg = cfg
 
     def initialize_weights(self):
-        d_hidden = self.cfg.d_mlp * self.cfg.dict_mult
+        d_hidden = self.cfg.d_input * self.cfg.dict_mult
         self.W_enc = nn.Parameter(
-            torch.empty(self.cfg.d_mlp, d_hidden, dtype=self.cfg.dtype)
+            torch.empty(self.cfg.d_input, d_hidden, dtype=self.cfg.dtype)
         )
 
-        self.W_dec = nn.Parameter(torch.empty(d_hidden, self.cfg.d_mlp, dtype=self.cfg.dtype))
+        self.W_dec = nn.Parameter(torch.empty(d_hidden, self.cfg.d_input, dtype=self.cfg.dtype))
         nn.init.kaiming_uniform_(self.W_dec)
 
         with torch.no_grad():
-            #we normalize to 
-            if not self.cfg.updated_anthropic_method:
-                #in the first autoencoder we constrain the W_DEC to unit norm     
-                #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
-                self.W_dec.data /= torch.norm(self.W_dec.data, dim=0, keepdim=True)
-            else:
-                self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
-                # Initialize W_enc to self.W_dec^T
+            #in the first autoencoder we constrain the W_DEC to unit norm     
+            #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
+            self.W_dec.data /= torch.norm(self.W_dec.data, dim=0, keepdim=True)
             
         assert not torch.isnan(self.W_dec).any(), f'self.W_dec contains nan after normalization: {self.W_dec.data}'
         self.W_enc.data = self.W_dec.data.t().clone()
         assert not torch.isnan(self.W_enc).any(), f'self.W_enc contains nan after transposition: {self.W_enc.data}'
 
-        self.pre_bias = nn.Parameter(torch.zeros(self.d_in, dtype=self.cfg.dtype)) # initialize to zero
+        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype)) # initialize to zero
         self.b_enc = nn.Parameter(torch.zeros(self.cfg.d_sae, dtype=self.cfg.dtype)) # initialize to zero
         
         assert not torch.isnan(self.W_dec).any(), f'self.W_dec contains nan: {self.W_dec.data}'
@@ -218,9 +158,6 @@ class AutoEncoderBase(nn.Module, ABC):
     def d_sae(self):
         return self.cfg.d_sae
     
-    @abstractproperty
-    def d_in(self):...
-
     @abstractmethod
     def forward(self, x: Tensor, method: Methods) -> Any:
         """
@@ -230,9 +167,12 @@ class AutoEncoderBase(nn.Module, ABC):
         pass
 
     @torch.no_grad()
-    @abstractmethod
-    def get_weight_data(self)-> dict[str, float]:
-        pass
+    def get_weight_data(self) -> dict[str, float]:
+        weight_data = {}
+        for name, value in inspect.getmembers(self):
+            if isinstance(value, Union[nn.Parameter, nn.Linear]):
+                weight_data[f'{name}_norm'] = torch.norm(value.data).item()
+        return weight_data
 
     @classmethod
     def get_name(cls) -> str:
@@ -242,15 +182,24 @@ class AutoEncoderBase(nn.Module, ABC):
     def name(self):
         return self.__class__.__name__.lower()
     
-    @property
-    def get_file_path(self):
-        return self.metadata_cfg
-    
+    @classmethod
+    def train_cfg_path_name(cls) -> str: 
+        return 'config.json'
+
+    @classmethod
+    def model_cfg_path_name(cls) -> str: 
+        return 'model_cfg.json'
+
+    @classmethod
+    def model_weights_path_name(cls) -> str: 
+        return 'model.pt'
+
+
     @classmethod
     def load_from_checkpoint(
         cls, 
         dir_path : str, 
-    ) -> Union['GatedAutoEncoder', 'AutoEncoder']:
+    ) -> tuple[AUTOENCODER_CLASS, AutoencoderTrainConfig]:
         """
         Loads the saved autoencoder from a checkpoint.
         If a json file is not provided, it is expected that the checkpoint is from a run of the autoencoder
@@ -259,26 +208,50 @@ class AutoEncoderBase(nn.Module, ABC):
         """
         if not os.path.isdir(dir_path):
             raise ValueError(f"Got path to file {dir_path} not folder")
-            
-        json_path = f'{dir_path}/config.json'
+
+        print("property", repr(cls.train_cfg_path_name()))
+
+        cfg_path = f"{dir_path}/{cls.train_cfg_path_name()}"
+        print('cfg_path', cfg_path)
+        train_cfg = AutoencoderTrainConfig.model_validate(
+            json.load(open(cfg_path))
+        )
+
+        model_cfg_path = f"{dir_path}/{str(cls.model_cfg_path_name())}"
+        print('model_cfg_path', model_cfg_path)
+        model_cfg = json.load(open(model_cfg_path))
         
-        if not os.path.exists(json_path): 
-            raise ValueError("no corresponding json file found for the checkpoint. a json file should be provided")
-
-        cls.dir_name = dir_path.split('/')[-1] 
-        cfg = AutoencoderTrainConfig(**json.loads(open(json_path).read()))
-        cls.metadata_cfg = cfg
-
-
-        if cfg.type == 'autoencoder':
-            model = AutoEncoder(cfg)
-        elif cfg.type == 'gated_autoencoder':
-            model = GatedAutoEncoder(cfg)
+        class_name = cls.__name__
+        if class_name in ['AutoEncoder', 'GatedAutoEncoder']:
+            model_cfg = AutoEncoderBaseConfig.model_validate(model_cfg)
+            if class_name == 'AutoEncoder':
+                model = AutoEncoder(model_cfg) 
+            else:
+                model = GatedAutoEncoder(model_cfg)
+        elif class_name == 'TopKAutoEncoder':
+            model_cfg = TopKAutoEncoderConfig.model_validate(model_cfg)
+            model = TopKAutoEncoder(model_cfg)
         else:
-            raise ValueError(f"Config type '{cfg.type}' does not match the expected type '{cls.__name__.lower()}'")
-
-        model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=cfg.device))
-        return model
+            raise ValueError(f"Config type '{class_name}' does not match the expected type '{cls.__name__.lower()}'")
+        model.load_state_dict(torch.load(f'{dir_path}/{cls.model_weights_path_name()}'))
+        return model, train_cfg
+    
+    def save_model(
+        self,
+        train_cfg: AutoencoderTrainConfig,
+        model_dir : str
+    ):
+        name = self.cfg.create_folder_name(train_cfg)
+        self.model_path = f'{model_dir}/{name}'
+        os.makedirs(self.model_path, exist_ok=True)
+        torch.save(
+            self.state_dict(), 
+            f"{self.model_path}/{self.model_weights_path_name()}"
+        )
+        with open(f"{self.model_path}/{self.train_cfg_path_name()}", "w") as f:
+            f.write(train_cfg.model_dump_json())
+        with open(f"{self.model_path}/{self.model_cfg_path_name()}", "w") as f:
+            f.write(self.cfg.model_dump_json())
 
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):
@@ -286,66 +259,16 @@ class AutoEncoderBase(nn.Module, ABC):
         W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
         self.W_dec.grad -= W_dec_grad_proj
 
-    @classmethod
-    @abstractmethod
-    def default(cls: Type[T]) -> T:
-        """Should be implemented to return an instance of the calling class."""
-        pass
-    #inspired by neel nanda https://colab.research.google.com/drive/1u8larhpxy8w4mMsJiSBddNOzFGj7_RTn#scrollTo=qCF9odNdAvKX
 
 class AutoEncoder(AutoEncoderBase):
-    def __init__(self, cfg : AutoencoderModelConfig):
+    def __init__(self, cfg : AutoEncoderBaseConfig):
         super().__init__(cfg)
-        self.d_hidden = cfg.d_mlp * cfg.dict_mult
+        self.d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         self.initialize_weights()
         self.activation = nn.ReLU()
         self.l1_coeff = cfg.l1_coeff
         self.to(self.cfg.device) # move to device
-
-    @property
-    def d_in(self):
-        return self.W_enc.shape[0]
-
-    @classmethod
-    def default(cls: Type[T]) -> T:
-        return cls(AutoencoderTrainConfig.default())
-
-    @classmethod
-    @overload
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str,
-    ) -> 'AutoEncoder': ...
-
-    @classmethod
-    @overload
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str, 
-    ) -> 'AutoEncoder': ...
-
-    @classmethod
-    @overload
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str, 
-    ) -> 'AutoEncoder': ...
-
-    @classmethod
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str, 
-    ) -> 'AutoEncoder': 
-        return super(AutoEncoder, cls).load_from_checkpoint(checkpoint_path) #type: ignore
-
-    def get_weight_data(self)-> dict[str, float]:
-        return {
-            'W_enc_norm': torch.norm(self.W_enc).item(),
-            'pre_bias_norm': torch.norm(self.pre_bias).item(),
-            'W_dec_norm': torch.norm(self.W_dec).item(),
-            'b_enc_norm': torch.norm(self.b_enc).item(),
-        }
     
     def _prepare_weights(self, feature_indices: Optional[slice]):
         W_enc = slice_weights(self.W_enc, feature_indices)
@@ -401,34 +324,34 @@ class AutoEncoder(AutoEncoderBase):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
             for v_key in ["exp_avg", "exp_avg_sq"]:
                 if dict_idx == 0:
-                    assert k.data.shape == (self.d_sae, self.d_in), f"expected shape (self.d_sae, self.d_in) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
                     v[v_key][indices, :] = 0.0
                 elif dict_idx == 1:
-                    assert k.data.shape == (self.d_in, self.d_sae), f"expected shape (self.d_in,) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
                     v[v_key][:, indices] = 0.0
                 elif dict_idx == 2:
-                    assert k.data.shape == (self.d_sae,), f"expected shape (self.d_in, self.d_sae) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
                     v[v_key][indices] = 0.0
                 elif dict_idx == 3:
-                    assert k.data.shape == (self.d_in,), f"expected shape (self.d_sae,) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
 
 #from paper https://arxiv.org/pdf/2404.16014
 class GatedAutoEncoder(AutoEncoderBase):
-    def __init__(self, cfg : AutoencoderModelConfig):
+    def __init__(self, cfg : AutoEncoderBaseConfig):
         super().__init__(cfg)
-        d_hidden = cfg.d_mlp * cfg.dict_mult
+        d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         # Initialize parameters for the gated autoencoder
         self.l1_coeff = cfg.l1_coeff
-        self.W_gate = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
+        self.W_gate = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(cfg.d_input, d_hidden, dtype=cfg.dtype)))
 
         self.b_gate = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
         self.b_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
 
-        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
-        self.pre_bias = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
+        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_input, dtype=cfg.dtype)))
+        self.pre_bias = nn.Parameter(torch.zeros(cfg.d_input, dtype=cfg.dtype)) # initialize to zero
 
         # Initialize W_mag as a vector of learnable parameters
         self.r_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype)) #TODO should this be initialized to zero?
@@ -436,48 +359,6 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.W_mag = nn.Parameter(weight_init)
         self.activation = nn.ReLU()
         self.to(self.cfg.device)
-
-    @property
-    def d_in(self):
-        return self.W_gate.shape[0]
-
-    @classmethod
-    def default(cls: Type[T]) -> T:
-        return cls(AutoencoderTrainConfig.default())
-
-    @overload
-    @classmethod
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str, 
-    ) -> 'GatedAutoEncoder': ...
-
-    @overload
-    @classmethod
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path : str, 
-        json_path : Optional[str] = None
-    ) -> 'GatedAutoEncoder': ...
-
-    @classmethod
-    def load_from_checkpoint(
-        cls, 
-        checkpoint_path: str, 
-        json_path: Optional[str] = None
-    ) -> 'GatedAutoEncoder':
-        # Implementation remains the same
-        return super(GatedAutoEncoder, cls).load_from_checkpoint(checkpoint_path, json_path) #type: ignore
-
-    def get_weight_data(self)-> dict[str, float]:
-        return {
-            'W_gate_norm': torch.norm(self.W_gate).item(),
-            'b_gate_norm': torch.norm(self.b_gate).item(),
-            'W_mag_norm': torch.norm(self.W_mag).item(),
-            'b_mag_norm': torch.norm(self.b_mag).item(),
-            'W_dec_norm': torch.norm(self.W_dec).item(),
-            'b_enc_norm': torch.norm(self.b_enc).item(),
-        }
 
     def forward(
         self, 
@@ -544,7 +425,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
             for v_key in ["exp_avg", "exp_avg_sq"]:
                 if dict_idx == 0:
-                    assert k.data.shape == (self.d_in, self.d_hidden), f"expected shape ({self.d_in}, {self.d_hidden}) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input, self.d_hidden), f"expected shape ({self.cfg.d_input}, {self.d_hidden}) got {k.data.shape}"
                     v[v_key][:, indices] = 0.0
                 elif dict_idx == 1:
                     assert k.data.shape == (self.d_sae,), f"expected shape (self.d_sae,) got {k.data.shape}"
@@ -553,12 +434,12 @@ class GatedAutoEncoder(AutoEncoderBase):
                     assert k.data.shape == (self.d_sae,), f"expected shape (self.d_sae,) got {k.data.shape}"
                     v[v_key][indices] = 0.0
                 elif dict_idx == 3:
-                    assert k.data.shape == (self.d_sae, self.d_in), f"expected shape (self.d_sae, self.d_in) got {k.data.shape}"
+                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
                     v[v_key][indices, :] = 0.0
                 elif dict_idx == 4:
-                    assert k.data.shape == (self.d_in,), f"expected shape (self.d_in,) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
                 elif dict_idx == 5:
-                    assert k.data.shape == (self.d_in, self.d_sae), f"expected shape (self.d_in, 1536) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input, 1536) got {k.data.shape}"
                     v[v_key][:, indices]
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
@@ -578,7 +459,7 @@ class TopKActivation(nn.Module):
         result = torch.zeros_like(x, device=x.device)
         result.scatter_(-1, topk.indices, values)
         return result
-    
+
     def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> Tensor:
         topk = torch.topk(
             ema_frequency_counter, 
@@ -591,7 +472,7 @@ class TopKActivation(nn.Module):
         result.scatter_(-1, topk.indices.unsqueeze(0).expand(x.size(0), -1), values)
         return result
 
-class TopKAutoEncoderModelConfig(AutoencoderModelConfig):
+class TopKAutoEncoderConfig(AutoEncoderBaseConfig):
     k: int
     k_aux: int 
     # select aux_k as a power of two as close to d_model/2 as possible 
@@ -601,20 +482,21 @@ class TopKAutoEncoderModelConfig(AutoencoderModelConfig):
     def folder_name(self) -> str:
         super_folder_name = super().folder_name
         return f"{super_folder_name}_k_{self.k}_k_aux_{self.k_aux}"
-
-class TopKAutoEncoder(nn.Module):
+   
+class TopKAutoEncoder(AutoEncoderBase):
     def __init__(
-        self, model_cfg: TopKAutoEncoderModelConfig
+        self, 
+        model_cfg: TopKAutoEncoderConfig
     ) -> None:
-        super().__init__()
+        super().__init__(model_cfg)
         self.cfg = model_cfg
-        self.d_hidden = model_cfg.d_mlp
-        d_mlp = model_cfg.d_mlp
+        self.d_hidden = model_cfg.d_input
+        d_input = model_cfg.d_input
         device = model_cfg.device
-        self.W_enc = nn.Parameter(torch.randn(d_mlp, self.d_hidden, device=device))
+        self.W_enc = nn.Parameter(torch.randn(d_input, self.d_hidden, device=device))
         self.pre_bias = nn.Parameter(torch.zeros(self.d_hidden, device=device))
-        self.W_dec = nn.Parameter(torch.randn(self.d_hidden, d_mlp, device=device))
-        self.latent_bias = nn.Parameter(torch.zeros(d_mlp, device=device))
+        self.W_dec = nn.Parameter(torch.randn(self.d_hidden, d_input, device=device))
+        self.latent_bias = nn.Parameter(torch.zeros(d_input, device=device))
 
         nans = torch.isnan(self.W_dec.data)
         assert not nans.any(), f'self.W_dec contains nan pre normalization: {self.W_dec.data}, nans: {nans}'
@@ -635,7 +517,7 @@ class TopKAutoEncoder(nn.Module):
         #we set w_enc to transpose of w_dec
         nans = torch.isnan(self.W_dec.data)
         assert not nans.any(), f'self.W_dec contains nan post normalization: {self.W_dec.data}, nans: {nans}'
-    
+
     def forward(
         self, 
         x: Tensor, 
@@ -681,6 +563,24 @@ class TopKAutoEncoder(nn.Module):
             return x_reconstruct
         else:
             raise ValueError(f"Invalid method: {method}")
+        
+
+    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
+        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
+            for v_key in ["exp_avg", "exp_avg_sq"]:
+                if dict_idx == 0:
+                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
+                    v[v_key][indices, :] = 0.0
+                elif dict_idx == 1:
+                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
+                    v[v_key][:, indices] = 0.0
+                elif dict_idx == 2:
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
+                    v[v_key][indices] = 0.0
+                elif dict_idx == 3:
+                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
+                else:
+                    raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
 class EMA:
     def __init__(self, model, ema_decay = 0.999):
