@@ -6,13 +6,12 @@ from typing_extensions import Self
 import os
 from typing import Optional
 import torch
-from torch import Tensor
-import torch.nn as nn
+from torch import Tensor, nn
 from pydantic import BaseModel, model_validator, Field
 from torch.nn import functional as F
 from typing import Callable, Union, Literal, List, Any, Type, TypeVar
 from abc import ABC, abstractmethod, abstractproperty
-from utils import get_device, slice_weights, slice_biases
+from utils import slice_weights, slice_biases
 from typing import overload
 from _types import Loss_Method, Methods
 from loss_and_stats import (
@@ -36,7 +35,7 @@ class BasicStats(BaseModel):
     l2_loss: Tensor = Field(..., description="mean squared error")
     l1_loss: Tensor = Field(..., description="mean absolute error")
     normalized_l1_loss: Tensor = Field(..., description="normalized L1 loss")
-    l_sparsity: Tensor = Field(..., description="the sum of the absolute values of the activations")
+    l_sparsity: Optional[Tensor] = Field(..., description="the sum of the absolute values of the activations")
     l0_norm: Tensor = Field(..., description="average number of non-zero entries in the activations")
     normalized_mse : Tensor 
     weight_stats : Optional[dict[str, float]] = Field(
@@ -69,9 +68,7 @@ class BasicStats(BaseModel):
 
 
 class GatedAutoEncoderResult(BasicStats):
-    #loss, x_reconstruct, acts, L_Reconstruct, L_Sparsity, L_aux
     L_aux: Tensor
-
     class Config:
         arbitrary_types_allowed = True
 
@@ -100,7 +97,7 @@ class AutoencoderModelConfig(BaseModel):
     l1_coeff: float
     seed: int = 42
     enc_dtype: Literal['fp32', 'fp16'] = 'fp16'
-    device: Literal['cuda', 'mps'] = 'cuda'
+    device: Literal['cuda', 'mps', 'cpu'] = 'cuda'
     updated_anthropic_method : bool = True
     
     @property
@@ -189,31 +186,33 @@ class AutoEncoderBase(nn.Module, ABC):
 
     def initialize_weights(self):
         d_hidden = self.cfg.d_mlp * self.cfg.dict_mult
-        self.W_enc = nn.Parameter(torch.empty(self.cfg.d_mlp,d_hidden, dtype=self.cfg.dtype))
-        torch.nn.init.kaiming_uniform_(self.W_enc, a=math.sqrt(5)) #TODO why sqrt(5)
-        self.W_dec = nn.Parameter(self.W_enc.data.t().clone())
-        with torch.no_grad():
-            # Anthropic normalize this to have unit columns
+        self.W_enc = nn.Parameter(
+            torch.empty(self.cfg.d_mlp, d_hidden, dtype=self.cfg.dtype)
+        )
+
+        self.W_dec = nn.Parameter(torch.empty(d_hidden, self.cfg.d_mlp, dtype=self.cfg.dtype))
+        nn.init.kaiming_uniform_(self.W_dec)
+
+
+        """ with torch.no_grad():
+            #we normalize to 
             if not self.cfg.updated_anthropic_method:
                 #in the first autoencoder we constrain the W_DEC to unit norm     
                 #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
-                self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
-            else:
-                #we initialize the weights to have a fixed L2 norm of 0.1
-                self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
-                # Initialize W_enc to self.W_dec^T
-        torch.nn.init.kaiming_uniform_(self.W_enc, a=math.sqrt(5))
-        self.W_dec.data = self.W_enc.data.t().clone()
-
-        with torch.no_grad():
-            if not self.cfg.updated_anthropic_method:
-                self.W_dec.data /= torch.norm(self.W_dec.data, dim=1, keepdim=True)
+                self.W_dec.data /= torch.norm(self.W_dec.data, dim=0, keepdim=True)
             else:
                 self.W_dec.data *= 0.1 / torch.norm(self.W_dec.data, dim=0, keepdim=True)
+                # Initialize W_enc to self.W_dec^T """
+            
+        assert not torch.isnan(self.W_dec).any(), f'self.W_dec contains nan after normalization: {self.W_dec.data}'
+        self.W_enc.data = self.W_dec.data.t().clone()
+        assert not torch.isnan(self.W_enc).any(), f'self.W_enc contains nan after transposition: {self.W_enc.data}'
 
         self.b_enc = nn.Parameter(torch.zeros(self.d_hidden, dtype=self.cfg.dtype)) # initialize to zero
         self.b_dec = nn.Parameter(torch.zeros(self.cfg.d_mlp, dtype=self.cfg.dtype)) # initialize to zero
-
+        
+        assert not torch.isnan(self.W_dec).any(), f'self.W_dec contains nan: {self.W_dec.data}'
+        assert not torch.isnan(self.W_enc).any(), f'self.W_enc contains nan: {self.W_enc.data}'
 
     @abstractmethod
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):...
@@ -273,7 +272,6 @@ class AutoEncoderBase(nn.Module, ABC):
         cfg = AutoencoderTrainConfig(**json.loads(open(json_path).read()))
         cls.metadata_cfg = cfg
 
-        device = get_device()
 
         if cfg.type == 'autoencoder':
             model = AutoEncoder(cfg)
@@ -282,7 +280,7 @@ class AutoEncoderBase(nn.Module, ABC):
         else:
             raise ValueError(f"Config type '{cfg.type}' does not match the expected type '{cls.__name__.lower()}'")
 
-        model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=device))
+        model.load_state_dict(torch.load(f'{dir_path}/model.pt', map_location=cfg.device))
         return model
 
     @torch.no_grad()
@@ -306,9 +304,8 @@ class AutoEncoder(AutoEncoderBase):
         self.initialize_weights()
         self.activation = nn.ReLU()
         self.l1_coeff = cfg.l1_coeff
-        self.device = get_device()
 
-        self.to(self.device) # move to device
+        self.to(self.cfg.device) # move to device
 
     @property
     def d_in(self):
@@ -357,6 +354,23 @@ class AutoEncoder(AutoEncoderBase):
             'W_dec_norm': torch.norm(self.W_dec).item(),
             'b_dec_norm': torch.norm(self.b_dec).item(),
         }
+    
+    def _prepare_weights_and_biases(self, feature_indices: Optional[slice], normalize_weights: bool):
+        W_enc = slice_weights(self.W_enc, feature_indices)
+        b_enc = slice_biases(self.b_enc, feature_indices)
+        W_dec = slice_weights(self.W_dec, feature_indices)
+        b_dec = slice_biases(self.b_dec, feature_indices)
+
+        if normalize_weights:
+            with torch.no_grad(): 
+                norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
+                W_dec = W_dec / norm_factor  # Normalize W_dec directly
+                b_dec = b_dec / norm_factor
+        W_enc = self.W_enc
+        b_enc = self.b_enc
+        W_dec = self.W_dec
+        b_dec = self.b_dec
+        return W_enc, b_enc, W_dec, b_dec
 
     def forward(
         self, 
@@ -365,20 +379,7 @@ class AutoEncoder(AutoEncoderBase):
         normalize_weights: bool = False,
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, AutoencoderResult]:
-        
-        W_enc = slice_weights(self.W_enc, feature_indices)
-        b_enc = slice_biases(self.b_enc, feature_indices)
-        W_dec = slice_weights(self.W_dec, feature_indices)
-        b_dec = slice_biases(self.b_dec, feature_indices)
-        x = x[:, feature_indices] if feature_indices else x
-       
-        
-        if normalize_weights:
-            #with torch.no_grad(): ?
-            norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
-            W_enc = W_enc * norm_factor
-            b_enc = b_enc * norm_factor  # Ensure b_enc is correctly broadcasted
-            W_dec = W_dec / norm_factor  # Normalize W_dec directly
+        W_enc, b_enc, W_dec, b_dec = self._prepare_weights_and_biases(feature_indices, normalize_weights)
 
         x_center = x - b_dec
         acts = self.activation(x_center @ W_enc + b_enc)
@@ -392,6 +393,7 @@ class AutoEncoder(AutoEncoderBase):
                 L_sparse = compute_l1_sparsity(acts)
             else:  # method == 'with_new_loss'
                 L_sparse = (acts.abs() * torch.norm(W_dec, dim=-1)).sum()  # alternative sparsity metric
+            
             loss = l2_loss + (self.l1_coeff * L_sparse)
             
             return AutoencoderResult(
@@ -442,12 +444,12 @@ class GatedAutoEncoder(AutoEncoderBase):
         torch.manual_seed(cfg.seed)
         # Initialize parameters for the gated autoencoder
         self.l1_coeff = cfg.l1_coeff
-        self.W_gate = nn.Parameter(torch.nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
+        self.W_gate = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(cfg.d_mlp, d_hidden, dtype=cfg.dtype)))
 
         self.b_gate = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
         self.b_mag = nn.Parameter(torch.zeros(d_hidden, dtype=cfg.dtype))
 
-        self.W_dec = nn.Parameter()
+        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(d_hidden, cfg.d_mlp, dtype=cfg.dtype)))
         self.b_dec = nn.Parameter(torch.zeros(cfg.d_mlp, dtype=cfg.dtype)) # initialize to zero
 
         # Initialize W_mag as a vector of learnable parameters
@@ -455,8 +457,7 @@ class GatedAutoEncoder(AutoEncoderBase):
         weight_init = torch.exp(self.r_mag)[None, :] * self.W_gate
         self.W_mag = nn.Parameter(weight_init)
         self.activation = nn.ReLU()
-        self.device = get_device()
-        self.to(self.device)
+        self.to(self.cfg.device)
 
     @property
     def d_in(self):
@@ -520,18 +521,13 @@ class GatedAutoEncoder(AutoEncoderBase):
         b_mag = slice_biases(self.b_mag, feature_indices)
         W_dec = slice_weights(self.W_dec, feature_indices)
         b_dec = slice_biases(self.b_dec, feature_indices)
-        x = x[:, feature_indices]
-        
+        x = x[:, feature_indices] if feature_indices is not None else x
         x_center = x - b_dec
-
         gate_center = x_center @ W_gate + b_gate
-        active_features = (gate_center > 0).float()
-
+        active_features = (gate_center > 0).to(self.cfg.dtype)
         feature_magnitudes = self.activation(x_center @ W_mag + b_mag)
-
         # Computing final activations
         acts = active_features * feature_magnitudes
-
         # Reconstructing x
         x_reconstruct = acts @ W_dec + b_dec
 
@@ -598,26 +594,121 @@ class GatedAutoEncoder(AutoEncoderBase):
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
 #based on https://cdn.openai.com/papers/sparse-autoencoders.pdf
-class TopK(nn.Module):
-    def __init__(self, k: int, postact_fn: Callable = nn.ReLU()) -> None:
+class TopKActivation(nn.Module):
+    def __init__(self, k: int, k_aux : int, postact_fn: Callable = nn.ReLU()) -> None:
         super().__init__()
         self.k = k
+        self.k_aux = k_aux
         self.postact_fn = postact_fn
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> torch.Tensor:
         topk = torch.topk(x, k=self.k, dim=-1)
         values = self.postact_fn(topk.values)
         # make all other values 0
-        result = torch.zeros_like(x)
+        result = torch.zeros_like(x, device=x.device)
         result.scatter_(-1, topk.indices, values)
+        return result
+    
+    def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> Tensor:
+        min_topk = torch.topk(
+            ema_frequency_counter, 
+            k=self.k_aux, 
+            dim=-1, 
+            largest=False
+        )
+        dead_features = x[:, min_topk.indices] 
+        values = self.postact_fn(dead_features)
+        result = torch.zeros_like(x, device=x.device)
+        result.scatter_(-1, min_topk.indices.unsqueeze(0).expand(x.size(0), -1), values)
         return result
 
 class TopKAutoEncoderModelConfig(AutoencoderModelConfig):
     k: int
+    k_aux: int
 
-class TopKAutoEncoder(AutoEncoder):
-    def __init__(self, cfg : TopKAutoEncoderModelConfig):
-        super().__init__(cfg)
-        self.activation = TopK(cfg.k, postact_fn=nn.ReLU())
+    @property
+    def folder_name(self) -> str:
+        super_folder_name = super().folder_name
+        return f"{super_folder_name}_k_{self.k}_k_aux_{self.k_aux}"
 
-   
+class TopKAutoEncoder(nn.Module):
+    def __init__(
+        self, model_cfg: TopKAutoEncoderModelConfig
+    ) -> None:
+        super().__init__()
+        self.cfg = model_cfg
+        self.d_hidden = model_cfg.d_mlp
+        d_mlp = model_cfg.d_mlp
+        device = model_cfg.device
+        self.W_enc = nn.Parameter(torch.randn(d_mlp, self.d_hidden, device=device))
+        self.pre_bias = nn.Parameter(torch.zeros(self.d_hidden, device=device))
+        self.W_dec = nn.Parameter(torch.randn(self.d_hidden, d_mlp, device=device))
+        self.latent_bias = nn.Parameter(torch.zeros(d_mlp, device=device))
+
+        nans = torch.isnan(self.W_dec.data)
+        assert not nans.any(), f'self.W_dec contains nan pre normalization: {self.W_dec.data}, nans: {nans}'
+        self.activation = TopKActivation(k=model_cfg.k, k_aux=model_cfg.k_aux)
+        with torch.no_grad():
+            #we normalize to 
+            eps = 1
+            norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
+            if torch.any(norm == 0):
+                raise ValueError("Zero norm encountered in W_dec")
+            
+            #we initialize the weights to have a fixed L2 norm of 0.1
+            norm = norm + eps
+            self.W_dec.data *= 0.1 / (norm + eps)
+            print(self.W_dec.data, "norm", torch.norm(self.W_dec.data))
+            # Initialize W_enc to self.W_dec^T
+            
+        #we set w_enc to transpose of w_dec
+        nans = torch.isnan(self.W_dec.data)
+        assert not nans.any(), f'self.W_dec contains nan post normalization: {self.W_dec.data}, nans: {nans}'
+    
+    def forward(
+        self, 
+        x: Tensor, 
+        method: Literal['with_acts', 'with_loss', 'reconstruct'],
+        ema_frequency_counter : Tensor,
+        normalize_weights: bool = False,
+        feature_indices: Optional[slice] = None
+    ) -> Union[Tensor, AutoencoderResult]:
+        assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
+
+        x_center = x - self.pre_bias
+        acts = x_center @ self.W_enc + self.latent_bias
+        if method == 'with_acts':
+            return acts
+        
+        acts_top_k = self.activation(acts)
+        x_reconstruct = acts_top_k @ self.W_dec + self.pre_bias
+        if method == 'with_loss':
+            l2_loss = compute_mse(x_reconstruct, x)
+            aux_acts = self.activation.forward_aux(acts, ema_frequency_counter)
+            e = x - x_reconstruct
+            e_hat = aux_acts @ self.W_dec + self.pre_bias
+            l_aux = compute_mse(e, e_hat)
+                        
+            alpha = 1/32 #as specified in openai autoencoder paper
+
+            loss = l2_loss + alpha * l_aux
+            return AutoencoderResult(
+                loss=loss, 
+                x_reconstruct=x_reconstruct, 
+                acts=acts_top_k, 
+                acts_sum=acts_top_k.sum(1).mean(),
+                l2_loss=loss, 
+                l_sparsity=None, #sparsity loss,
+                l1_loss=compute_mean_absolute_error(x_reconstruct, x),
+                normalized_l1_loss=compute_normalized_L1_loss(acts_top_k, x),
+                l0_norm=compute_l0_norm(acts_top_k),
+                normalized_mse=compute_normalized_mse(x_reconstruct, x),
+                did_fire=compute_did_fire(acts_top_k),
+                mean_firing_percentage=compute_mean_firing_percentage(acts_top_k),
+                avg_num_firing=compute_avg_num_firing_per_neuron(acts_top_k)
+            )
+        elif method == 'reconstruct':
+            return x_reconstruct
+        else:
+            raise ValueError(f"Invalid method: {method}")
+        

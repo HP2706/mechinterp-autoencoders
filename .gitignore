@@ -14,5 +14,6 @@ model.pt
 *.wav
 *.html
 test_pyspark.py
+openaiautoencoder.py
 *.png
 

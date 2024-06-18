@@ -3,7 +3,7 @@ import torch
 
 def compute_did_fire(acts : Tensor)-> Tensor:
     '''compute count of how often specific feature was nonzero across the batch'''
-    return (acts > 0).long().sum(dim=0).cpu()
+    return (acts > 0).long().sum(dim=0)
 
 def compute_mean_firing_percentage(x : Tensor)-> Tensor:
     '''compute the mean firing percentage of the neurons across the batch'''

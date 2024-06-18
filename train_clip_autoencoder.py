@@ -7,6 +7,7 @@ from common import (
     LAION_DATASET_PATH,
     dataset_vol
 )
+import inspect
 import time
 import torch
 from torch.nn.utils import clip_grad_norm_
@@ -26,7 +27,7 @@ from autoencoder import (
 from modal import gpu
 import modal
 import os
-from typing import Literal, Optional, Union
+from typing import Literal, Optional, Union, cast
 
 from torch.optim import AdamW
 from tqdm import tqdm
@@ -59,7 +60,7 @@ def save_model(
     _allow_background_volume_commits=True
 )
 def train_autoencoder(
-    type: Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder'], 
+    model_type: Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder'], 
     dict_mult : int,
     anthropic_resampling : bool = False,
     anthropic_resample_look_back_steps : int = 12500,#anthropic paper uses this number
@@ -73,7 +74,9 @@ def train_autoencoder(
     loss_func: Loss_Method = 'with_loss',
     retrain_path : Optional[str] = None,
     sched_lr_factor : Optional[float] = None,
-    wandb_log : bool = True
+    wandb_log : bool = True,
+    top_k : Optional[int] = None,
+    top_k_aux : Optional[int] = None
 ):
     if with_ramp and loss_func == 'with_loss':
         print("with_ramp does not work for the with_loss loss function disabling it")
@@ -112,27 +115,34 @@ def train_autoencoder(
             training_set=train_files,
             validation_set=test_files,
             n_steps=0,
-            type=type,
+            type=model_type,
             updated_anthropic_method=True if loss_func=='with_new_loss' else False,
             anthropic_resampling=anthropic_resampling,
             anthropic_resample_look_back_steps=anthropic_resample_look_back_steps if anthropic_resampling else None,
             sched_lr_factor=sched_lr_factor
         )
 
-        if type == "gated_autoencoder":
+        if model_type == "gated_autoencoder":
             model = GatedAutoEncoder(cfg)
-        elif type == "autoencoder":
+        elif model_type == "autoencoder":
             model = AutoEncoder(cfg)
-        elif type == "topk_autoencoder":
+        elif model_type == "topk_autoencoder":
+            if top_k is None or top_k_aux is None:
+                raise ValueError("top_k and top_k_aux must both be provided when using topk_autoencoder")
+
             model_cfg = TopKAutoEncoderModelConfig(
-                k = 10, #TODO let user set
+                k = top_k, #TODO let user set
+                k_aux = top_k_aux,
                 **cfg.model_dump()
             )
             model = TopKAutoEncoder(model_cfg)
         else:
             raise ValueError(f"type {type} not recognized")
     
-    model = torch.compile(model)
+    """ model = cast(
+        Union[GatedAutoEncoder, AutoEncoder, TopKAutoEncoder], 
+        torch.compile(model)
+    ) """
 
     def resample_at_step_idx()->bool:
         if resampling_interval is None:
@@ -159,7 +169,7 @@ def train_autoencoder(
             name = cfg.folder_name,
             config={
                 "learning_rate": cfg.lr,
-                "architecture": "AutoEncoder",
+                "architecture": model_type,
                 "dataset": "Laion2B",
                 "epochs": cfg.n_epochs,
             }
@@ -174,7 +184,9 @@ def train_autoencoder(
     )
 
     model.to(model.cfg.device)
-    optimizer = AdamW(model.parameters(), lr=cfg.lr)
+    fused_available = 'fused' in inspect.signature(AdamW).parameters
+    use_fused = fused_available and torch.cuda.is_available()
+    optimizer = AdamW(model.parameters(), lr=cfg.lr, fused=use_fused)
     
     scheduler = StepLR(
         optimizer, step_size=cfg.batch_size*100, gamma=sched_lr_factor
@@ -193,122 +205,153 @@ def train_autoencoder(
     # we linearly increase l1_coeff from 0 to 5 
     #over the first 5% of the total steps as per anthropic paper
 
-    running_frequency_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.int)
+    running_frequency_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.int, device=model.cfg.device)
+    ema_running_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.float32, device=model.cfg.device)
+
+    # Define the decay factor for the EMA
+    decay = 0.99  # You can adjust this value
+
+    #did_fire_last_10_k_steps = torch.zeros(model.W_dec.shape[0], dtype=torch.bool) #TODO is this needed?
 
     times = []
-    while step < steps:
-        model.train()
-        for batch in tqdm(train_loader, total = len(train_loader), desc="dataset training"): 
-            step += 1
-            t0 = time.time()
-            # Update l1_coeff linearly over the first 5% of the total steps
-            if with_ramp:
-                if model.l1_coeff <= max_l_coef:
-                    model.l1_coeff += l1_ramp 
+    with tqdm(total=steps, desc="Training Progress") as pbar:
+        while step < steps:
+            model.train()
+            for batch in train_loader: 
+                step += 1
+                t0 = time.time()
+                # Update l1_coeff linearly over the first 5% of the total steps
+                if with_ramp:
+                    if model.l1_coeff <= max_l_coef:
+                        model.l1_coeff += l1_ramp 
 
-            batch = batch.to(model.cfg.device)
-            #we have scaled the embeddings by 10 to make them larger and easier to work with
+                batch = batch.to(model.cfg.device)
+                #we have scaled the embeddings by 10 to make them larger and easier to work with
 
-            optimizer.zero_grad()
-            with torch.autocast(model.cfg.device):
-                result : Union[AutoencoderResult, GatedAutoEncoderResult] = model.forward(batch, method=loss_func) # type: ignore
-            running_frequency_counter += result.did_fire
-
-            result.loss.backward()
-            clip_grad_norm_(model.parameters(), max_norm=1) 
-            # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
-            
-            model.remove_parallel_component_of_grads()
-            optimizer.step()
-            if scheduler:
-                scheduler.step()
-
-            torch.cuda.synchronize()
-            times.append(time.time() - t0)
-            if len(times) > 100:
-                mean_time = np.mean(times)
-                times = []
-            else:
-                mean_time = np.mean(times) if times else None
-
-            metrics = {
-                "l1_coeff": model.l1_coeff,
-                'lr': optimizer.param_groups[0]['lr'],
-                'time_per_step': mean_time,
-                **result.format_data()
-            }
-
-            if not cfg.updated_anthropic_method:
-                with torch.no_grad():
-                    # Renormalize W_dec to have unit norm
-                    norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
-                    model.W_dec.data /= (norms + 1e-6) 
-
-            if step % save_interval == 0:
-                print("saving model at step", step)
-                save_model(model, cfg, model_dir)
-            cfg.n_steps = step
-            cfg.l1_coeff = model.l1_coeff
-
-            if resample_at_step_idx():
-                current_frequency_counter = running_frequency_counter.to(cfg.device) / (
-                    cfg.batch_size * (
-                    step - last_resampling_step_idx)
-                )
-
-                #from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b)
-                fig = hist(
-                    torch.max(current_frequency_counter.cpu(), torch.FloatTensor([1e-10])).log10().cpu(),
-                    # Show proportion on y axis
-                    histnorm="percent",
-                    title = "Histogram of SAE Neuron Firing Frequency (Proportions of all Neurons)",
-                    xaxis_title = "Log10(Frequency)",
-                    yaxis_title = "Percent (changed!) of Neurons",
-                    return_fig = True,
-                    showlegend = False
-                )
-                metrics["frequency_histogram"] = fig
-                if not anthropic_resampling:
-                    running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
-            
-            if anthropic_resampling_at_step_idx():
-                print("resampling at step", step)
-                if cfg.wandb_log:
-                    wandb.log({'resample_step' : step})
-                indices = (running_frequency_counter == 0).nonzero(as_tuple=False)[:, 0]
-                if len(indices) > 0:
-                    resampling_stats = anthropic_resample(
-                        indices=indices,
-                        val_dataset=test_loader.dataloader,
-                        model=model,
-                        optimizer=optimizer,
-                        sched = scheduler,
-                        resampling_dataset_size=resampling_dataset_size,
-                        resample_factor=0.2,
-                        bias_resample_factor=0.2
-                    )
-                
-                    last_resampling_step_idx = step
-                    running_frequency_counter = torch.zeros_like(running_frequency_counter)
-                    torch.cuda.empty_cache()
-                    metrics.update(resampling_stats.model_dump())
+                optimizer.zero_grad()
+                #with torch.autocast(model.cfg.device):
+                if model_type == "topk_autoencoder":
+                    result = model.forward(
+                        batch, 
+                        method=loss_func, # type: ignore
+                        ema_frequency_counter=ema_running_counter # type: ignore
+                    ) 
                 else:
-                    print("no indices to resample")
+                    result = model.forward(batch, method=loss_func) # type: ignore
+                running_frequency_counter += result.did_fire
 
-            if cfg.wandb_log:
-                wandb.log(metrics)
+                # Update the EMA
+                ema_running_counter = decay * ema_running_counter + (1 - decay) * running_frequency_counter.float()
+                print('result.x_reconstruct', result.x_reconstruct)
+                print('result.x_reconstruct', torch.isnan(result.x_reconstruct).any() or torch.isneginf(result.x_reconstruct).any())
+                print('result.loss', torch.isnan(result.loss).any() or torch.isneginf(result.loss).any())
+                result.loss.backward()
 
-            if step % test_steps == 0:
-                model.eval()
-                with torch.no_grad():
-                    for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
-                        batch = batch.to(model.cfg.device)
-                        result : Union[AutoencoderResult, GatedAutoEncoderResult] = model.forward(batch, method="with_loss")
-                        if cfg.wandb_log:
-                            wandb.log(
-                                {
-                                f'test_{key}': value for key, value in result.format_data().items()
-                            }) 
-                        else:
-                            print(result.format_data())
-            cfg.n_epochs += 1
+                clip_grad_norm_(model.parameters(), max_norm=1) 
+                # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
+                
+                model.remove_parallel_component_of_grads()
+                optimizer.step()
+                if scheduler:
+                    scheduler.step()
+
+                if step % 1000 == 0:
+                    print('step', step)
+                    raise Exception('stop')
+
+                torch.cuda.synchronize()
+                times.append(time.time() - t0)
+                if len(times) > 100:
+                    mean_time = np.mean(times)
+                    times = []
+                else:
+                    mean_time = np.mean(times) if times else None
+
+                metrics = {
+                    "l1_coeff": model.l1_coeff,
+                    'lr': optimizer.param_groups[0]['lr'],
+                    'time_per_step': mean_time,
+                    **result.format_data()
+                }
+
+                if not cfg.updated_anthropic_method:
+                    with torch.no_grad():
+                        # Renormalize W_dec to have unit norm
+                        norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
+                        model.W_dec.data /= (norms + 1e-6) 
+
+                if step % save_interval == 0:
+                    print("saving model at step", step)
+                    save_model(model, cfg, model_dir)
+                cfg.n_steps = step
+                cfg.l1_coeff = model.l1_coeff
+
+                if resample_at_step_idx():
+                    #TODO use exponetial moving average(ema) instead??
+                    current_frequency_counter = running_frequency_counter / (
+                        cfg.batch_size * (
+                        step - last_resampling_step_idx)
+                    )
+
+                    #from https://github.com/ArthurConmy/sae/tree/8bf510d9285eb5d79f77fe6896f2166d35f06a2b)
+                    fig = hist(
+                        torch.max(current_frequency_counter.cpu(), torch.FloatTensor([1e-10])).log10().cpu(),
+                        # Show proportion on y axis
+                        histnorm="percent",
+                        title = "Histogram of SAE Neuron Firing Frequency (Proportions of all Neurons)",
+                        xaxis_title = "Log10(Frequency)",
+                        yaxis_title = "Percent (changed!) of Neurons",
+                        return_fig = True,
+                        showlegend = False
+                    )
+                    metrics["frequency_histogram"] = fig
+                    if not anthropic_resampling:
+                        running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
+                
+                if anthropic_resampling_at_step_idx():
+                    print("resampling at step", step)
+                    if cfg.wandb_log:
+                        wandb.log({'resample_step' : step})
+                    indices = (running_frequency_counter == 0).nonzero(as_tuple=False)[:, 0]
+                    if len(indices) > 0:
+                        resampling_stats = anthropic_resample(
+                            indices=indices,
+                            val_dataset=test_loader.dataloader,
+                            model=model,
+                            optimizer=optimizer,
+                            sched = scheduler,
+                            resampling_dataset_size=resampling_dataset_size,
+                            resample_factor=0.2,
+                            bias_resample_factor=0.2
+                        )
+                    
+                        last_resampling_step_idx = step
+                        running_frequency_counter = torch.zeros_like(running_frequency_counter)
+                        torch.cuda.empty_cache()
+                        metrics.update(resampling_stats.model_dump())
+                    else:
+                        print("no indices to resample")
+
+                if cfg.wandb_log:
+                    wandb.log(metrics)
+                
+                pbar.update(1)
+
+                if step % test_steps == 0:
+                    model.eval()
+                    with torch.no_grad():
+                        for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
+                            batch = batch.to(model.cfg.device)
+                            if isinstance(model, TopKAutoEncoder):
+                                result = model.forward(batch, method="with_loss", ema_frequency_counter=ema_running_counter)
+                            else:
+                                result = model.forward(batch, method="with_loss")
+                            if cfg.wandb_log:
+                                wandb.log(
+                                    {
+                                    f'test_{key}': value for key, value in result.format_data().items()
+                                }) 
+                            else:
+                                print(result.format_data())
+                cfg.n_epochs += 1
+

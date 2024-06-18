@@ -1,6 +1,6 @@
 from _types import Methods
 import pandas as pd
-from autoencoder import compute_mse
+from autoencoder import TopKAutoEncoder, compute_mse
 import torch
 from tqdm import tqdm
 import math
@@ -105,7 +105,7 @@ def scale_dataset(X: torch.Tensor, n: float):
 def anthropic_resample(
     indices: torch.Tensor,
     val_dataset: DataLoader,
-    model: Union[AutoEncoder, GatedAutoEncoder],
+    model: Union[AutoEncoder, GatedAutoEncoder, TopKAutoEncoder],
     optimizer: torch.optim.Optimizer,
     resampling_dataset_size: int,
     sched: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
@@ -125,9 +125,18 @@ def anthropic_resample(
     assert isinstance(val_dataset, DataLoader)
     assert val_dataset.batch_size is not None
 
-    global_loss_increases = torch.zeros((resampling_dataset_size,), dtype=model.cfg.dtype, device=model.cfg.device)
+    global_loss_increases = torch.zeros(
+        (resampling_dataset_size,), 
+        dtype=model.cfg.dtype, 
+        device=model.cfg.device
+    )
+    
     d_in = model.W_enc.shape[0]
-    global_input_activations = torch.zeros((resampling_dataset_size, d_in), dtype=model.cfg.dtype, device=model.cfg.device)
+    global_input_activations = torch.zeros(
+        (resampling_dataset_size, d_in), 
+        dtype=model.cfg.dtype, 
+        device=model.cfg.device
+    )
 
     for (batch_idx, normal_activations) in enumerate(val_dataset): # , total=resampling_dataset_size):
         if batch_idx * val_dataset.batch_size >= resampling_dataset_size:
