@@ -17,14 +17,11 @@ from _types import Loss_Method, Methods
 from loss_and_stats import (
     compute_l0_norm,
     compute_mean_absolute_error,
-    compute_mse,
     compute_l1_sparsity,
-    compute_normalized_mse,
     compute_normalized_L1_loss,
     compute_did_fire,
-    compute_mean_firing_percentage,
+    compute_normalized_mse,
     compute_avg_num_firing_per_neuron,
-    compute_mean_firing_per_batch
 )
 
 class BasicStats(BaseModel):
@@ -37,16 +34,13 @@ class BasicStats(BaseModel):
     normalized_l1_loss: Tensor = Field(..., description="normalized L1 loss")
     l_sparsity: Optional[Tensor] = Field(..., description="the sum of the absolute values of the activations")
     l0_norm: Tensor = Field(..., description="average number of non-zero entries in the activations")
-    normalized_mse : Tensor 
     weight_stats : Optional[dict[str, float]] = Field(
         default=None, 
         description="the norms and sums of all the weights"
     )
-    mean_firing_percentage : Tensor = Field(..., description="the mean firing percentage of the neurons across the batch")
-
     did_fire : Tensor = Field(..., description="test with ones and zeros for whether metric for whether activation fired or not")
-    avg_num_firing : Tensor = Field(..., description="average number of times a neuron fires")
-
+    
+    avg_num_firing_per_neuron : Tensor 
     class Config:
         arbitrary_types_allowed = True
 
@@ -114,6 +108,11 @@ class AutoencoderModelConfig(BaseModel):
 
 class AutoencoderTrainConfig(AutoencoderModelConfig):
     wandb_log : bool = True
+    normalize_w_dec : bool = Field(...,description="""
+        normalize the wdec to unit norm after each step necessary to 
+        avoid gameability of sparsity metric
+        """
+    )
     type: AUTOENCODER_TYPES
     batch_size: int
     buffer_mult: int
@@ -171,6 +170,7 @@ class AutoencoderTrainConfig(AutoencoderModelConfig):
             d_mlp=768,
             l1_coeff=0.1,
             seed=0,
+            normalize_w_dec=True,
             enc_dtype='fp32',
             device='cuda'
         )
@@ -347,31 +347,20 @@ class AutoEncoder(AutoEncoderBase):
             'b_enc_norm': torch.norm(self.b_enc).item(),
         }
     
-    def _prepare_weights_and_biases(self, feature_indices: Optional[slice], normalize_weights: bool):
+    def _prepare_weights(self, feature_indices: Optional[slice]):
         W_enc = slice_weights(self.W_enc, feature_indices)
         pre_bias = slice_biases(self.pre_bias, feature_indices)
         W_dec = slice_weights(self.W_dec, feature_indices)
         b_enc = slice_biases(self.b_enc, feature_indices)
-
-        if normalize_weights:
-            with torch.no_grad(): 
-                norm_factor = torch.norm(W_dec, dim=0, keepdim=True).mean()  # Reshape norm_factor for broadcasting
-                W_dec = W_dec / norm_factor  # Normalize W_dec directly
-                b_enc = b_enc / norm_factor
-        W_enc = self.W_enc
-        pre_bias = self.pre_bias
-        W_dec = self.W_dec
-        b_enc = self.b_enc
         return W_enc, pre_bias, W_dec, b_enc
 
     def forward(
         self, 
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
-        normalize_weights: bool = False,
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, AutoencoderResult]:
-        W_enc, pre_bias, W_dec, b_enc = self._prepare_weights_and_biases(feature_indices, normalize_weights)
+        W_enc, pre_bias, W_dec, b_enc = self._prepare_weights(feature_indices)
         x_center = x - pre_bias
         acts = self.activation(x_center @ W_enc + b_enc)
         if method == 'with_acts':
@@ -379,7 +368,7 @@ class AutoEncoder(AutoEncoderBase):
 
         x_reconstruct = acts @ W_dec + pre_bias
         if method in ['with_loss', 'with_new_loss']:
-            l2_loss = compute_mse(x_reconstruct, x)
+            l2_loss = compute_normalized_L1_loss(x_reconstruct, x)
             if method == 'with_loss':
                 L_sparse = compute_l1_sparsity(acts)
             else:  # method == 'with_new_loss'
@@ -397,10 +386,8 @@ class AutoEncoder(AutoEncoderBase):
                 l1_loss=compute_mean_absolute_error(x_reconstruct, x),
                 normalized_l1_loss=compute_normalized_L1_loss(acts, x),
                 l0_norm=compute_l0_norm(acts),
-                normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
-                mean_firing_percentage=compute_mean_firing_percentage(acts),
-                avg_num_firing=compute_avg_num_firing_per_neuron(acts)
+                avg_num_firing_per_neuron=compute_avg_num_firing_per_neuron(acts)
             )
         elif method == 'reconstruct':
             return x_reconstruct
@@ -496,7 +483,6 @@ class GatedAutoEncoder(AutoEncoderBase):
         self, 
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
-        normalize_weights: bool = False,
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, GatedAutoEncoderResult]:
 
@@ -523,7 +509,7 @@ class GatedAutoEncoder(AutoEncoderBase):
             return x_reconstruct
         elif method == 'with_loss':
             # Reconstruct loss
-            l2 = compute_mse(x_reconstruct, x)
+            l2 = compute_normalized_mse(x_reconstruct, x)
             # Computing Sparsity loss
             via_gate_feature_magnitudes = self.activation(gate_center)
             L_Sparsity = via_gate_feature_magnitudes.float().sum()
@@ -533,7 +519,7 @@ class GatedAutoEncoder(AutoEncoderBase):
                 W_dec_frozen = W_dec.detach()
                 b_enc_frozen = b_mag.detach()
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_enc_frozen)
-            L_aux = compute_mse(x, via_gate_reconstruction)
+            L_aux = compute_normalized_mse(via_gate_reconstruction, x)
             loss = l2 + (self.l1_coeff * L_Sparsity) + L_aux
 
             return GatedAutoEncoderResult(
@@ -547,10 +533,8 @@ class GatedAutoEncoder(AutoEncoderBase):
                 acts=acts, 
                 acts_sum=acts.sum(),
                 L_aux=L_aux,
-                normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts),
-                mean_firing_percentage=compute_mean_firing_per_batch(acts),
-                avg_num_firing=compute_avg_num_firing_per_neuron(acts),
+                avg_num_firing_per_neuron=compute_avg_num_firing_per_neuron(acts),
                 # weight_stats=self.get_weight_data()
             )
         else:
@@ -596,21 +580,22 @@ class TopKActivation(nn.Module):
         return result
     
     def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> Tensor:
-        min_topk = torch.topk(
+        topk = torch.topk(
             ema_frequency_counter, 
             k=self.k_aux, 
             dim=-1, 
-            largest=False
         )
-        dead_features = x[:, min_topk.indices] 
+        dead_features = x[:, topk.indices] 
         values = self.postact_fn(dead_features)
         result = torch.zeros_like(x, device=x.device)
-        result.scatter_(-1, min_topk.indices.unsqueeze(0).expand(x.size(0), -1), values)
+        result.scatter_(-1, topk.indices.unsqueeze(0).expand(x.size(0), -1), values)
         return result
 
 class TopKAutoEncoderModelConfig(AutoencoderModelConfig):
     k: int
-    k_aux: int
+    k_aux: int 
+    # select aux_k as a power of two as close to d_model/2 as possible 
+    # from openai paper https://cdn.openai.com/papers/sparse-autoencoders.pdf
 
     @property
     def folder_name(self) -> str:
@@ -656,7 +641,6 @@ class TopKAutoEncoder(nn.Module):
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
         ema_frequency_counter : Tensor,
-        normalize_weights: bool = False,
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, AutoencoderResult]:
         assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
@@ -669,15 +653,17 @@ class TopKAutoEncoder(nn.Module):
         acts_top_k = self.activation(acts)
         x_reconstruct = acts_top_k @ self.W_dec + self.pre_bias
         if method == 'with_loss':
-            l2_loss = compute_mse(x_reconstruct, x)
+            l2_loss = compute_normalized_mse(x_reconstruct, x)
             aux_acts = self.activation.forward_aux(acts, ema_frequency_counter)
             e = x - x_reconstruct
             e_hat = aux_acts @ self.W_dec + self.pre_bias
-            l_aux = compute_mse(e, e_hat)
-                        
+            aux_k = compute_normalized_mse(e_hat, e)
+            if aux_k.isnan().any():
+                print("aux_k is nan")
+                aux_k = torch.zeros_like(aux_k)
             alpha = 1/32 #as specified in openai autoencoder paper
+            loss = l2_loss + alpha * aux_k
 
-            loss = l2_loss + alpha * l_aux
             return AutoencoderResult(
                 loss=loss, 
                 x_reconstruct=x_reconstruct, 
@@ -688,13 +674,42 @@ class TopKAutoEncoder(nn.Module):
                 l1_loss=compute_mean_absolute_error(x_reconstruct, x),
                 normalized_l1_loss=compute_normalized_L1_loss(acts_top_k, x),
                 l0_norm=compute_l0_norm(acts_top_k),
-                normalized_mse=compute_normalized_mse(x_reconstruct, x),
                 did_fire=compute_did_fire(acts_top_k),
-                mean_firing_percentage=compute_mean_firing_percentage(acts_top_k),
-                avg_num_firing=compute_avg_num_firing_per_neuron(acts_top_k)
+                avg_num_firing_per_neuron=compute_avg_num_firing_per_neuron(acts_top_k)
             )
         elif method == 'reconstruct':
             return x_reconstruct
         else:
             raise ValueError(f"Invalid method: {method}")
         
+class EMA:
+    def __init__(self, model, ema_decay = 0.999):
+        self.ema_decay = ema_decay
+        self.model = model
+        self.shadow = {}
+        self.backup = {}
+
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = (1.0 - self.ema_decay) * param.data + self.ema_decay * self.shadow[name]
+                self.shadow[name] = new_average.clone()
+
+    def apply_shadow(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
