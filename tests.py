@@ -1,4 +1,4 @@
-from typing import List, Literal
+from typing import List, Literal, Tuple, Type, Union
 import unittest
 from tqdm import tqdm
 import pytest
@@ -78,9 +78,16 @@ def test_check_nans():
     elif torch.backends.mps.is_available():
         devices.append('mps')
 
+    autoencoder_configs : List[
+        Tuple[
+            Union[Type[TopKAutoEncoder], Type[GatedAutoEncoder], Type[AutoEncoder]], 
+            AutoencoderModelConfig
+        ]
+    ] = []
+
     for device in devices:
-        autoencoder_configs = [
-        (TopKAutoEncoder, TopKAutoEncoderModelConfig(
+        """ autoencoder_configs.append(
+            (TopKAutoEncoder, TopKAutoEncoderModelConfig(
             seed=42,
             l1_coeff=10e-3, 
             dict_mult=2,
@@ -90,17 +97,21 @@ def test_check_nans():
             k=1,
             k_aux=1,
             updated_anthropic_method=True,
-        )),    
-        (GatedAutoEncoder, AutoencoderModelConfig(
-            seed=42,
-            l1_coeff=10e-3, 
-            dict_mult=2,
-            d_mlp=1,
-            device=device, 
-            type='gated_autoencoder',
-            updated_anthropic_method=True,
-        )),
-        (AutoEncoder, AutoencoderModelConfig(
+            ))
+        ) """
+        """ autoencoder_configs.append(
+            (GatedAutoEncoder, AutoencoderModelConfig(
+                seed=42,
+                l1_coeff=10e-3, 
+                dict_mult=2,
+                d_mlp=1,
+                device=device, 
+                type='gated_autoencoder',
+                updated_anthropic_method=True,
+            ))
+        ) """
+        autoencoder_configs.append(
+            (AutoEncoder, AutoencoderModelConfig(
             seed=42,
             l1_coeff=10e-3, 
             dict_mult=2,
@@ -108,11 +119,11 @@ def test_check_nans():
             device=device, 
             type='autoencoder',
             updated_anthropic_method=True,
-        )), 
-    ]
+            ))
+        )
  
     for autoencoder_class, config_instance in autoencoder_configs:
-        print(f"Running nan check test for {autoencoder_class.__name__} on {device}")
+        print(f"Running nan check test for {autoencoder_class.__name__} on {config_instance.device}")
         run_nan_check_test(autoencoder_class, config_instance)
 
 if __name__ == '__main__':
