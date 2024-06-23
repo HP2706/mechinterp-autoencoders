@@ -5,7 +5,16 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from typing import Generator, Literal, Optional, List, Tuple, Union
 from utils import load_tensor
-from mechninterp_utils import scale_dataset
+import math
+
+def scale_dataset(X: torch.Tensor, n: float):
+    '''Computes the expected norm of the dataset row (dim=-1) and normalizes to sqrt(target_norm).'''
+    n_sqrt = math.sqrt(n)
+    norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
+    mean_norm = torch.mean(norms).float()
+    scaling_factor = n_sqrt / mean_norm
+    X_scaled = X * scaling_factor  # Scale the dataset
+    return X_scaled
 
 def check_inputs(kwargs):
     split = kwargs.get('split', None)

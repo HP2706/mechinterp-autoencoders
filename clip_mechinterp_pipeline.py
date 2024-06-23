@@ -22,7 +22,7 @@ from datamodels import PredictActivation
 from gpu_pipeline import GpuPipeline
 from common import (
     image, 
-    stub, 
+    app, 
     vol, 
     PATH, 
     LAION_DATASET_PATH, 
@@ -52,7 +52,7 @@ np.random.seed(42)
 #set seed for pandas
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-@stub.cls(
+@app.cls(
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},
     image = image,
     timeout=10*60*60, #10 hours 

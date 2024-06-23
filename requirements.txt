@@ -1,5 +1,7 @@
+einops
 torch
 transformer_lens
+bitsandbytes
 transformers
 datasets
 einops
@@ -8,6 +10,7 @@ pydantic>=2.0
 huggingface_hub
 wandb
 tqdm
+bitsandbytes
 pytest
 sentencepiece
 psutil

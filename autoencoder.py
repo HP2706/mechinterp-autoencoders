@@ -14,8 +14,9 @@ from typing import Callable, Union, Literal, List, Any, Type, TypeVar
 from abc import ABC, abstractmethod, abstractproperty
 from training_config import AutoencoderTrainConfig
 from utils import slice_weights, slice_biases
-from typing import overload
 from _types import Loss_Method, Methods
+import einops
+from jaxtyping import Float, Int
 from loss_and_stats import (
     compute_l0_norm,
     compute_mean_absolute_error,
@@ -25,6 +26,9 @@ from loss_and_stats import (
     compute_normalized_mse,
     compute_avg_num_firing_per_neuron,
 )
+if torch.cuda.is_available():
+    from kernels import TritonDecoder
+
 
 AUTOENCODER_TYPES = Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder']
 AUTOENCODER_CLASS = Union['GatedAutoEncoder', 'AutoEncoder', 'TopKAutoEncoder']
@@ -128,6 +132,13 @@ class AutoEncoderBase(nn.Module, ABC):
         self.cfg = cfg
 
     def initialize_weights(self):
+        '''
+        initializes the following weights
+        W_dec : d_hidden x d_input
+        W_enc : d_input x d_hidden
+        b_enc : d_hidden
+        pre_bias : d_input
+        '''
         d_hidden = self.cfg.d_input * self.cfg.dict_mult
         self.W_enc = nn.Parameter(
             torch.empty(self.cfg.d_input, d_hidden, dtype=self.cfg.dtype)
@@ -135,16 +146,8 @@ class AutoEncoderBase(nn.Module, ABC):
 
         self.W_dec = nn.Parameter(torch.empty(d_hidden, self.cfg.d_input, dtype=self.cfg.dtype))
         nn.init.kaiming_uniform_(self.W_dec)
-
-        with torch.no_grad():
-            #in the first autoencoder we constrain the W_DEC to unit norm     
-            #initialization as described in https://transformer-circuits.pub/2024/april-update/index.html#training-saes   
-            self.W_dec.data /= torch.norm(self.W_dec.data, dim=0, keepdim=True)
-            
-        assert not torch.isnan(self.W_dec).any(), f'self.W_dec contains nan after normalization: {self.W_dec.data}'
+        self.set_decoder_norm_to_unit_norm()
         self.W_enc.data = self.W_dec.data.t().clone()
-        assert not torch.isnan(self.W_enc).any(), f'self.W_enc contains nan after transposition: {self.W_enc.data}'
-
         self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype)) # initialize to zero
         self.b_enc = nn.Parameter(torch.zeros(self.cfg.d_sae, dtype=self.cfg.dtype)) # initialize to zero
         
@@ -173,6 +176,29 @@ class AutoEncoderBase(nn.Module, ABC):
             if isinstance(value, Union[nn.Parameter, nn.Linear]):
                 weight_data[f'{name}_norm'] = torch.norm(value.data).item()
         return weight_data
+
+    @method()
+    @torch.no_grad()
+    def set_decoder_norm_to_unit_norm(self):
+        eps = torch.finfo(self.W_dec.dtype).eps
+        norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
+        self.W_dec.data /= norm + eps
+
+    @method()
+    @torch.no_grad()
+    def remove_gradient_parallel_to_decoder_directions(self):
+        assert self.W_dec.grad is not None  # keep pyright happy
+
+        parallel_component = einops.einsum(
+            self.W_dec.grad,
+            self.W_dec.data,
+            "d_sae d_in, d_sae d_in -> d_sae",
+        )
+        self.W_dec.grad -= einops.einsum(
+            parallel_component,
+            self.W_dec.data,
+            "d_sae, d_sae d_in -> d_sae d_in",
+        )
 
     @classmethod
     def get_name(cls) -> str:
@@ -446,21 +472,23 @@ class GatedAutoEncoder(AutoEncoderBase):
         
 #based on https://cdn.openai.com/papers/sparse-autoencoders.pdf
 class TopKActivation(nn.Module):
-    def __init__(self, k: int, k_aux : int, postact_fn: Callable = nn.ReLU()) -> None:
+    def __init__(
+        self, 
+        k: int, 
+        k_aux : int, 
+    ) -> None:
         super().__init__()
         self.k = k
         self.k_aux = k_aux
-        self.postact_fn = postact_fn
 
-    def forward(self, x: Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        #we assume the relu already has been applied
         topk = torch.topk(x, k=self.k, dim=-1)
-        values = self.postact_fn(topk.values)
-        # make all other values 0
         result = torch.zeros_like(x, device=x.device)
-        result.scatter_(-1, topk.indices, values)
-        return result
+        result.scatter_(-1, topk.indices, topk.values)
+        return result, topk.indices
 
-    def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> Tensor:
+    def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> tuple[Tensor, Tensor]:
         topk = torch.topk(
             ema_frequency_counter, 
             k=self.k_aux, 
@@ -469,8 +497,9 @@ class TopKActivation(nn.Module):
         dead_features = x[:, topk.indices] 
         values = self.postact_fn(dead_features)
         result = torch.zeros_like(x, device=x.device)
-        result.scatter_(-1, topk.indices.unsqueeze(0).expand(x.size(0), -1), values)
-        return result
+        indices = topk.indices.unsqueeze(0).expand(x.size(0), -1)
+        result.scatter_(-1, indices, values)
+        return result, indices
 
 class TopKAutoEncoderConfig(AutoEncoderBaseConfig):
     k: int
@@ -482,6 +511,7 @@ class TopKAutoEncoderConfig(AutoEncoderBaseConfig):
     def folder_name(self) -> str:
         super_folder_name = super().folder_name
         return f"{super_folder_name}_k_{self.k}_k_aux_{self.k_aux}"
+    
    
 class TopKAutoEncoder(AutoEncoderBase):
     def __init__(
@@ -491,32 +521,70 @@ class TopKAutoEncoder(AutoEncoderBase):
         super().__init__(model_cfg)
         self.cfg = model_cfg
         self.d_hidden = model_cfg.d_input
-        d_input = model_cfg.d_input
-        device = model_cfg.device
-        self.W_enc = nn.Parameter(torch.randn(d_input, self.d_hidden, device=device))
-        self.pre_bias = nn.Parameter(torch.zeros(self.d_hidden, device=device))
-        self.W_dec = nn.Parameter(torch.randn(self.d_hidden, d_input, device=device))
-        self.latent_bias = nn.Parameter(torch.zeros(d_input, device=device))
-
-        nans = torch.isnan(self.W_dec.data)
-        assert not nans.any(), f'self.W_dec contains nan pre normalization: {self.W_dec.data}, nans: {nans}'
         self.activation = TopKActivation(k=model_cfg.k, k_aux=model_cfg.k_aux)
-        with torch.no_grad():
-            #we normalize to 
-            eps = 1
-            norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
-            if torch.any(norm == 0):
-                raise ValueError("Zero norm encountered in W_dec")
-            
-            #we initialize the weights to have a fixed L2 norm of 0.1
-            norm = norm + eps
-            self.W_dec.data *= 0.1 / (norm + eps)
-            print(self.W_dec.data, "norm", torch.norm(self.W_dec.data))
-            # Initialize W_enc to self.W_dec^T
-            
-        #we set w_enc to transpose of w_dec
-        nans = torch.isnan(self.W_dec.data)
-        assert not nans.any(), f'self.W_dec contains nan post normalization: {self.W_dec.data}, nans: {nans}'
+        self.initialize_weights()#initialize weights
+        self.set_decoder_norm_to_unit_norm()
+        
+
+    def encode(
+        self, 
+        x: Float[Tensor, "... d_in"]
+    ) -> tuple[
+            Float[Tensor, "... d_sae"], 
+            Int[Tensor, "... d_sae"]
+        ]:
+        # Remove decoder bias as per Anthropic
+        sae_in = torch.relu(x.to(self.cfg.dtype) - self.pre_bias)
+        return self.activation.forward(sae_in @ self.W_enc + self.b_enc)
+
+    def decode(self, acts: Float[Tensor, "... d_sae"])-> Float[Tensor, "... d_in"]:
+        return acts @ self.W_dec + self.pre_bias
+
+    def decode_kernel(
+        self,
+        top_acts: Float[Tensor, "... d_sae"],
+        top_indices: Int[Tensor, "..."],
+    ) -> Float[Tensor, "... d_in"]:
+        y = TritonDecoder.apply(top_indices, top_acts.to(self.cfg.dtype), self.W_dec.mT)
+        return y + self.pre_bias
+
+    def forward2(self, x: Tensor, dead_mask: Tensor | None = None)-> Float[Tensor, "... d_in"]:
+        latent_acts = self.encode(x)
+        top_acts, top_indices = latent_acts.topk(self.cfg.k, sorted=False)
+
+        # Decode and compute residual
+        sae_out = self.decode_kernel(top_acts, top_indices)
+        e = sae_out - x
+
+        # Used as a denominator for putting everything on a reasonable scale
+        total_variance = (x - x.mean(0)).pow(2).sum(0)
+
+        # Second decoder pass for AuxK loss
+        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+            # Heuristic from Appendix B.1 in the paper
+            k_aux = x.shape[-1] // 2
+
+            # Reduce the scale of the loss if there are a small number of dead latents
+            scale = min(num_dead / k_aux, 1.0)
+            k_aux = min(k_aux, num_dead)
+
+            # Don't include living latents in this loss
+            auxk_latents = torch.where(dead_mask[None], latent_acts, -torch.inf)
+
+            # Top-k dead latents
+            auxk_acts, auxk_indices = auxk_latents.topk(k_aux, sorted=False)
+
+            # Encourage the top ~50% of dead latents to predict the residual of the
+            # top k living latents
+            e_hat = self.decode_kernel(auxk_acts, auxk_indices)
+            auxk_loss = (e_hat - e).pow(2).sum(0)
+            auxk_loss = scale * torch.mean(auxk_loss / total_variance)
+        else:
+            auxk_loss = sae_out.new_tensor(0.0)
+
+        l2_loss = e.pow(2).sum(0)
+        fvu = torch.mean(l2_loss / total_variance)
+        return sae_out
 
     def forward(
         self, 
@@ -528,11 +596,12 @@ class TopKAutoEncoder(AutoEncoderBase):
         assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
 
         x_center = x - self.pre_bias
-        acts = x_center @ self.W_enc + self.latent_bias
+        acts = x_center @ self.W_enc + self.b_enc
         if method == 'with_acts':
             return acts
         
         acts_top_k = self.activation(acts)
+
         x_reconstruct = acts_top_k @ self.W_dec + self.pre_bias
         if method == 'with_loss':
             l2_loss = compute_normalized_mse(x_reconstruct, x)
@@ -582,6 +651,39 @@ class TopKAutoEncoder(AutoEncoderBase):
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
         
+""" 
+class Sae(nn.Module):
+    def __init__(
+        self,
+        d_in: int,
+        cfg: SaeConfig,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.cfg = cfg
+        self.d_in = d_in
+        d_sae = d_in * cfg.expansion_factor
+
+        self.encoder = nn.Linear(d_in, d_sae, device=device, dtype=dtype)
+        self.encoder.bias.data.zero_()
+        self.encoder.weight.data *= 0.1    # Small init means FVU starts below 1.0
+
+        self.W_dec = nn.Parameter(self.encoder.weight.data.clone())
+        if self.cfg.normalize_decoder:
+            self.set_decoder_norm_to_unit_norm()
+
+        self.b_dec = nn.Parameter(torch.zeros(d_in, dtype=dtype, device=device))
+
+    @property
+    def device(self):
+        return self.b_dec.device
+
+    @property
+    def dtype(self):
+        return self.b_dec.dtype """
+
+
 class EMA:
     def __init__(self, model, ema_decay = 0.999):
         self.ema_decay = ema_decay

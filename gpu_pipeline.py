@@ -6,9 +6,9 @@ import pandas as pd
 from autoencoder import AutoEncoderBase
 import torch
 from modal import method, gpu
-from common import stub, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
+from common import app, vol, image, PATH, dataset_vol, LAION_DATASET_PATH
 
-@stub.cls(
+@app.cls(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
     timeout=60*60,

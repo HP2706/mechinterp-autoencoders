@@ -3,7 +3,7 @@ from typing import Union, Optional, List
 import modal
 from modal import gpu, method, build, enter
 from common import (
-    stub, PATH, vol, image, dataset_vol, LAION_DATASET_PATH, 
+    app, PATH, vol, image, dataset_vol, LAION_DATASET_PATH, 
     METADATA_FOLDER, CLIP_MODEL_ID, DIFFUSION_MODEL_ID
 )
 import numpy as np
@@ -93,7 +93,7 @@ def translate(
     return x / x.norm()
 
 
-@stub.cls(
+@app.cls(
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},
     image = image.pip_install('diffusers', 'accelerate' ),
     gpu=gpu.A10G(),    

@@ -1,6 +1,6 @@
 from modal import App, Volume, Image, Secret
 
-stub = App(
+app = App(
     name="autoencoder anthropic", 
     secrets=[
         Secret.from_name("my-gemini-secret"), 

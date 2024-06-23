@@ -6,7 +6,7 @@ from torch.optim import AdamW
 from datamodels import RunMetaData
 from typing import List, Tuple, Union
 from utils import get_model_memory_usage, lm_cross_entropy_loss, get_gpu_memory_usage
-from common import stub, PATH, vol, dataset_vol, LAION_DATASET_PATH,  image, EMB_FOLDER, METADATA_FOLDER
+from common import app, PATH, vol, dataset_vol, LAION_DATASET_PATH,  image, EMB_FOLDER, METADATA_FOLDER
 from modal import Image, Volume, gpu
 import aiohttp
 import asyncio
@@ -38,7 +38,7 @@ def download_laion_file(dir_name: str, destination_folder: str)->bool:
     print("check if it is saved", os.listdir(destination_folder))
     return True
 
-@stub.function(
+@app.function(
     image = image,
     volumes = { LAION_DATASET_PATH: dataset_vol},
     _allow_background_volume_commits = True,
@@ -73,7 +73,7 @@ async def async_download_laion_file(
         print(f"Failed to download {dir_name}: {e}")
         return (False, (dir_name, destination_folder))
     
-@stub.function(
+@app.function(
     image = image,
     volumes = { PATH: vol, LAION_DATASET_PATH: dataset_vol},
     _allow_background_volume_commits = True,

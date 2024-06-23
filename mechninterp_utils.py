@@ -89,17 +89,6 @@ def hist(tensor : torch.Tensor, renderer=None, **kwargs):
     else:
         fig.show(renderer=renderer, config=CONFIG_STATIC if static else CONFIG)
 
-
-
-def scale_dataset(X: torch.Tensor, n: float):
-    '''Computes the expected norm of the dataset row (dim=-1) and normalizes to sqrt(target_norm).'''
-    n_sqrt = math.sqrt(n)
-    norms = torch.norm(X, dim=-1, p=2)  # Compute L2 norm of each row
-    mean_norm = torch.mean(norms).float()
-    scaling_factor = n_sqrt / mean_norm
-    X_scaled = X * scaling_factor  # Scale the dataset
-    return X_scaled
-
 @torch.no_grad()
 def anthropic_resample(
     indices: torch.Tensor,

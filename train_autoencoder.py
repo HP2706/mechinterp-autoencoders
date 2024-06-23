@@ -1,5 +1,5 @@
 from common import (
-    stub, 
+    app, 
     vol, 
     image, 
     EMB_FOLDER,
@@ -12,17 +12,15 @@ import time
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
+from bitsandbytes.optim import Adam8bit
 from Laion_Processing.dataloader import load_loaders
 import wandb
 from autoencoder import (
-    AutoEncoderBase, 
     AutoEncoder,
-    AutoencoderResult,
-    AutoencoderTrainConfig, 
     GatedAutoEncoder,
-    GatedAutoEncoderResult, 
+    AutoEncoderBaseConfig,
+    TopKAutoEncoderConfig,
     TopKAutoEncoder,
-    TopKAutoEncoderModelConfig
 )
 from modal import gpu
 import modal
@@ -31,27 +29,15 @@ from typing import Literal, Optional, Union, cast
 
 from torch.optim import AdamW
 from tqdm import tqdm
+from training_config import AutoencoderTrainConfig
 from utils import get_device
 from _types import Loss_Method
 from mechninterp_utils import hist, anthropic_resample #TODO MOVE THIS TO MECHINTERP UTILS
 from torch.optim.lr_scheduler import StepLR  # Add this import
 
-def save_model(
-    model : Union[GatedAutoEncoder, AutoEncoder], 
-    cfg: AutoencoderTrainConfig,
-    model_dir : str
-):
-    basename = cfg.create_basename()
-    model_path = f'{model_dir}/{basename}'
-    os.makedirs(model_path, exist_ok=True)
-    print("saving model at", model_path)
-    torch.save(model.state_dict(), f"{model_path}/model.pt")
-    with open(f"{model_path}/config.json", "w") as f:
-        f.write(cfg.model_dump_json())
-    vol.commit()
-    print("checkpoint and cfg saved at", f"{model_dir}", os.listdir(model_dir))
 
-@stub.function(
+
+@app.function(
     image = image,
     volumes={PATH: vol, LAION_DATASET_PATH: dataset_vol},   
     timeout=10*60*60, #3 hours
@@ -60,137 +46,92 @@ def save_model(
     _allow_background_volume_commits=True
 )
 def train_autoencoder(
-    model_type: Literal['autoencoder', 'gated_autoencoder', 'topk_autoencoder'], 
-    dict_mult : int,
-    anthropic_resampling : bool = False,
-    anthropic_resample_look_back_steps : int = 12500,#anthropic paper uses this number
-    resampling_dataset_size : int = 819200, #anthropic paper uses this number
-    resampling_interval : Optional[int] = int(2.5*10**4),
-    steps: int = 10**5, # 100 k steps as per anthropic paper
-    save_interval : int = 10**4, # we save the model every save_interval steps
-    test_steps : int = 25*10**3,
-    with_ramp: bool = True,
-    max_l_coef : float = 5,
-    loss_func: Loss_Method = 'with_loss',
-    retrain_path : Optional[str] = None,
-    sched_lr_factor : Optional[float] = None,
-    wandb_log : bool = True,
-    top_k : Optional[int] = None,
-    top_k_aux : Optional[int] = None
+    train_cfg : AutoencoderTrainConfig,
+    model_cfg : Union[AutoEncoderBaseConfig, TopKAutoEncoderConfig],
+    retrain_path : Optional[str] = None
 ):
-    if with_ramp and loss_func == 'with_loss':
-        print("with_ramp does not work for the with_loss loss function disabling it")
-        with_ramp = False
-
-    if retrain_path is not None:
-        model = AutoEncoderBase.load_from_checkpoint(retrain_path)
+    if model_cfg is None:
+        if retrain_path is None:
+            raise ValueError("model_cfg or retrain_path must be provided")
+        
+        model_type = train_cfg.type
+        if model_type == "autoencoder":
+            model, train_cfg = AutoEncoder.load_from_checkpoint(retrain_path)
+        elif model_type == "gated_autoencoder":
+            model, train_cfg = GatedAutoEncoder.load_from_checkpoint(retrain_path)
+        elif model_type == "topk_autoencoder":
+            model, train_cfg = TopKAutoEncoder.load_from_checkpoint(retrain_path)
+        else:
+            raise ValueError(f"model_type {model_type} not recognized")
         model_dir = retrain_path
         print("retraining model")
-        print("additional training steps", steps-model.metadata_cfg.n_steps)
-        cfg = model.metadata_cfg
-    else:
-        d_mlp = 768 
+        #TODO configure wandb to log to same project as original run
+
+    else: 
+        assert train_cfg.type == model_cfg.type, f"train_cfg.type {train_cfg.type} does not match model_cfg.type {model_cfg.type}"
         paths = [os.path.join(EMB_FOLDER, p) for p in os.listdir(EMB_FOLDER)]
         train_files = paths[:int(len(paths)*0.8)]
         test_files = paths[int(len(paths)*0.8):]
-
-        cfg = AutoencoderTrainConfig(
-            wandb_log=wandb_log,
-            seed=42,
-            batch_size=4096, #2048 or 4096
-            buffer_mult=10,
-            lr=0.0012, 
-            l1_coeff=0 if with_ramp else 10e-3, 
-            beta1=0.9,
-            beta2=0.999,
-            dict_mult=dict_mult,
-            with_ramp=with_ramp,
-            loss_func=loss_func,
-            seq_len=512,
-            d_mlp=d_mlp,
-            buffer_size=1000000,
-            buffer_batches=25,
-            device=get_device(), # type: ignore
-            n_epochs=0, # inital epochs are 0 but gradually increasing
-            training_set=train_files,
-            validation_set=test_files,
-            n_steps=0,
-            type=model_type,
-            updated_anthropic_method=True if loss_func=='with_new_loss' else False,
-            anthropic_resampling=anthropic_resampling,
-            anthropic_resample_look_back_steps=anthropic_resample_look_back_steps if anthropic_resampling else None,
-            sched_lr_factor=sched_lr_factor
-        )
-
-        if model_type == "gated_autoencoder":
-            model = GatedAutoEncoder(cfg)
-        elif model_type == "autoencoder":
-            model = AutoEncoder(cfg)
-        elif model_type == "topk_autoencoder":
-            if top_k is None or top_k_aux is None:
-                raise ValueError("top_k and top_k_aux must both be provided when using topk_autoencoder")
-
-            model_cfg = TopKAutoEncoderModelConfig(
-                k = top_k, #TODO let user set
-                k_aux = top_k_aux,
-                **cfg.model_dump()
-            )
-            model = TopKAutoEncoder(model_cfg)
+        
+        if model_cfg.type == "autoencoder":
+            model = AutoEncoder(model_cfg)
+        elif model_cfg.type == "gated_autoencoder":
+            model = GatedAutoEncoder(model_cfg)
+        elif model_cfg.type == "topk_autoencoder":
+            model = TopKAutoEncoder(model_cfg) #type: ignore
         else:
             raise ValueError(f"type {type} not recognized")
     
-    """ model = cast(
-        Union[GatedAutoEncoder, AutoEncoder, TopKAutoEncoder], 
-        torch.compile(model)
-    ) """
-
     def resample_at_step_idx()->bool:
-        if resampling_interval is None:
+        if train_cfg.resampling_interval is None:
             return False
         else:
-            return step % resampling_interval == 0    
+            return step % train_cfg.resampling_interval == 0    
 
     def anthropic_resampling_at_step_idx()->bool:
-        if anthropic_resampling:
-            return step % anthropic_resample_look_back_steps == 0
+        if train_cfg.anthropic_resampling and train_cfg.anthropic_resample_look_back_steps is not None:
+            return step % train_cfg.anthropic_resample_look_back_steps == 0
         else:
             return False
 
-    model_dir = f"{PATH}/laion2b_autoencoders/{cfg.folder_name}"
+    model_dir = f"{PATH}/laion2b_autoencoders/{model.cfg.folder_name}"
     os.makedirs(model_dir, exist_ok=True)
     vol.commit()
 
-    if wandb_log:
+    if train_cfg.wandb_log:
         wandb.login(key=os.getenv('WANDB_API_KEY'))
         wandb.init(
             # set the wandb project where this run will be logged
             project="Sparse AutoEncoder",
             # track hyperparameters and run metadata
-            name = cfg.folder_name,
+            name = model.cfg.folder_name,
             config={
-                "learning_rate": cfg.lr,
-                "architecture": model_type,
+                "learning_rate": train_cfg.lr,
+                "architecture": train_cfg.type,
                 "dataset": "Laion2B",
-                "epochs": cfg.n_epochs,
+                "epochs": train_cfg.n_epochs,
             }
         )
 
     train_loader, test_loader = load_loaders(
-        batch_size=(cfg.batch_size, 4*cfg.batch_size), 
+        batch_size=(train_cfg.batch_size, 4*train_cfg.batch_size), 
         emb_folder=EMB_FOLDER,
         train_share=0.8,
-        d_hidden = model.W_dec.shape[0] if cfg.updated_anthropic_method else None,
+        d_hidden = model.W_dec.shape[0], #TODO what is this variable again?
         n_counts=(None, 5)
     )
 
-    model.to(model.cfg.device)
+    model.to(train_cfg.device)
     fused_available = 'fused' in inspect.signature(AdamW).parameters
     use_fused = fused_available and torch.cuda.is_available()
-    optimizer = AdamW(model.parameters(), lr=cfg.lr, fused=use_fused)
+    if train_cfg.adam8bit:
+        optimizer = Adam8bit(model.parameters(), lr=train_cfg.lr)
+    else:
+        optimizer = AdamW(model.parameters(), lr=train_cfg.lr, fused=use_fused)
     
     scheduler = StepLR(
-        optimizer, step_size=cfg.batch_size*100, gamma=sched_lr_factor
-    ) if sched_lr_factor is not None else None
+        optimizer, step_size=train_cfg.batch_size*100, gamma=train_cfg.sched_lr_factor
+    ) if train_cfg.sched_lr_factor is not None else None
 
     if retrain_path is None:
         step = 0
@@ -201,28 +142,27 @@ def train_autoencoder(
     last_resampling_step_idx = step
 
     #TODO think about effects of retraining here if model.cfg_metadata.l1_coeff is below max_l_coef
-    l1_ramp = max_l_coef / ((steps // 100)*5 )
+    l1_ramp = train_cfg.max_l_coef / ((train_cfg.n_steps // 100)*5 )
     # we linearly increase l1_coeff from 0 to 5 
     #over the first 5% of the total steps as per anthropic paper
-
     running_frequency_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.int, device=model.cfg.device)
     ema_running_counter = torch.zeros(model.W_dec.shape[0], dtype=torch.float32, device=model.cfg.device)
 
     # Define the decay factor for the EMA
-    decay = 0.99  # You can adjust this value
+    decay = 0.99 
 
     #did_fire_last_10_k_steps = torch.zeros(model.W_dec.shape[0], dtype=torch.bool) #TODO is this needed?
 
     times = []
-    with tqdm(total=steps, desc="Training Progress") as pbar:
-        while step < steps:
+    with tqdm(total=train_cfg.n_steps, desc="Training Progress") as pbar:
+        while step < train_cfg.n_steps:
             model.train()
             for batch in train_loader: 
                 step += 1
                 t0 = time.time()
                 # Update l1_coeff linearly over the first 5% of the total steps
-                if with_ramp:
-                    if model.l1_coeff <= max_l_coef:
+                if train_cfg.with_ramp:
+                    if model.l1_coeff <= train_cfg.max_l_coef:
                         model.l1_coeff += l1_ramp 
 
                 batch = batch.to(model.cfg.device)
@@ -230,26 +170,21 @@ def train_autoencoder(
 
                 optimizer.zero_grad()
                 #with torch.autocast(model.cfg.device):
-                if model_type == "topk_autoencoder":
+                if train_cfg.type == "topk_autoencoder":
                     result = model.forward(
                         batch, 
-                        method=loss_func, # type: ignore
+                        method=train_cfg.loss_func, # type: ignore
                         ema_frequency_counter=ema_running_counter # type: ignore
                     ) 
                 else:
-                    result = model.forward(batch, method=loss_func) # type: ignore
+                    result = model.forward(batch, method=train_cfg.loss_func) # type: ignore
                 running_frequency_counter += result.did_fire
 
                 # Update the EMA
                 ema_running_counter = decay * ema_running_counter + (1 - decay) * running_frequency_counter.float()
-                print('result.x_reconstruct', result.x_reconstruct)
-                print('result.x_reconstruct', torch.isnan(result.x_reconstruct).any() or torch.isneginf(result.x_reconstruct).any())
-                print('result.loss', torch.isnan(result.loss).any() or torch.isneginf(result.loss).any())
                 result.loss.backward()
 
                 clip_grad_norm_(model.parameters(), max_norm=1) 
-                # clip grad norm as per anthropic https://transformer-circuits.pub/2024/april-update/index.html#training-saes 
-                
                 model.remove_parallel_component_of_grads()
                 optimizer.step()
                 if scheduler:
@@ -274,22 +209,22 @@ def train_autoencoder(
                     **result.format_data()
                 }
 
-                if not cfg.updated_anthropic_method:
-                    with torch.no_grad():
-                        # Renormalize W_dec to have unit norm
-                        norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
-                        model.W_dec.data /= (norms + 1e-6) 
+                with torch.no_grad():
+                    # Renormalize W_dec to have unit norm
+                    norms = torch.norm(model.W_dec.data, dim=1, keepdim=True)
+                    model.W_dec.data /= (norms + 1e-6) 
 
-                if step % save_interval == 0:
+                if step % train_cfg.save_interval == 0:
                     print("saving model at step", step)
-                    save_model(model, cfg, model_dir)
-                cfg.n_steps = step
-                cfg.l1_coeff = model.l1_coeff
+                    model.save_model(train_cfg, model_dir)
+                
+                train_cfg.n_steps = step
+                train_cfg.l1_coeff = model.l1_coeff
 
                 if resample_at_step_idx():
                     #TODO use exponetial moving average(ema) instead??
                     current_frequency_counter = running_frequency_counter / (
-                        cfg.batch_size * (
+                        train_cfg.batch_size * (
                         step - last_resampling_step_idx)
                     )
 
@@ -305,12 +240,12 @@ def train_autoencoder(
                         showlegend = False
                     )
                     metrics["frequency_histogram"] = fig
-                    if not anthropic_resampling:
+                    if not train_cfg.anthropic_resampling:
                         running_frequency_counter = torch.zeros_like(running_frequency_counter) # reset running counter to all zeros
                 
                 if anthropic_resampling_at_step_idx():
                     print("resampling at step", step)
-                    if cfg.wandb_log:
+                    if train_cfg.wandb_log:
                         wandb.log({'resample_step' : step})
                     indices = (running_frequency_counter == 0).nonzero(as_tuple=False)[:, 0]
                     if len(indices) > 0:
@@ -320,7 +255,7 @@ def train_autoencoder(
                             model=model,
                             optimizer=optimizer,
                             sched = scheduler,
-                            resampling_dataset_size=resampling_dataset_size,
+                            resampling_dataset_size=train_cfg.resampling_dataset_size,
                             resample_factor=0.2,
                             bias_resample_factor=0.2
                         )
@@ -332,12 +267,12 @@ def train_autoencoder(
                     else:
                         print("no indices to resample")
 
-                if cfg.wandb_log:
+                if train_cfg.wandb_log:
                     wandb.log(metrics)
                 
                 pbar.update(1)
 
-                if step % test_steps == 0:
+                if step % train_cfg.test_steps == 0:
                     model.eval()
                     with torch.no_grad():
                         for batch in tqdm(test_loader, desc="Testing"): # we only use fraction
@@ -346,12 +281,12 @@ def train_autoencoder(
                                 result = model.forward(batch, method="with_loss", ema_frequency_counter=ema_running_counter)
                             else:
                                 result = model.forward(batch, method="with_loss")
-                            if cfg.wandb_log:
+                            if train_cfg.wandb_log:
                                 wandb.log(
                                     {
                                     f'test_{key}': value for key, value in result.format_data().items()
                                 }) 
                             else:
                                 print(result.format_data())
-                cfg.n_epochs += 1
+                train_cfg.n_epochs += 1
 
