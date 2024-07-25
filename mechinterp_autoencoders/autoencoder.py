@@ -1,5 +1,6 @@
 from torch.optim import Optimizer
 from tqdm import tqdm
+from contextlib import contextmanager
 from typing import Optional
 import torch
 from torch import Tensor, nn
@@ -23,29 +24,38 @@ class AutoEncoder(AutoEncoderBase):
         super().__init__(cfg)
         self.d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.W_enc = torch.randn(self.cfg.d_input, self.d_hidden, dtype=self.cfg.enc_dtype)
-        self.pre_bias = torch.randn(self.cfg.d_input, dtype=self.cfg.enc_dtype)
-        self.W_dec = torch.randn(self.d_hidden, self.cfg.d_input, dtype=self.cfg.enc_dtype)
-        self.b_enc = torch.randn(self.d_hidden, dtype=self.cfg.enc_dtype)
+        self.W_enc = torch.randn(self.cfg.d_input, self.d_hidden, dtype=self.cfg.dtype)
+        self.pre_bias = torch.randn(self.cfg.d_input, dtype=self.cfg.dtype)
+        self.W_dec = torch.randn(self.d_hidden, self.cfg.d_input, dtype=self.cfg.dtype)
+        self.b_enc = torch.randn(self.d_hidden, dtype=self.cfg.dtype)
         self.activation = nn.ReLU()
         self.l1_coeff = cfg.l1_coeff
         self.to(self.cfg.device) # move to device
         
-    
+    @contextmanager
     def _prepare_params(self, feature_indices: Optional[slice]):
         if feature_indices is None:
-            return self.W_enc, self.pre_bias, self.W_dec, self.b_enc
-        
-        W_enc = self.W_enc[feature_indices, :]
-        pre_bias = self.pre_bias[feature_indices]
-        W_dec = self.W_dec[:, feature_indices]
-        b_enc = self.b_enc
-        return W_enc, pre_bias, W_dec, b_enc
+            yield
+        else:
+            original_W_enc = self.W_enc
+            original_pre_bias = self.pre_bias
+            original_W_dec = self.W_dec
+            
+            self.W_enc = self.W_enc[feature_indices, :]
+            self.pre_bias = self.pre_bias[feature_indices]
+            self.W_dec = self.W_dec[:, feature_indices]
+            
+            try:
+                yield
+            finally:
+                self.W_enc = original_W_enc
+                self.pre_bias = original_pre_bias
+                self.W_dec = original_W_dec
 
     def encode(self, x: Tensor, feature_indices: Optional[slice] = None) -> Tensor:
-        W_enc, pre_bias, W_dec, b_enc = self._prepare_params(feature_indices)
-        x_center = x - pre_bias
-        acts = self.activation(x_center @ W_enc + b_enc)
+        with self._prepare_params(feature_indices):
+            x_center = x - self.pre_bias
+            acts = self.activation(x_center @ self.W_enc + self.b_enc)
         return acts
 
     def forward(
@@ -54,41 +64,42 @@ class AutoEncoder(AutoEncoderBase):
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, dict]:
-        W_enc, pre_bias, W_dec, b_enc = self._prepare_params(feature_indices)
-        acts = self.encode(x, feature_indices)
-        if method == 'with_acts':
-            return acts
+        with self._prepare_params(feature_indices):
+            acts = self.encode(x, feature_indices)
+            if method == 'with_acts':
+                return acts
 
-        x_reconstruct = acts @ W_dec + pre_bias
-        if method in ['with_loss', 'with_new_loss']:
-            l2_loss = normalized_L1_loss(x_reconstruct, x)
-            if method == 'with_loss':
-                L_sparse = l1_norm(acts)
+            x_reconstruct = acts @ self.W_dec + self.pre_bias
+            if method in ['with_loss', 'with_new_loss']:
+                l2_loss = normalized_L1_loss(x_reconstruct, x)
+                if method == 'with_loss':
+                    L_sparse = l1_norm(acts)
+                else:
+                    L_sparse = (acts.abs() * torch.norm(self.W_dec, dim=-1)).sum()
+                
+                loss = l2_loss + (self.l1_coeff * L_sparse)
+                
+                return {
+                    "loss": loss, 
+                    "x_reconstruct": x_reconstruct, 
+                    "acts": acts, 
+                    "acts_sum": acts.sum(1).mean(),
+                    "l2_loss": l2_loss, 
+                    "l_sparsity": L_sparse,
+                    "l1_loss": mean_absolute_error(x_reconstruct, x),
+                    "normalized_l1_loss": normalized_L1_loss(acts, x),
+                    "l0_norm": l0_norm(acts),
+                    "did_fire": did_fire(acts),
+                    "avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
+                }
+            elif method == 'reconstruct':
+                return x_reconstruct
             else:
-                L_sparse = (acts.abs() * torch.norm(W_dec, dim=-1)).sum()
-            
-            loss = l2_loss + (self.l1_coeff * L_sparse)
-            
-            return {
-                "loss": loss, 
-                "x_reconstruct": x_reconstruct, 
-                "acts": acts, 
-                "acts_sum": acts.sum(1).mean(),
-                "l2_loss": l2_loss, 
-                "l_sparsity": L_sparse,
-                "l1_loss": mean_absolute_error(x_reconstruct, x),
-                "normalized_l1_loss": normalized_L1_loss(acts, x),
-                "l0_norm": l0_norm(acts),
-                "did_fire": did_fire(acts),
-                "avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
-            }
-        elif method == 'reconstruct':
-            return x_reconstruct
-        else:
-            raise ValueError(f"Invalid method: {method}")
+                raise ValueError(f"Invalid method: {method}")
         
-    def decode(self, acts : Tensor) -> Tensor:
-        return acts @ self.W_dec + self.pre_bias
+    def decode(self, acts : Tensor, feature_indices: Optional[slice] = None) -> Tensor:
+        with self._prepare_params(feature_indices):
+            return acts @ self.W_dec + self.pre_bias
     
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):

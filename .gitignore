@@ -1,2 +1,4 @@
 *.cpython
 *.pyc
+__pycache__
+main.py

@@ -14,8 +14,8 @@ class AutoEncoderBaseConfig(BaseModel):
     dict_mult: int
     d_input: int 
     seed: int = 42
-    enc_dtype: torch.dtype = torch.float32
-    device: torch.device = torch.device('cuda')
+    dtype: torch.dtype = torch.float32
+    device: torch.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     updated_anthropic_method : bool = True
 
     class Config:
@@ -24,17 +24,12 @@ class AutoEncoderBaseConfig(BaseModel):
     @property
     def d_sae(self):
         return self.d_input * self.dict_mult
-
-    @property 
-    def dtype(self):
-        return torch.float32 if self.enc_dtype == 'fp32' else torch.float16
     
     @property
     def save_name(self) -> str:
         #name to save
         name = self.__class__.__name__
         return f'{name}_d_hidden_{self.d_input * self.dict_mult}_dict_mult_{self.dict_mult}'
-
 
 class AutoEncoderBase(nn.Module, ABC):
     def __init__(self, cfg : AutoEncoderBaseConfig):
