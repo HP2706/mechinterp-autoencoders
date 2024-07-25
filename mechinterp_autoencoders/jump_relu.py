@@ -55,7 +55,7 @@ class JumpReLUModule(nn.Module):
 
 class JumpReLUAutoEncoder(BaseAutoEncoder):
     cfg: JumpReLUAutoEncoderConfig
-    
+
     def __init__(
         self, 
         cfg : JumpReLUAutoEncoderConfig
@@ -65,6 +65,7 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
         self.initialize_weights()
         threshold = math.exp(self.cfg.log_threshold)
         self.jump_relu = JumpReLUModule(threshold, self.cfg.bandwidth)
+        self.to(self.cfg.dtype)
 
     @jaxtyped(typechecker=beartype)
     def encode_pre_act(

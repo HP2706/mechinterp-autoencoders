@@ -40,7 +40,19 @@ _JumpReLUConfig = JumpReLUAutoEncoderConfig(
     ]
 )
 def test_forward(model, method):
-    if isinstance(model, TopKAutoEncoder):
-        model.forward(torch.randn(10, 10), ema_frequency_counter=torch.randn(model.cfg.d_sae), method='with_loss')
+
+    if model.cfg.use_kernel:
+        #we enfore sparsity by setting 90% of the values to zero
+        x = torch.zeros(10, 10)
+        indices = torch.randint(0, 10, (2,))
+        x[:, indices] = torch.randn(indices.shape)
     else:
-        model.forward(torch.randn(10, 10), method=method)
+        x = torch.randn(10, 10)
+
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    x = x.to(device).to(model.cfg.dtype)
+    model = model.to(device).to(model.cfg.dtype)
+    if isinstance(model, TopKAutoEncoder):
+        model.forward(x, ema_frequency_counter=torch.randn(model.cfg.d_sae, device=device, dtype=model.cfg.dtype), method='with_loss')
+    else:
+        model.forward(x, method=method)

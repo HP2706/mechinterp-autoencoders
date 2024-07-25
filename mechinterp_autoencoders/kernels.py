@@ -407,7 +407,7 @@ class TritonDecoder(torch.autograd.Function):
     def forward(ctx, sparse_indices, sparse_values, decoder_weight):
         ctx.save_for_backward(sparse_indices, sparse_values, decoder_weight)
         return triton_sparse_dense_matmul(
-            sparse_indices, sparse_values, decoder_weight.T
+            sparse_indices, sparse_values, decoder_weight.T.contiguous()
         )
 
     @staticmethod

@@ -5,3 +5,8 @@ pytest
 beartype
 tqdm
 pydantic
+Pillow
+requests
+openai
+anthropic
+instructor

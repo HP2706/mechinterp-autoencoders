@@ -10,6 +10,8 @@ from torch.optim import Optimizer
 from jaxtyping import Float
 from tqdm import tqdm
 from contextlib import contextmanager
+
+from utils import extract_nonzero
 if torch.cuda.is_available():
     from .kernels import TritonDecoder
 
@@ -166,11 +168,10 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         W_dec : (d_sae, d_input)
         b_enc : (d_sae)
         '''
-        self.W_enc = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.cfg.d_input, self.d_sae, dtype=self.cfg.dtype)))
-        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.d_sae, self.cfg.d_input, dtype=self.cfg.dtype)))
-        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype)) # initialize to zero
-        self.b_enc = nn.Parameter(torch.zeros(self.cfg.d_sae, dtype=self.cfg.dtype)) # initialize to zero
-
+        self.W_enc = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.cfg.d_input, self.d_sae, dtype=self.cfg.dtype)).contiguous())
+        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.d_sae, self.cfg.d_input, dtype=self.cfg.dtype)).contiguous())
+        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype).contiguous())
+        self.b_enc = nn.Parameter(torch.zeros(self.d_sae, dtype=self.cfg.dtype).contiguous())
         if self.cfg.tie_w_dec:
             self.tie_weights()
 
@@ -207,8 +208,8 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         '''
         with self._prepare_params(acts, feature_indices):
             if self.cfg.use_kernel and torch.cuda.is_available():
-                non_zero_indices = torch.nonzero(acts)
-                y = TritonDecoder.apply(non_zero_indices, acts.to(self.cfg.dtype), self.W_dec)
+                non_zero_values, non_zero_indices = extract_nonzero(acts)
+                y = TritonDecoder.apply(non_zero_indices, non_zero_values.to(self.cfg.dtype), self.W_dec)
                 return y + self.pre_bias
             return acts @ self.W_dec + self.pre_bias
     

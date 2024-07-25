@@ -1,4 +1,3 @@
-from click import Abort
 import torch
 from contextlib import contextmanager
 import torch.nn as nn
@@ -32,7 +31,11 @@ class TopKActivationFn(nn.Module):
         self.k_aux = k_aux
         self.postact_fn = postact_fn
 
-    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+    @jaxtyped(typechecker=beartype)
+    def forward(
+        self, 
+        x: Float[Tensor, "batch d_in"]
+    ) -> tuple[Float[Tensor, "batch d_in"], Int[Tensor, "batch d_sae"]]:
         #we assume the relu already has been applied
         topk = torch.topk(x, k=self.k, dim=-1)
         values = self.postact_fn(topk.values)
@@ -40,11 +43,17 @@ class TopKActivationFn(nn.Module):
         result.scatter_(-1, topk.indices, values)
         return result, topk.indices
 
-    def forward_aux(self, x: Tensor, ema_frequency_counter: Tensor) -> tuple[Tensor, Tensor]:
+    @jaxtyped(typechecker=beartype)
+    def forward_aux(
+        self, 
+        x: Float[Tensor, "batch d_in"], 
+        ema_frequency_counter: Float[Tensor, "d_sae"]
+    ) -> tuple[Float[Tensor, "batch d_in"], Int[Tensor, "batch top_k"]]:
         topk = torch.topk(
             ema_frequency_counter, 
             k=self.k_aux, 
             dim=-1, 
+            largest=False #NOTE we want the least used features
         )
         dead_features = x[:, topk.indices] 
         values = self.postact_fn(dead_features)
@@ -63,8 +72,7 @@ class TopKAutoEncoder(BaseAutoEncoder):
         torch.manual_seed(cfg.seed)
         self.initialize_weights()
         self.activation = TopKActivationFn(k=cfg.k, k_aux=cfg.k_aux)
-        if self.cfg.tie_w_dec:
-            self.tie_weights()
+        self.to(self.cfg.dtype)
 
     @jaxtyped(typechecker=beartype)
     def encode_pre_act(
@@ -97,7 +105,7 @@ class TopKAutoEncoder(BaseAutoEncoder):
         acts: Float[Tensor, "batch d_sae"],
         non_zero_indices: Int[Tensor, "..."],
         feature_indices: Optional[slice] = None
-    )-> Float[Tensor, "batch d_in"]:
+    )-> Float[Tensor, "batch d_in"]:        
         with self._prepare_params(acts, feature_indices):
             if self.cfg.use_kernel:
                 #use custom kernel
@@ -106,7 +114,14 @@ class TopKAutoEncoder(BaseAutoEncoder):
                     acts: the activations of the topk
                     non_zero_indices: the indices of the non-zero elements in the activations after topk(this is necessary for sparsity)
                 '''
-                y = TritonDecoder.apply(non_zero_indices, acts.to(self.cfg.dtype), self.W_dec)
+                top_k_acts = acts.gather(1, non_zero_indices).reshape(non_zero_indices.shape[0], -1)
+
+                assert non_zero_indices.shape == top_k_acts.shape, f"expected non_zero_indices.shape == top_k_acts.shape, got {non_zero_indices.shape} != {top_k_acts.shape}"
+                y = TritonDecoder.apply(
+                    non_zero_indices.contiguous(),
+                    top_k_acts.to(self.cfg.dtype).contiguous(), 
+                    self.W_dec.contiguous()
+                )
                 return y + self.pre_bias
             else:
                 return acts @ self.W_dec + self.pre_bias
