@@ -2,7 +2,7 @@ import os
 from click import Option
 from pydantic import BaseModel, Field, field_validator
 from typing import Any, List, Optional, Literal, Protocol, Union, overload, runtime_checkable
-from utils import format_image_anthropic, format_image_openai
+from mechinterp_autoencoders.utils import format_image_anthropic, format_image_openai
 import torch
 
 class AnthropicResample(BaseModel):

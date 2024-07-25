@@ -3,6 +3,7 @@ from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, Gat
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
 from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
+from mechinterp_autoencoders.utils import extract_nonzero
 import torch
 
 _AutoEncoderConfig = AutoEncoderConfig(
@@ -56,3 +57,10 @@ def test_forward(model, method):
         model.forward(x, ema_frequency_counter=torch.randn(model.cfg.d_sae, device=device, dtype=model.cfg.dtype), method='with_loss')
     else:
         model.forward(x, method=method)
+
+def test_extract_nonzero():
+    x = torch.randn(1000, 10)
+    values, indices = extract_nonzero(x)
+    assert values.shape == indices.shape == (1000, 10)
+    new_x = torch.gather(x, 1, indices)
+    assert torch.allclose(new_x, values, atol=1e-5), f'new_x == values, {(new_x == values)}'

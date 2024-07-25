@@ -4,10 +4,45 @@ from typing import Union
 from PIL import Image
 import io
 import base64
+import beartype
 import requests
 import torch
+from jaxtyping import Float, jaxtyped, Int
+from beartype import beartype
+from torch import Tensor
 
-def extract_nonzero(x):
+@jaxtyped(typechecker=beartype)
+def extract_nonzero(
+    x: Float[Tensor, "batch_size seq_len"]
+) -> tuple[Float[Tensor, "batch_size a"], Int[Tensor, "batch_size a"]]:
+    batch_size, seq_len = x.shape
+    mask = (x.abs() > 1e-5).long()
+    a = int(mask.sum(1).max().item())
+    
+    torch.zeros(batch_size, a, device=x.device)
+    non_zero_idxs = torch.nonzero(mask)
+    row_counts = torch.bincount(non_zero_idxs[:, 0], minlength=batch_size)
+    padding_count = a - row_counts
+
+    # Correct way to get zero indices
+    values = torch.zeros(batch_size, a, device=x.device, dtype=x.dtype)
+    indices = torch.zeros(batch_size, a, device=x.device, dtype=torch.long)
+
+    # crazy vectorized way to get the indices
+    # what are you not willing to do to avoid a for loop in python:)
+    free_mask = (mask == 0) & (torch.arange(seq_len, device=x.device).unsqueeze(0) < padding_count.unsqueeze(1))
+    non_zero_mask = mask.bool()
+    indices = torch.where(free_mask, torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1), 
+                      torch.where(non_zero_mask, torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1), 
+                                  torch.zeros(batch_size, seq_len, device=x.device, dtype=torch.long)))
+
+    indices = indices[:, :a]  # Truncate to shape (batch_size, a)
+
+    values = x.gather(1, indices)
+    return values, indices
+
+
+def extract_nonzero_for_loop(x):
     batch_size, seq_len = x.shape
     mask = (x.abs() > 1e-5).long()
     a = mask.sum(1).max().item()

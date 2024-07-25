@@ -10,8 +10,8 @@ from torch.optim import Optimizer
 from jaxtyping import Float
 from tqdm import tqdm
 from contextlib import contextmanager
+from mechinterp_autoencoders.utils import extract_nonzero
 
-from utils import extract_nonzero
 if torch.cuda.is_available():
     from .kernels import TritonDecoder
 
