@@ -1,59 +1,36 @@
-from torch.optim import Optimizer
-from tqdm import tqdm
-from contextlib import contextmanager
+from beartype import beartype
 from typing import Optional
 import torch
 from torch import Tensor, nn
-from pydantic import BaseModel, model_validator, Field
-from torch.nn import functional as F
-from typing import Callable, Union, Literal, List, Any, Type, TypeVar
-from jaxtyping import Float, Int
-from .base_autoencoder import AutoEncoderBase, AutoEncoderBaseConfig
+from typing import  Union, Literal, TypeVar
+from jaxtyping import Float, jaxtyped
+from .base_autoencoder import BaseAutoEncoder, AutoEncoderBaseConfig, AbstractAutoEncoder
 from .compute_metrics import normalized_L1_loss, l1_norm, mean_absolute_error, l0_norm, did_fire, avg_num_firing_per_neuron
-
-T = TypeVar('T', bound='AutoEncoderBase')
 
 class AutoEncoderConfig(AutoEncoderBaseConfig):
     l1_coeff : float
 
-class AutoEncoder(AutoEncoderBase):
+class AutoEncoder(BaseAutoEncoder):
     def __init__(
         self, 
         cfg : AutoEncoderConfig
     ):
-        super().__init__(cfg)
+        super().__init__()
+        self.cfg = cfg
         self.d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.W_enc = torch.randn(self.cfg.d_input, self.d_hidden, dtype=self.cfg.dtype)
-        self.pre_bias = torch.randn(self.cfg.d_input, dtype=self.cfg.dtype)
-        self.W_dec = torch.randn(self.d_hidden, self.cfg.d_input, dtype=self.cfg.dtype)
-        self.b_enc = torch.randn(self.d_hidden, dtype=self.cfg.dtype)
+        self.initialize_weights()
         self.activation = nn.ReLU()
         self.l1_coeff = cfg.l1_coeff
         self.to(self.cfg.device) # move to device
-        
-    @contextmanager
-    def _prepare_params(self, feature_indices: Optional[slice]):
-        if feature_indices is None:
-            yield
-        else:
-            original_W_enc = self.W_enc
-            original_pre_bias = self.pre_bias
-            original_W_dec = self.W_dec
-            
-            self.W_enc = self.W_enc[feature_indices, :]
-            self.pre_bias = self.pre_bias[feature_indices]
-            self.W_dec = self.W_dec[:, feature_indices]
-            
-            try:
-                yield
-            finally:
-                self.W_enc = original_W_enc
-                self.pre_bias = original_pre_bias
-                self.W_dec = original_W_dec
 
-    def encode(self, x: Tensor, feature_indices: Optional[slice] = None) -> Tensor:
-        with self._prepare_params(feature_indices):
+    @jaxtyped(typechecker=beartype)
+    def encode(
+        self, 
+        x: Float[Tensor, "batch_size d_input"], 
+        feature_indices: Optional[slice] = None
+    ) -> Float[Tensor, "batch_size d_hidden"]:
+        with self._prepare_params(x, feature_indices):
             x_center = x - self.pre_bias
             acts = self.activation(x_center @ self.W_enc + self.b_enc)
         return acts
@@ -64,12 +41,12 @@ class AutoEncoder(AutoEncoderBase):
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, dict]:
-        with self._prepare_params(feature_indices):
+        with self._prepare_params(x, feature_indices):
             acts = self.encode(x, feature_indices)
             if method == 'with_acts':
                 return acts
 
-            x_reconstruct = acts @ self.W_dec + self.pre_bias
+            x_reconstruct = self.decode(acts, feature_indices)
             if method in ['with_loss', 'with_new_loss']:
                 l2_loss = normalized_L1_loss(x_reconstruct, x)
                 if method == 'with_loss':
@@ -97,23 +74,3 @@ class AutoEncoder(AutoEncoderBase):
             else:
                 raise ValueError(f"Invalid method: {method}")
         
-    def decode(self, acts : Tensor, feature_indices: Optional[slice] = None) -> Tensor:
-        with self._prepare_params(feature_indices):
-            return acts @ self.W_dec + self.pre_bias
-    
-    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
-        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
-            for v_key in ["exp_avg", "exp_avg_sq"]:
-                if dict_idx == 0:
-                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
-                    v[v_key][indices, :] = 0.0
-                elif dict_idx == 1:
-                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
-                    v[v_key][:, indices] = 0.0
-                elif dict_idx == 2:
-                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
-                    v[v_key][indices] = 0.0
-                elif dict_idx == 3:
-                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
-                else:
-                    raise ValueError(f"Unexpected dict_idx {dict_idx}")

@@ -8,6 +8,10 @@ import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
 from jaxtyping import Float
+from tqdm import tqdm
+from contextlib import contextmanager
+if torch.cuda.is_available():
+    from .kernels import TritonDecoder
 
 class AutoEncoderBaseConfig(BaseModel):
     '''Base config for all autoencoders'''
@@ -17,7 +21,8 @@ class AutoEncoderBaseConfig(BaseModel):
     dtype: torch.dtype = torch.float32
     device: torch.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     tie_w_dec: bool = True #whether to tie encoder decoder weights at initialization
-
+    use_kernel: bool = True #uses a custom cuda kernel for sparse_dense matmul if cuda is available
+    use_pre_enc_bias: bool = True #uses a pre-bias for the encoder
     class Config:
         arbitrary_types_allowed = True
     
@@ -31,11 +36,8 @@ class AutoEncoderBaseConfig(BaseModel):
         name = self.__class__.__name__
         return f'{name}_d_hidden_{self.d_input * self.dict_mult}_dict_mult_{self.dict_mult}'
 
-class AutoEncoderBase(nn.Module, ABC):
-    def __init__(self, cfg : AutoEncoderBaseConfig):
-        super().__init__()
-        self.cfg = cfg
-
+class AbstractAutoEncoder(nn.Module, ABC):
+    
     @abstractmethod
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):...
 
@@ -52,7 +54,7 @@ class AutoEncoderBase(nn.Module, ABC):
         pass
 
     @abstractmethod
-    def _prepare_params(self, feature_indices: Optional[slice]):
+    def _prepare_params(self, x: Tensor, feature_indices: Optional[slice]):
         '''
         this is useful for when you only want to look at a 
         subset of the weights to save compute
@@ -144,3 +146,85 @@ class AutoEncoderBase(nn.Module, ABC):
         if train_cfg is not None:
             checkpoint['train_config'] = train_cfg
         torch.save(checkpoint, save_path)
+
+class BaseAutoEncoder(AbstractAutoEncoder):
+    '''
+    this autoencoder is a basic autoencoder that 
+    implements certain stable methods that multiple autoencoders will use
+    '''
+    cfg: AutoEncoderBaseConfig #must inherit from base cfg class
+    W_enc: torch.Tensor
+    pre_bias: torch.Tensor
+    W_dec: torch.Tensor
+    b_enc: torch.Tensor
+
+    def initialize_weights(self):
+        '''
+        a helper method that initializes the following weights
+        W_enc : (d_input, d_sae)
+        pre_bias : (d_sae)
+        W_dec : (d_sae, d_input)
+        b_enc : (d_sae)
+        '''
+        self.W_enc = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.cfg.d_input, self.d_sae, dtype=self.cfg.dtype)))
+        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.d_sae, self.cfg.d_input, dtype=self.cfg.dtype)))
+        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype)) # initialize to zero
+        self.b_enc = nn.Parameter(torch.zeros(self.cfg.d_sae, dtype=self.cfg.dtype)) # initialize to zero
+
+        if self.cfg.tie_w_dec:
+            self.tie_weights()
+
+    def tie_weights(self):
+        '''
+        ties the encoder to the transpose of the decoder weights
+        '''
+        if self.cfg.tie_w_dec:
+            self.W_enc.data = self.W_dec.data.t().clone()
+
+    @contextmanager
+    def _prepare_params(self, x: Tensor, feature_indices: Optional[slice]):
+        if feature_indices is None:
+            yield x
+        else:
+            original_W_enc = self.W_enc
+            original_pre_bias = self.pre_bias
+            original_W_dec = self.W_dec
+            
+            self.W_enc = self.W_enc[feature_indices, :]
+            self.pre_bias = self.pre_bias[feature_indices]
+            self.W_dec = self.W_dec[:, feature_indices]
+            x = x[:, feature_indices]
+            try:
+                yield x
+            finally:
+                self.W_enc = original_W_enc
+                self.pre_bias = original_pre_bias
+                self.W_dec = original_W_dec
+
+    def decode(self, acts : Tensor, feature_indices: Optional[slice] = None) -> Tensor:
+        '''
+        Decode method assumes self.W_dec and self.pre_bias are defined
+        '''
+        with self._prepare_params(acts, feature_indices):
+            if self.cfg.use_kernel and torch.cuda.is_available():
+                non_zero_indices = torch.nonzero(acts)
+                y = TritonDecoder.apply(non_zero_indices, acts.to(self.cfg.dtype), self.W_dec)
+                return y + self.pre_bias
+            return acts @ self.W_dec + self.pre_bias
+    
+    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
+        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
+            for v_key in ["exp_avg", "exp_avg_sq"]:
+                if dict_idx == 0:
+                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
+                    v[v_key][indices, :] = 0.0
+                elif dict_idx == 1:
+                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
+                    v[v_key][:, indices] = 0.0
+                elif dict_idx == 2:
+                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
+                    v[v_key][indices] = 0.0
+                elif dict_idx == 3:
+                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
+                else:
+                    raise ValueError(f"Unexpected dict_idx {dict_idx}")

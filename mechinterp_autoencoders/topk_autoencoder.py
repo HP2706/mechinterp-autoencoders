@@ -1,3 +1,4 @@
+from click import Abort
 import torch
 from contextlib import contextmanager
 import torch.nn as nn
@@ -7,11 +8,11 @@ from typing import Callable, Optional, Union, Literal
 from tqdm import tqdm
 from jaxtyping import Float, Int, jaxtyped
 from beartype import beartype
-from mechinterp_autoencoders.base_autoencoder import AutoEncoderBase, AutoEncoderBaseConfig
+from mechinterp_autoencoders.base_autoencoder import AbstractAutoEncoder, BaseAutoEncoder, AutoEncoderBaseConfig
 from mechinterp_autoencoders.compute_metrics import normalized_mse, mean_absolute_error, normalized_L1_loss, l0_norm, did_fire, avg_num_firing_per_neuron
 
 if torch.cuda.is_available():
-    from kernels import TritonDecoder
+    from mechinterp_autoencoders.kernels import TritonDecoder
 
 class TopKAutoEncoderConfig(AutoEncoderBaseConfig):
     k: int
@@ -52,42 +53,18 @@ class TopKActivationFn(nn.Module):
         result.scatter_(-1, indices, values)
         return result, indices
    
-class TopKAutoEncoder(AutoEncoderBase):
+class TopKAutoEncoder(BaseAutoEncoder):
     def __init__(
         self, 
         cfg: TopKAutoEncoderConfig
     ) -> None:
-        super().__init__(cfg)
+        super().__init__()
         self.cfg = cfg
-        self.d_hidden = cfg.d_input
-        self.d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
-        self.W_enc = nn.Parameter(torch.randn(self.cfg.d_input, self.d_hidden, dtype=self.cfg.dtype))
-        self.pre_bias = nn.Parameter(torch.randn(self.cfg.d_input, dtype=self.cfg.dtype))
-        self.W_dec = nn.Parameter(torch.randn(self.d_hidden, self.cfg.d_input, dtype=self.cfg.dtype))
-        self.b_enc = nn.Parameter(torch.randn(self.d_hidden, dtype=self.cfg.dtype))
-
+        self.initialize_weights()
         self.activation = TopKActivationFn(k=cfg.k, k_aux=cfg.k_aux)
-
-    @contextmanager
-    def _prepare_params(self, feature_indices: Optional[slice]):
-        if feature_indices is None:
-            yield
-        else:
-            original_W_enc = self.W_enc
-            original_pre_bias = self.pre_bias
-            original_W_dec = self.W_dec
-            
-            self.W_enc = self.W_enc[feature_indices, :]
-            self.pre_bias = self.pre_bias[feature_indices]
-            self.W_dec = self.W_dec[:, feature_indices]
-            
-            try:
-                yield
-            finally:
-                self.W_enc = original_W_enc
-                self.pre_bias = original_pre_bias
-                self.W_dec = original_W_dec
+        if self.cfg.tie_w_dec:
+            self.tie_weights()
 
     @jaxtyped(typechecker=beartype)
     def encode_pre_act(
@@ -96,7 +73,7 @@ class TopKAutoEncoder(AutoEncoderBase):
         feature_indices: Optional[slice] = None
     ) -> Float[Tensor, "batch d_sae"]:
         '''encode without activation'''
-        with self._prepare_params(feature_indices):
+        with self._prepare_params(x, feature_indices):
             x = x - self.pre_bias
             return x @ self.W_enc + self.b_enc
 
@@ -110,8 +87,7 @@ class TopKAutoEncoder(AutoEncoderBase):
             Int[Tensor, "..."]
         ]:
         '''encode with activation returns (relu(topk), indices)'''
-        with self._prepare_params(feature_indices):
-            x = x[:, feature_indices] if feature_indices is not None else x
+        with self._prepare_params(x, feature_indices):
             acts = self.encode_pre_act(x)
             return self.activation.forward(acts)
 
@@ -122,7 +98,7 @@ class TopKAutoEncoder(AutoEncoderBase):
         non_zero_indices: Int[Tensor, "..."],
         feature_indices: Optional[slice] = None
     )-> Float[Tensor, "batch d_in"]:
-        with self._prepare_params(feature_indices):
+        with self._prepare_params(acts, feature_indices):
             if self.cfg.use_kernel:
                 #use custom kernel
                 '''
@@ -153,7 +129,7 @@ class TopKAutoEncoder(AutoEncoderBase):
             l2_loss = normalized_mse(x_reconstruct, x)
             aux_acts, indices = self.activation.forward_aux(acts, ema_frequency_counter)
             e = x - x_reconstruct
-            
+
             e_hat = self.decode(aux_acts, indices, feature_indices)
             aux_k = normalized_mse(e_hat, e)
             if aux_k.isnan().any():
@@ -178,21 +154,3 @@ class TopKAutoEncoder(AutoEncoderBase):
             return x_reconstruct
         else:
             raise ValueError(f"Invalid method: {method}")
-        
-
-    def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
-        for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
-            for v_key in ["exp_avg", "exp_avg_sq"]:
-                if dict_idx == 0:
-                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
-                    v[v_key][indices, :] = 0.0
-                elif dict_idx == 1:
-                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
-                    v[v_key][:, indices] = 0.0
-                elif dict_idx == 2:
-                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
-                    v[v_key][indices] = 0.0
-                elif dict_idx == 3:
-                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
-                else:
-                    raise ValueError(f"Unexpected dict_idx {dict_idx}")

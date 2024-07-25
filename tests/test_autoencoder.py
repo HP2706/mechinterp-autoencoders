@@ -9,14 +9,12 @@ _AutoEncoderConfig = AutoEncoderConfig(
     dict_mult=1,
     d_input=10,
     l1_coeff=0.1,
-    device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
 )
 
 _GatedAutoEncoderConfig = GatedAutoEncoderConfig(
     dict_mult=1,
     d_input=10,
     l1_coeff=0.1,
-    device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
 )
 
 _TopKAutoEncoderConfig = TopKAutoEncoderConfig(
@@ -24,14 +22,13 @@ _TopKAutoEncoderConfig = TopKAutoEncoderConfig(
     d_input=10,
     k=1,
     k_aux=1,
-    use_kernel=False,
+    use_kernel=torch.cuda.is_available(),
 )
 
 _JumpReLUConfig = JumpReLUAutoEncoderConfig(
     dict_mult=1,
     d_input=10,
     l1_coeff=0.1,
-    device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
 )
 
 @pytest.mark.parametrize(
@@ -44,6 +41,6 @@ _JumpReLUConfig = JumpReLUAutoEncoderConfig(
 )
 def test_forward(model, method):
     if isinstance(model, TopKAutoEncoder):
-        model.forward(torch.randn(10, 10), ema_frequency_counter=torch.randn(model.d_hidden), method='with_loss')
+        model.forward(torch.randn(10, 10), ema_frequency_counter=torch.randn(model.cfg.d_sae), method='with_loss')
     else:
         model.forward(torch.randn(10, 10), method=method)

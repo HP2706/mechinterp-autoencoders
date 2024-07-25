@@ -1,7 +1,7 @@
 import torch
 from contextlib import contextmanager
 from torch import nn, Tensor
-from .base_autoencoder import AutoEncoderBase, AutoEncoderBaseConfig
+from .base_autoencoder import BaseAutoEncoder, AutoEncoderBaseConfig, AbstractAutoEncoder
 from jaxtyping import jaxtyped, Float
 from beartype import beartype
 from typing import Optional, Union, Literal
@@ -13,9 +13,10 @@ class GatedAutoEncoderConfig(AutoEncoderBaseConfig):
     l1_coeff: float
 
 #from paper https://arxiv.org/pdf/2404.16014
-class GatedAutoEncoder(AutoEncoderBase):
+class GatedAutoEncoder(BaseAutoEncoder):
     def __init__(self, cfg : GatedAutoEncoderConfig):
-        super().__init__(cfg)
+        super().__init__()
+        self.cfg = cfg
         d_hidden = cfg.d_input * cfg.dict_mult
         torch.manual_seed(cfg.seed)
         # Initialize parameters for the gated autoencoder
@@ -36,9 +37,9 @@ class GatedAutoEncoder(AutoEncoderBase):
         self.to(self.cfg.device)
 
     @contextmanager
-    def _prepare_params(self, feature_indices: Optional[slice] = None):
+    def _prepare_params(self, x : Tensor, feature_indices: Optional[slice] = None):
         if feature_indices is None:
-            yield
+            yield x
         else:
             #we store a copy
             #this might not be great for memory consumption though
@@ -55,9 +56,10 @@ class GatedAutoEncoder(AutoEncoderBase):
             self.W_dec = self.W_dec[:, feature_indices]
             self.b_gate = self.b_gate[feature_indices]
             self.b_mag = self.b_mag[feature_indices]
+            x = x[:, feature_indices] 
             
             try:
-                yield
+                yield x
             finally:
                 self.W_mag = original_W_mag
                 self.W_gate = original_W_gate
@@ -75,9 +77,7 @@ class GatedAutoEncoder(AutoEncoderBase):
             Float[Tensor, "batch d_hidden"], 
             Float[Tensor, "batch d_hidden"]
         ]:
-        with self._prepare_params(feature_indices):
-            x = x[:, feature_indices] if feature_indices is not None else x
-
+        with self._prepare_params(x, feature_indices):
             x_center = x - self.pre_bias
             gate_center = x_center @ self.W_gate + self.b_gate
             active_features = (gate_center > 0).to(self.cfg.dtype)
@@ -86,14 +86,6 @@ class GatedAutoEncoder(AutoEncoderBase):
             acts = active_features * feature_magnitudes
         return acts, gate_center
     
-    @jaxtyped(typechecker=beartype)
-    def decode(
-        self, 
-        acts: Float[Tensor, "batch d_hidden"], 
-        feature_indices: Optional[slice] = None
-    ) -> Float[Tensor, "batch d_input"]:
-        with self._prepare_params(feature_indices):
-            return acts @ self.W_dec + self.pre_bias
 
     @jaxtyped(typechecker=beartype)
     def forward(
