@@ -11,6 +11,19 @@ from jaxtyping import Float, jaxtyped, Int
 from beartype import beartype
 from torch import Tensor
 
+def generate_sparse_tensor(
+    batch_size : int, 
+    feature_dim : int, 
+    sparsity : float
+):
+    # Calculate the number of non-zero elements
+    n_nonzero = int(batch_size * feature_dim * sparsity)
+    x = torch.zeros(batch_size, feature_dim)
+    indices = torch.randint(0, batch_size * feature_dim, (n_nonzero,))
+    x.view(-1)[indices] = torch.randn(n_nonzero)
+    return x
+
+
 @jaxtyped(typechecker=beartype)
 def extract_nonzero(
     x: Float[Tensor, "batch_size seq_len"]
@@ -32,13 +45,15 @@ def extract_nonzero(
     # what are you not willing to do to avoid a for loop in python:)
     free_mask = (mask == 0) & (torch.arange(seq_len, device=x.device).unsqueeze(0) < padding_count.unsqueeze(1))
     non_zero_mask = mask.bool()
-    indices = torch.where(free_mask, torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1), 
-                      torch.where(non_zero_mask, torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1), 
-                                  torch.zeros(batch_size, seq_len, device=x.device, dtype=torch.long)))
 
-    indices = indices[:, :a]  # Truncate to shape (batch_size, a)
-
+    indices = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
+    indices = torch.where(
+        free_mask | non_zero_mask, indices, 
+        torch.zeros(batch_size, seq_len, device=x.device, dtype=torch.long)
+    )
+    indices = indices[:, :a]  #shape (batch_size, a)
     values = x.gather(1, indices)
+
     return values, indices
 
 

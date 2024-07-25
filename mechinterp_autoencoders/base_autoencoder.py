@@ -209,7 +209,11 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         with self._prepare_params(acts, feature_indices):
             if self.cfg.use_kernel and torch.cuda.is_available():
                 non_zero_values, non_zero_indices = extract_nonzero(acts)
-                y = TritonDecoder.apply(non_zero_indices, non_zero_values.to(self.cfg.dtype), self.W_dec)
+                y = TritonDecoder.apply(
+                    non_zero_indices.contiguous(), 
+                    non_zero_values.to(self.cfg.dtype).contiguous(), 
+                    self.W_dec.contiguous()
+                )
                 return y + self.pre_bias
             return acts @ self.W_dec + self.pre_bias
     
