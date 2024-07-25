@@ -1,6 +1,7 @@
 import pytest
 from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, GatedAutoEncoder
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
+from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
 import torch
 
@@ -9,7 +10,6 @@ _AutoEncoderConfig = AutoEncoderConfig(
     d_input=10,
     l1_coeff=0.1,
     device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
-    updated_anthropic_method=True,
 )
 
 _GatedAutoEncoderConfig = GatedAutoEncoderConfig(
@@ -17,7 +17,6 @@ _GatedAutoEncoderConfig = GatedAutoEncoderConfig(
     d_input=10,
     l1_coeff=0.1,
     device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
-    updated_anthropic_method=True,
 )
 
 _TopKAutoEncoderConfig = TopKAutoEncoderConfig(
@@ -28,11 +27,19 @@ _TopKAutoEncoderConfig = TopKAutoEncoderConfig(
     use_kernel=False,
 )
 
+_JumpReLUConfig = JumpReLUAutoEncoderConfig(
+    dict_mult=1,
+    d_input=10,
+    l1_coeff=0.1,
+    device=torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu'),
+)
+
 @pytest.mark.parametrize(
     'model,method', [
         (AutoEncoder(cfg=_AutoEncoderConfig), 'with_loss'),
         (GatedAutoEncoder(cfg=_GatedAutoEncoderConfig), 'with_loss'),
         (TopKAutoEncoder(cfg=_TopKAutoEncoderConfig), 'with_loss'),
+        (JumpReLUAutoEncoder(cfg=_JumpReLUConfig), 'with_loss'),
     ]
 )
 def test_forward(model, method):

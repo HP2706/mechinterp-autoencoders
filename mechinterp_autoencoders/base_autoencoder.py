@@ -16,7 +16,7 @@ class AutoEncoderBaseConfig(BaseModel):
     seed: int = 42
     dtype: torch.dtype = torch.float32
     device: torch.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    updated_anthropic_method : bool = True
+    tie_w_dec: bool = True #whether to tie encoder decoder weights at initialization
 
     class Config:
         arbitrary_types_allowed = True
