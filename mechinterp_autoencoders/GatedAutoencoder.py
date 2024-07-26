@@ -113,7 +113,8 @@ class GatedAutoEncoder(BaseAutoEncoder):
             # Computing L_aux with frozen decoder
             with torch.no_grad():
                 W_dec_frozen = self.W_dec.detach()
-                b_enc_frozen = self.b_mag.detach()
+                b_enc_frozen = self.pre_bias.detach()
+
             via_gate_reconstruction = (via_gate_feature_magnitudes @ W_dec_frozen + b_enc_frozen)
             L_aux = normalized_mse(via_gate_reconstruction, x)
             loss = l2 + (self.l1_coeff * L_Sparsity) + L_aux

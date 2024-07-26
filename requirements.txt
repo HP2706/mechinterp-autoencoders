@@ -9,4 +9,7 @@ Pillow
 requests
 openai
 anthropic
+litellm
 instructor
+pandas
+plotly

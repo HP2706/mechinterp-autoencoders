@@ -1,5 +1,7 @@
-from modal import Image, App
+from modal import Image, App, Volume
 app = App("test-autoencoders")
+
+vol = Volume.from_name("benchmark-autoencoders", create_if_missing=True)
 
 image = Image.debian_slim(python_version="3.11").run_commands(
     'apt update'

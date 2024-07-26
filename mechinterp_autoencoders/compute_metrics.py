@@ -22,7 +22,7 @@ def l0_norm(x: Float[Tensor, "batch_size dim"]) -> Tensor:
 @jaxtyped(typechecker=beartype)
 def normalized_mse(x: Float[Tensor, "batch_size dim"], ground_truth: Float[Tensor, "batch_size dim"]) -> Tensor:
     return (
-        (x - ground_truth).pow(2).mean(dim=1) / (ground_truth**2).mean(dim=1)
+        (x - ground_truth).pow(2).mean(dim=1) / ((ground_truth**2) + 1e-5).mean(dim=1) #we use 1e-5 to avoid division by zero 
     ).mean()
 
 @jaxtyped(typechecker=beartype)
@@ -36,7 +36,7 @@ def l1_norm(x: Float[Tensor, "batch_size dim"]) -> Tensor:
 
 @jaxtyped(typechecker=beartype)
 def normalized_L1_loss(
-    latent_activations: Float[Tensor, "batch_size dim"],
+    latent_activations: Float[Tensor, "batch_size d_sae"],
     ground_truth: Float[Tensor, "batch_size dim"],
 ) -> Tensor:
     '''the mean normalized L1 loss of the activations over the batch'''

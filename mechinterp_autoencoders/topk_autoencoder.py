@@ -146,9 +146,9 @@ class TopKAutoEncoder(BaseAutoEncoder):
             e = x - x_reconstruct
 
             e_hat = self.decode(aux_acts, indices, feature_indices)
+
             aux_k = normalized_mse(e_hat, e)
             if aux_k.isnan().any():
-                print("aux_k is nan")
                 aux_k = torch.zeros_like(aux_k)
             alpha = 1/32 #as specified in openai autoencoder paper
             loss = l2_loss + alpha * aux_k
