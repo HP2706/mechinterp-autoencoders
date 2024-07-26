@@ -12,17 +12,23 @@ from beartype import beartype
 from torch import Tensor
 
 def generate_sparse_tensor(
-    batch_size : int, 
-    feature_dim : int, 
-    sparsity : float
-):
-    # Calculate the number of non-zero elements
-    n_nonzero = int(batch_size * feature_dim * sparsity)
-    x = torch.zeros(batch_size, feature_dim)
-    indices = torch.randint(0, batch_size * feature_dim, (n_nonzero,))
-    x.view(-1)[indices] = torch.randn(n_nonzero)
+    batch_size: int,
+    feature_dim: int,
+    sparsity: float,
+    device: torch.device = torch.device('cpu'),
+    dtype: torch.dtype = torch.float16
+) -> torch.Tensor:
+    n_elements = batch_size * feature_dim
+    n_nonzero = int(n_elements * sparsity)
+    
+    x = torch.zeros(batch_size, feature_dim, device=device, dtype=dtype)
+    
+    indices = torch.randperm(n_elements, device=device)[:n_nonzero]
+    
+    # Fill the selected indices with random non-zero values
+    x.view(-1)[indices] = torch.randn(n_nonzero, device=device, dtype=dtype)
+    
     return x
-
 
 @jaxtyped(typechecker=beartype)
 def extract_nonzero(

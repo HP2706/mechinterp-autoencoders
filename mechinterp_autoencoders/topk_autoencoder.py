@@ -129,10 +129,9 @@ class TopKAutoEncoder(BaseAutoEncoder):
         self, 
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
-        ema_frequency_counter : Tensor,
+        ema_frequency_counter : Optional[Tensor],
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, dict]:
-        assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
         acts, non_zero_indices = self.encode(x, feature_indices)
         if method == 'with_acts':
             return acts
@@ -140,6 +139,7 @@ class TopKAutoEncoder(BaseAutoEncoder):
         x_reconstruct = self.decode(acts, non_zero_indices, feature_indices)
 
         if method == 'with_loss':
+            assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
             l2_loss = normalized_mse(x_reconstruct, x)
             aux_acts, indices = self.activation.forward_aux(acts, ema_frequency_counter)
             e = x - x_reconstruct

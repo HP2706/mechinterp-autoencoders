@@ -55,24 +55,27 @@ def test_autoencoder_benchmark(
     else:
         raise ValueError(f'Unknown model class: {model_cls}')
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     model = model_cls(cfg).to(device)
     
     total_time = 0
-    num_iterations = 10
+    num_iterations = 3
     
     with torch.autocast(
-        device_type=device, 
+        device_type=device.type, 
         dtype=torch.bfloat16 if device == 'cuda' else torch.float32
     ):
         gpu_memory_usage = []
+        t0 = time.time()
+        x = generate_sparse_tensor(batch_size, d_input, sparsity_level, device)
+        print(f'generate_sparse_tensor took {time.time() - t0} seconds')
         for _ in range(num_iterations):
-            x = generate_sparse_tensor(batch_size, d_input, sparsity_level).to(device)
             start_time = time.time()
             if isinstance(model, TopKAutoEncoder):
                 model.forward(x, method='with_loss', ema_frequency_counter=torch.randn(d_input).to(device))
             else:
                 model.forward(x, method='with_loss')
+            
             gpu_memory_usage.append(torch.cuda.memory_allocated(device))
             end_time = time.time()
             total_time += end_time - start_time
@@ -102,13 +105,30 @@ def visualize_and_save(df: pd.DataFrame, save_path: str):
     # Group by all parameters except d_input and avg_time
     grouping_cols = ['model', 'dict_mult', 'k', 'sparsity_level', 'batch_size', 'use_kernel']
     
+    # Apply negative reciprocal transformation to avg_time
+    df['avg_time'] = df['avg_time'] * 1000
+    df['log_avg_time'] = np.log10(df['avg_time'])
     for use_kernel in [True, False]:
-        fig = px.line(df[df['use_kernel'] == use_kernel], x='d_input', y='avg_time',
-                color='model', line_dash='dict_mult', symbol='k',
-                facet_col='sparsity_level', facet_row='batch_size',
-                hover_data=grouping_cols,
-                title=f'use_kernel: {use_kernel} Performance Curves by Model and Input Dimension')
-        fig.update_layout(height=1000, width=1200)
+        fig = px.line(df, x='dict_mult', y='log_avg_time',
+            color=df.apply(lambda row: f"{row['model']} ({'with' if row['use_kernel'] else 'without'} kernel)", axis=1),
+            line_dash='d_input', symbol='k',
+            facet_col='sparsity_level', facet_row='batch_size',
+            hover_data=grouping_cols + ['avg_time'],
+            title=('Performance Curves by Model and Input Dimension (Transformed Scale)'),
+            height=1000, 
+            width=1200
+        )
+        
+        # Update y-axis to show original values
+        max_time = df['log_avg_time'].max()
+        tick_values = [0.001, 0.01, 0.1, min(1, max_time)]
+        fig.update_layout(yaxis=dict(
+            tickmode='array',
+            tickvals=[-1/t for t in tick_values],
+            ticktext=[f'{t:.3f}' for t in tick_values],
+            title='log(avg_time) (milliseconds)'
+        ))
+
         fig.write_html(f'{save_path}/performance_curves{"with_kernel" if use_kernel else ""}.html')
         fig.show()
 
@@ -142,12 +162,12 @@ def get_params(
     else:
         param_values = [
             model_cfgs,
-            [16],  # dict_mults
+            [4, 8, 16, 32, 64],  # dict_mults
             [768],  # d_inputs
-            [8],  # ks
-            [0.1, 0.001],  # sparsity_levels
+            [8, 16, 32],  # ks
+            [0.1, 0.001, 0.0001, 0.00001],  # sparsity_levels
             [True, False],  # use_kernels
-            [128]  # batch_sizes
+            [1024, 2048]  # batch_sizes
         ]
 
     param_names = ['model_config', 'dict_mult', 'd_input', 'k', 'sparsity_level', 'use_kernel', 'batch_size']
@@ -179,5 +199,35 @@ def run_benchmarks(
     visualize_and_save(pd.DataFrame(results), save_path)
 
 if __name__ == '__main__':
-    os.makedirs('benchmarks/data', exist_ok=True)
-    run_benchmarks('benchmarks/data', [AutoEncoder, TopKAutoEncoder], local_test=True)
+    #os.makedirs('benchmarks/data', exist_ok=True)
+    #run_benchmarks('benchmarks/data', [AutoEncoder])#, local_test=True)
+    from mechinterp_autoencoders.utils import generate_sparse_tensor
+
+    batch_size = 1024
+    d_input = 768
+    sparsity_levels = [0.0001, 0.00001]
+    dict_mults = [16]
+    use_kernels = [True, False]
+
+    for sparsity_level in sparsity_levels:
+        for dict_mult in dict_mults:
+            for use_kernel in use_kernels:
+                model = TopKAutoEncoder(
+                    TopKAutoEncoderConfig(
+                        dict_mult=dict_mult, 
+                        d_input=d_input, 
+                        use_kernel=use_kernel, 
+                        k = max(1, int(d_input* dict_mult * sparsity_level)),
+                        k_aux=max(1, int(d_input * dict_mult * sparsity_level))
+                    )
+                ).to(torch.device('cuda'))
+                x = generate_sparse_tensor(batch_size, d_input, sparsity_level, torch.device('cuda'))
+                t0 = time.time()
+                x_recons = model.forward(x, method='reconstruct', ema_frequency_counter=None)
+                mse = torch.mean((x - x_recons)**2)
+                mse.backward()
+                print(f'time for {use_kernel} use_kernel,{sparsity_level} sparsity, {dict_mult} dict_mult: {time.time() - t0} seconds')
+
+    """ import pandas as pd
+    df = pd.read_parquet('benchmarks/data/benchmark_results.parquet')
+    visualize_and_save(df, 'benchmarks/data') """
