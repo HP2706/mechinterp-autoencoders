@@ -1,6 +1,7 @@
 *.cpython
 *.pyc
 __pycache__
+*.pytest_cache
 main.py
 main.ipynb
 *.html

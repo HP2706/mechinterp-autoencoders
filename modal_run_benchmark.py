@@ -1,20 +1,33 @@
 from modal_common import app, image, vol
 from modal import gpu, Mount
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-dir = Mount.from_local_dir(".", remote_path="/root")
+from benchmarks.perf import run_benchmarks
 
 @app.function(
     image=image,
-    volumes={"/results" : vol},
-    gpu=gpu.A10G(),
-    mounts=[dir],
+    volumes={"/root/modal_benchmark": vol},
+    gpu=gpu.A100(),
+    timeout=60*60, #1 hour
     _allow_background_volume_commits=True
 )
-def test():
-    import subprocess
-    subprocess.run(["python", "perf.py"], check=True, cwd="/root/benchmarks")
+def benchmark(cleanup: bool = False):  
+    if cleanup:
+        if os.path.exists("/root/modal_benchmark/data"):
+            print("removing /root/modal_benchmark/data")
+            os.system("rm -rf /root/modal_benchmark/data")
+
+    os.makedirs("/root/modal_benchmark/data", exist_ok=True)
+    run_benchmarks("/root/modal_benchmark/data")
     vol.commit()
 
 @app.local_entrypoint()
 def main():
-    test.remote()
+    benchmark.remote(cleanup=True)
+    #now download data to local dir
+    local_dir_path = 'benchmarks/data'
+    os.makedirs(local_dir_path, exist_ok=True)
+    import subprocess
+    subprocess.run(["modal", "volume", "get", "modal_benchmark", "modal_benchmark/data", "--force"], check=True)
