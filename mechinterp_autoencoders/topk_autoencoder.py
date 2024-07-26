@@ -63,6 +63,7 @@ class TopKActivationFn(nn.Module):
         return result, indices
    
 class TopKAutoEncoder(BaseAutoEncoder):
+    cfg: TopKAutoEncoderConfig
     def __init__(
         self, 
         cfg: TopKAutoEncoderConfig
@@ -107,15 +108,9 @@ class TopKAutoEncoder(BaseAutoEncoder):
         feature_indices: Optional[slice] = None
     )-> Float[Tensor, "batch d_in"]:        
         with self._prepare_params(acts, feature_indices):
-            if self.cfg.use_kernel:
+            top_k_acts = acts.gather(1, non_zero_indices).reshape(non_zero_indices.shape[0], -1)
+            if self.cfg.use_kernel and torch.cuda.is_available():
                 #use custom kernel
-                '''
-                Args:
-                    acts: the activations of the topk
-                    non_zero_indices: the indices of the non-zero elements in the activations after topk(this is necessary for sparsity)
-                '''
-                top_k_acts = acts.gather(1, non_zero_indices).reshape(non_zero_indices.shape[0], -1)
-                
                 y = TritonDecoder.apply(
                     non_zero_indices.contiguous(),
                     top_k_acts.to(self.cfg.dtype).contiguous(), 
@@ -123,7 +118,8 @@ class TopKAutoEncoder(BaseAutoEncoder):
                 )
                 return y + self.pre_bias
             else:
-                return acts @ self.W_dec + self.pre_bias
+                #same thing just in pytorch
+                return self.eager_decode(non_zero_indices, top_k_acts) + self.pre_bias
 
     def forward(
         self, 

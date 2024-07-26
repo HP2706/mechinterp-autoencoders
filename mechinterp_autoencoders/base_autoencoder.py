@@ -24,7 +24,7 @@ class AutoEncoderBaseConfig(BaseModel):
     dtype: torch.dtype = torch.float32
     device: torch.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     tie_w_dec: bool = True #whether to tie encoder decoder weights at initialization
-    use_kernel: bool = True #uses a custom cuda kernel for sparse_dense matmul if cuda is available
+    use_top_k: bool = True #uses top k eager decoding
     use_pre_enc_bias: bool = True #uses a pre-bias for the encoder
     class Config:
         arbitrary_types_allowed = True
@@ -203,20 +203,40 @@ class BaseAutoEncoder(AbstractAutoEncoder):
                 self.pre_bias = original_pre_bias
                 self.W_dec = original_W_dec
 
+    # inspired by https://github.com/EleutherAI/sae/blob/main/sae/utils.py#L94
+    def eager_decode(
+        self, 
+        top_indices : Tensor,
+        top_acts : Tensor,
+        feature_indices: Optional[slice] = None
+    ) -> Tensor:
+        '''
+        Decode method assumes self.W_dec and self.pre_bias are defined
+        '''
+        with self._prepare_params(top_acts, feature_indices):
+            buf = top_acts.new_zeros(top_acts.shape[:-1] + (self.cfg.d_sae,))
+            print(buf.shape, top_indices.shape, top_acts.shape)
+            acts = buf.scatter_(dim=-1, index=top_indices, src=top_acts)
+            return acts @ self.W_dec + self.pre_bias
+
     def decode(self, acts : Tensor, feature_indices: Optional[slice] = None) -> Tensor:
         '''
         Decode method assumes self.W_dec and self.pre_bias are defined
         '''
         with self._prepare_params(acts, feature_indices):
-            if self.cfg.use_kernel and torch.cuda.is_available():
+            if self.cfg.use_top_k:
                 non_zero_values, non_zero_indices = extract_nonzero(acts)
-                y = TritonDecoder.apply(
-                    non_zero_indices.contiguous(), 
-                    non_zero_values.to(self.cfg.dtype).contiguous(), 
-                    self.W_dec.mT.contiguous()
-                )
-                return y + self.pre_bias
-            return acts @ self.W_dec + self.pre_bias
+                if torch.cuda.is_available():
+                    y = TritonDecoder.apply(
+                        non_zero_indices.contiguous(), 
+                        non_zero_values.to(self.cfg.dtype).contiguous(), 
+                        self.W_dec.mT.contiguous()
+                    )
+                    return y + self.pre_bias
+                else:
+                    return self.eager_decode(non_zero_indices, non_zero_values)
+            else:
+                return acts @ self.W_dec + self.pre_bias
     
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):

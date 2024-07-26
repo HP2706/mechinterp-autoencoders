@@ -11,6 +11,9 @@ from jaxtyping import Float, jaxtyped, Int
 from beartype import beartype
 from torch import Tensor
 
+def get_device():
+    return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
 def generate_sparse_tensor(
     batch_size: int,
     feature_dim: int,

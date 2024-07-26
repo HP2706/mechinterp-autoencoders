@@ -3,7 +3,7 @@ from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, Gat
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
 from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
-from mechinterp_autoencoders.utils import extract_nonzero, generate_sparse_tensor
+from mechinterp_autoencoders.utils import extract_nonzero, generate_sparse_tensor, get_device
 import torch
 
 _AutoEncoderConfig = AutoEncoderConfig(
@@ -23,7 +23,7 @@ _TopKAutoEncoderConfig = TopKAutoEncoderConfig(
     d_input=10,
     k=1,
     k_aux=1,
-    use_kernel=torch.cuda.is_available(),
+    use_kernel=torch.cuda.is_available()
 )
 
 _JumpReLUConfig = JumpReLUAutoEncoderConfig(
@@ -41,8 +41,7 @@ _JumpReLUConfig = JumpReLUAutoEncoderConfig(
     ]
 )
 def test_forward_backward(model, method):
-
-    if model.cfg.use_kernel:
+    if model.cfg.use_top_k:
         #we enfore sparsity by setting 90% of the values to zero
         x = torch.zeros(10, 10)
         indices = torch.randint(0, 10, (2,))
@@ -50,7 +49,7 @@ def test_forward_backward(model, method):
     else:
         x = torch.randn(10, 10)
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    device = get_device()
     x = x.to(device).to(model.cfg.dtype)
     model = model.to(device).to(model.cfg.dtype)
     if isinstance(model, TopKAutoEncoder):
@@ -67,7 +66,6 @@ def test_extract_nonzero():
     new_x = torch.gather(x, 1, indices)
     assert torch.allclose(new_x, values, atol=1e-5), f'new_x == values, {(new_x == values)}'
 
-
 def test_generate_sparse_tensor():
     batch_size = 1024
     d_input = 768
@@ -76,3 +74,39 @@ def test_generate_sparse_tensor():
     x = generate_sparse_tensor(batch_size, d_input, sparsity_level, device)
     assert x.shape == (batch_size, d_input)
     assert torch.count_nonzero(x) == int(batch_size * d_input * sparsity_level)
+
+
+
+def test_decode():
+    batch = 2
+    d_in = 50
+    dict_mult = 2
+    d_sae = d_in * dict_mult
+    k = 10
+    device = get_device()
+    latents = torch.rand(batch, d_sae, device=device)
+
+    autoencoder = TopKAutoEncoder(
+        cfg=TopKAutoEncoderConfig(
+            dict_mult=dict_mult, 
+            d_input=d_in, 
+            k=k, 
+            k_aux=k, 
+            use_kernel=torch.cuda.is_available()
+        )
+    )
+    autoencoder = autoencoder.to(device)
+
+    top_vals, top_idx = latents.topk(k, dim=1)
+    latents.zero_()
+    latents.scatter_(1, top_idx, top_vals)
+
+    eager_res = autoencoder.eager_decode(top_idx, top_vals)
+    
+    standard_res = latents @ autoencoder.W_dec + autoencoder.pre_bias
+
+    assert torch.allclose(eager_res, standard_res), f"Eager and standard results differ: {eager_res - standard_res}"
+    if torch.cuda.is_available():
+        triton_res = autoencoder.triton_decode(top_idx, top_vals)
+        assert torch.allclose(eager_res, triton_res), f"Eager and Triton results differ: {eager_res - triton_res}"
+    
