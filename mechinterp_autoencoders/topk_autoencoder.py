@@ -115,12 +115,11 @@ class TopKAutoEncoder(BaseAutoEncoder):
                     non_zero_indices: the indices of the non-zero elements in the activations after topk(this is necessary for sparsity)
                 '''
                 top_k_acts = acts.gather(1, non_zero_indices).reshape(non_zero_indices.shape[0], -1)
-
-                assert non_zero_indices.shape == top_k_acts.shape, f"expected non_zero_indices.shape == top_k_acts.shape, got {non_zero_indices.shape} != {top_k_acts.shape}"
+                
                 y = TritonDecoder.apply(
                     non_zero_indices.contiguous(),
                     top_k_acts.to(self.cfg.dtype).contiguous(), 
-                    self.W_dec.contiguous()
+                    self.W_dec.mT.contiguous()
                 )
                 return y + self.pre_bias
             else:

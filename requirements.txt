@@ -13,3 +13,4 @@ litellm
 instructor
 pandas
 plotly
+pyarrow

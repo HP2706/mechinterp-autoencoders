@@ -104,19 +104,6 @@ def visualize_and_save(df: pd.DataFrame):
         fig.write_html(f'performance_curves{"with_kernel" if use_kernel else ""}.html')
         fig.show()
 
-
-def get_parametrize_args(func: Function) -> list:
-    param_names = []
-    param_values = []
-    for mark in func.pytestmark:
-        if mark.name == 'parametrize':
-            param_names.append(mark.args[0])
-            param_values.append(mark.args[1])
-    
-    all_combinations = list(itertools.product(*param_values))
-    return [dict(zip(param_names, combo)) for combo in all_combinations]
-
-
 def get_all_params() -> list[dict]:
     model_configs = [
         (AutoEncoder, AutoEncoderConfig),
@@ -127,11 +114,11 @@ def get_all_params() -> list[dict]:
     param_values = [
         model_configs,
         [2, 4],  # dict_mults
-        [2, 4, 8],  # d_inputs
-        [1],  # ks
-        [0.1],  # sparsity_levels
+        [768],  # d_inputs
+        [2, 4, 8, 16],  # ks
+        [0.001],  # sparsity_levels
         [True, False],  # use_kernels
-        [1028]  # batch_sizes
+        [16]  # batch_sizes
     ]
 
     param_names = ['model_config', 'dict_mult', 'd_input', 'k', 'sparsity_level', 'use_kernel', 'batch_size']
