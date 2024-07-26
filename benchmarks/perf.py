@@ -12,6 +12,7 @@ import torch
 import time
 import pandas as pd
 import plotly.express as px
+from mechinterp_autoencoders.base_autoencoder import BaseAutoEncoder
 from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, GatedAutoEncoder
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
 from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig
@@ -111,23 +112,43 @@ def visualize_and_save(df: pd.DataFrame, save_path: str):
         fig.write_html(f'{save_path}/performance_curves{"with_kernel" if use_kernel else ""}.html')
         fig.show()
 
-def get_all_params() -> list[list[dict]]:
-    model_configs = [
-        (AutoEncoder, AutoEncoderConfig),
-        (GatedAutoEncoder, GatedAutoEncoderConfig),
-        (TopKAutoEncoder, TopKAutoEncoderConfig),
-        (JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig)
+def get_params(
+    models: list[type[BaseAutoEncoder]],
+    local_test: bool = False
+) -> list[list[dict]]:
+
+    cfg_dict = {
+        AutoEncoder: AutoEncoderConfig,
+        GatedAutoEncoder: GatedAutoEncoderConfig,
+        TopKAutoEncoder: TopKAutoEncoderConfig,
+        JumpReLUAutoEncoder: JumpReLUAutoEncoderConfig
+    }
+
+    model_cfgs = [
+        (model, cfg_dict[model])
+        for model in models
     ]
     
-    param_values = [
-        model_configs,
-        [16, 32, 128],  # dict_mults
-        [768, 1536],  # d_inputs
-        [4, 8, 16],  # ks
-        [0.1, 0.001],  # sparsity_levels
-        [True, False],  # use_kernels
-        [1028, 4096]  # batch_sizes
-    ]
+    if local_test:
+        param_values = [
+            model_cfgs,
+            [1],  # dict_mults
+            [768],  # d_inputs
+            [8],  # ks
+            [0.001],  # sparsity_levels
+            [False],  # use_kernels
+            [10]  # batch_sizes
+        ]
+    else:
+        param_values = [
+            model_cfgs,
+            [16],  # dict_mults
+            [768],  # d_inputs
+            [8],  # ks
+            [0.1, 0.001],  # sparsity_levels
+            [True, False],  # use_kernels
+            [128]  # batch_sizes
+        ]
 
     param_names = ['model_config', 'dict_mult', 'd_input', 'k', 'sparsity_level', 'use_kernel', 'batch_size']
 
@@ -137,27 +158,26 @@ def get_all_params() -> list[list[dict]]:
         param_dict['model_cls'], param_dict['config_cls'] = param_dict.pop('model_config')
         all_params.append(param_dict)
 
-    all_params = [list(all_params)[i:i+5] for i in range(0, len(all_params), 5)]
+    random.shuffle(all_params)
+    print('all_params', all_params)
+    all_params = [list(all_params)[i:i+10] for i in range(0, len(all_params), 10)]
     return all_params
 
-def run_benchmarks(save_path: str):
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+def run_benchmarks(
+    save_path: str,
+    models: list[type[BaseAutoEncoder]],
+    local_test: bool = False
+):
     results = []
-
-    all_params = get_all_params()
-        
-    all_params = get_all_params()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    all_params = get_params(models, local_test)
     for param_list in tqdm.tqdm(all_params):
         #we use a list to get better sense of progress
         for params in param_list:
-            if params['use_kernel'] is True and device == 'cpu':
-                continue
             result = test_autoencoder_benchmark(**params)
             results.append(result)
 
     visualize_and_save(pd.DataFrame(results), save_path)
-    
 
 if __name__ == '__main__':
     os.makedirs('benchmarks/data', exist_ok=True)
+    run_benchmarks('benchmarks/data', [AutoEncoder, TopKAutoEncoder], local_test=True)
