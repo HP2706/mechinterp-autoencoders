@@ -12,7 +12,7 @@ dir = Mount.from_local_dir(".", remote_path="/root")
 )
 def test():
     import subprocess
-    subprocess.run(["pytest", "perf.py"], check=True, cwd="/root/benchmarks")
+    subprocess.run(["python", "perf.py"], check=True, cwd="/root/benchmarks")
     vol.commit()
 
 @app.local_entrypoint()

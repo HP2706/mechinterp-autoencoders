@@ -17,21 +17,6 @@ from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoE
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
 from mechinterp_autoencoders.utils import generate_sparse_tensor
 
-@pytest.mark.parametrize(
-    'model_cls, config_cls', 
-    [
-        (AutoEncoder, AutoEncoderConfig), 
-        (GatedAutoEncoder, GatedAutoEncoderConfig), 
-        (TopKAutoEncoder, TopKAutoEncoderConfig), 
-        (JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig)
-    ]
-)
-@pytest.mark.parametrize('dict_mult', [16, 32, 128])
-@pytest.mark.parametrize('d_input', [768, 1536, 3072])
-@pytest.mark.parametrize('k', [4, 8, 16])
-@pytest.mark.parametrize('sparsity_level', [0.1, 0.01, 0.001])
-@pytest.mark.parametrize('use_kernel', [True, False])
-@pytest.mark.parametrize('batch_size', [1028, 4096, 16384])
 def test_autoencoder_benchmark(
     model_cls, 
     config_cls, 
@@ -90,7 +75,7 @@ def test_autoencoder_benchmark(
             total_time += end_time - start_time
     
     avg_time = total_time / num_iterations
-    
+    assert True
     return {
         'model': model_cls.__name__,
         'dict_mult': dict_mult,
@@ -131,18 +116,44 @@ def get_parametrize_args(func: Function) -> list:
     all_combinations = list(itertools.product(*param_values))
     return [dict(zip(param_names, combo)) for combo in all_combinations]
 
+
+def get_all_params() -> list[dict]:
+    model_configs = [
+        (AutoEncoder, AutoEncoderConfig),
+        (GatedAutoEncoder, GatedAutoEncoderConfig),
+        (TopKAutoEncoder, TopKAutoEncoderConfig),
+        (JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig)
+    ]
+    param_values = [
+        model_configs,
+        [2, 4],  # dict_mults
+        [2, 4, 8],  # d_inputs
+        [1],  # ks
+        [0.1],  # sparsity_levels
+        [True, False],  # use_kernels
+        [1028]  # batch_sizes
+    ]
+
+    param_names = ['model_config', 'dict_mult', 'd_input', 'k', 'sparsity_level', 'use_kernel', 'batch_size']
+
+    all_params = []
+    for values in itertools.product(*param_values):
+        param_dict = dict(zip(param_names, values))
+        param_dict['model_cls'], param_dict['config_cls'] = param_dict.pop('model_config')
+        all_params.append(param_dict)
+
+    return all_params
+
 def run_benchmarks():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     results = []
-    all_params = get_parametrize_args(test_autoencoder_benchmark)
 
+    all_params = get_all_params()
     for params in tqdm.tqdm(all_params):
         if params['use_kernel'] is True and device == 'cpu':
             continue
-        
-        model_cls, config_cls = params.pop('model_cls, config_cls')
-        # Pass the unpacked parameters to the function
-        result = test_autoencoder_benchmark(model_cls, config_cls, **params)
+    
+        result = test_autoencoder_benchmark(**params)
         results.append(result)
 
     visualize_and_save(pd.DataFrame(results))

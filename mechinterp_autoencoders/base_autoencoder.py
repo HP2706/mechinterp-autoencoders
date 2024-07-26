@@ -214,7 +214,13 @@ class BaseAutoEncoder(AbstractAutoEncoder):
                     non_zero_values.to(self.cfg.dtype).contiguous(), 
                     self.W_dec.contiguous()
                 )
+                y_normal = acts @ self.W_dec
+                print('y after acts @ self.W_dec', y_normal.shape)
+                print('y after TritonDecoder', y.shape)
+                print('self.pre_bias.shape', self.pre_bias.shape)
                 return y + self.pre_bias
+            
+            
             return acts @ self.W_dec + self.pre_bias
     
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
