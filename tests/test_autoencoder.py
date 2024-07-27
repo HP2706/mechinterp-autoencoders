@@ -77,7 +77,7 @@ def test_generate_sparse_tensor():
     assert torch.count_nonzero(x) == int(batch_size * d_input * sparsity_level)
 
 
-def test_eager_decode():
+def test_decode():
     batch = 2
     d_in = 50
     dict_mult = 2
@@ -95,7 +95,6 @@ def test_eager_decode():
         )
     ).to(device)
 
-    target = torch.rand(batch, d_in, device=device)
     latents = torch.randn(batch, d_sae, device=device)
     top_vals, top_idx = latents.topk(k, dim=1)
     latents.zero_()
@@ -105,6 +104,11 @@ def test_eager_decode():
     standard_res = latents @ autoencoder.W_dec
 
     assert torch.allclose(eager_res, standard_res), f"Eager and standard results differ: {eager_res - standard_res}"
-    eager_mse = mse_loss(eager_res, target).backward() # checking bwd
-    standard_mse = mse_loss(standard_res, target).backward() # checking bwd
 
+    if torch.cuda.is_available():
+        #check kernel impl
+        eager_res = autoencoder.eager_decode(top_idx, top_vals)
+        triton_res = autoencoder.kernel_decode(top_idx, top_vals)
+        
+        tolerance = 1e-5
+        assert torch.allclose(eager_res, triton_res, atol=tolerance, rtol=tolerance), f"Eager and triton results differ beyond tolerance: {eager_res - triton_res}"
