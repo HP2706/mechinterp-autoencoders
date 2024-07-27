@@ -19,7 +19,7 @@ def generate_sparse_tensor(
     feature_dim: int,
     sparsity: float,
     device: torch.device = torch.device('cpu'),
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
     n_elements = batch_size * feature_dim
     n_nonzero = int(n_elements * sparsity)
@@ -63,7 +63,7 @@ def extract_nonzero(
     indices = indices[:, :a]  #shape (batch_size, a)
     values = x.gather(1, indices)
 
-    return values, indices
+    return values.contiguous(), indices.contiguous()
 
 
 def extract_nonzero_for_loop(x):

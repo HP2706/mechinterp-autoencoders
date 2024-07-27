@@ -41,15 +41,13 @@ def test_autoencoder_benchmark(
         cfg = JumpReLUAutoEncoderConfig(
             dict_mult=dict_mult,
             d_input=d_input,
-            use_kernel=use_kernel,
             l1_coeff=0.01,
             threshold=sparsity_level
         )
-    elif model_cls in [AutoEncoder, GatedAutoEncoder]:
+    elif model_cls == [AutoEncoder, GatedAutoEncoder]:
         cfg = config_cls(
             dict_mult=dict_mult,
             d_input=d_input,
-            use_kernel=use_kernel,
             l1_coeff=0.01,
         )
     else:

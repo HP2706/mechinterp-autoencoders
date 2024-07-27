@@ -1,11 +1,8 @@
 #taken from https://github.com/openai/sparse_autoencoder/blob/main/sparse_autoencoder/kernels.py
-import torch
 
-try:
-    import triton
-    import triton.language as tl
-except ImportError:
-    pass
+import torch
+import triton
+import triton.language as tl
 
 
 def triton_sparse_transpose_dense_matmul(
@@ -33,7 +30,6 @@ def triton_sparse_transpose_dense_matmul(
 
     K = sparse_indices.shape[1]
     A = dense.shape[0]
-    B = dense.shape[1]
     assert sparse_indices.shape[0] == A
 
     # COO-format and sorted
@@ -64,10 +60,9 @@ def triton_coo_sparse_dense_matmul(
 
     out = torch.zeros(N, B, device=dense.device, dtype=coo_values.dtype)
 
-    grid = lambda META: (
-        triton.cdiv(AK, META["BLOCK_SIZE_AK"]),
-        1,
-    )
+    def grid(META):
+        return triton.cdiv(AK, META["BLOCK_SIZE_AK"]), 1
+
     triton_sparse_transpose_dense_matmul_kernel[grid](
         coo_indices,
         coo_values,
@@ -407,16 +402,14 @@ class TritonDecoder(torch.autograd.Function):
     def forward(ctx, sparse_indices, sparse_values, decoder_weight):
         ctx.save_for_backward(sparse_indices, sparse_values, decoder_weight)
         return triton_sparse_dense_matmul(
-            sparse_indices, sparse_values, decoder_weight.T.contiguous()
+            sparse_indices, sparse_values, decoder_weight.T
         )
 
     @staticmethod
     def backward(ctx, grad_output):
         sparse_indices, sparse_values, decoder_weight = ctx.saved_tensors
 
-        assert (
-            grad_output.is_contiguous()
-        ), "grad_output must be contiguous; this is probably because the subsequent op was a .sum() or something like that, which returns a non contiguous gradient"
+        assert grad_output.is_contiguous(), "grad_output must be contiguous"
 
         decoder_grad = triton_sparse_transpose_dense_matmul(
             sparse_indices, sparse_values, grad_output, N=decoder_weight.shape[1]

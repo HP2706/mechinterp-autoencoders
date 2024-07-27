@@ -1,6 +1,6 @@
 import torch
 import time
-from typing import Any, Literal, Optional, Self, Union, overload
+from typing import Any, Literal, Optional, Self, Union, cast, overload
 from pydantic import BaseModel
 import os
 from abc import ABC, abstractmethod
@@ -8,7 +8,8 @@ import inspect
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
-from jaxtyping import Float
+from jaxtyping import Float, Int, jaxtyped
+from beartype import beartype
 from tqdm import tqdm
 from contextlib import contextmanager
 from mechinterp_autoencoders.utils import extract_nonzero
@@ -43,10 +44,6 @@ class AbstractAutoEncoder(nn.Module, ABC):
     
     @abstractmethod
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):...
-
-    @property
-    def d_sae(self):
-        return self.cfg.d_sae
     
     @abstractmethod
     def forward(self, x: Float[Tensor, 'batch d_in']):
@@ -169,10 +166,13 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         W_dec : (d_sae, d_input)
         b_enc : (d_sae)
         '''
-        self.W_enc = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.cfg.d_input, self.d_sae, dtype=self.cfg.dtype)).contiguous())
-        self.W_dec = nn.Parameter(nn.init.kaiming_uniform_(torch.empty(self.d_sae, self.cfg.d_input, dtype=self.cfg.dtype)).contiguous())
-        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype).contiguous())
-        self.b_enc = nn.Parameter(torch.zeros(self.d_sae, dtype=self.cfg.dtype).contiguous())
+        self.W_enc = nn.Parameter(torch.randn(self.cfg.d_input, self.cfg.d_sae, dtype=self.cfg.dtype))
+        self.W_dec = nn.Parameter(torch.randn(self.cfg.d_sae, self.cfg.d_input, dtype=self.cfg.dtype).contiguous())
+
+        assert self.W_dec.is_contiguous(), "W_dec must be contiguous"
+        self.pre_bias = nn.Parameter(torch.zeros(self.cfg.d_input, dtype=self.cfg.dtype))
+        self.b_enc = nn.Parameter(torch.zeros(self.cfg.d_sae, dtype=self.cfg.dtype))
+
         if self.cfg.tie_w_dec:
             self.tie_weights()
 
@@ -181,7 +181,7 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         ties the encoder to the transpose of the decoder weights
         '''
         if self.cfg.tie_w_dec:
-            self.W_enc.data = self.W_dec.data.t().clone()
+            self.W_enc.data = self.W_dec.data.clone().T.contiguous()
 
     @contextmanager
     def _prepare_params(self, x: Tensor, feature_indices: Optional[slice]):
@@ -206,8 +206,8 @@ class BaseAutoEncoder(AbstractAutoEncoder):
     # inspired by https://github.com/EleutherAI/sae/blob/main/sae/utils.py#L94
     def eager_decode(
         self, 
-        top_indices : Tensor,
-        top_acts : Tensor,
+        top_indices : Int[Tensor, 'batch k'],
+        top_acts : Float[Tensor, 'batch k'],
         feature_indices: Optional[slice] = None
     ) -> Tensor:
         '''
@@ -215,9 +215,28 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         '''
         with self._prepare_params(top_acts, feature_indices):
             buf = top_acts.new_zeros(top_acts.shape[:-1] + (self.cfg.d_sae,))
-            print(buf.shape, top_indices.shape, top_acts.shape)
             acts = buf.scatter_(dim=-1, index=top_indices, src=top_acts)
-            return acts @ self.W_dec + self.pre_bias
+            assert buf.shape == (top_acts.shape[0], self.cfg.d_sae), f"expected shape (top_acts.shape[0]/batch, self.cfg.d_sae) got {buf.shape}"
+            return acts @ self.W_dec
+
+    def kernel_decode(
+        self, 
+        top_indices : Int[Tensor, 'batch k'], 
+        top_acts : Float[Tensor, 'batch k'], 
+        feature_indices: Optional[slice] = None
+    ) -> Float[Tensor, 'batch d_in']:
+        '''
+        Decode method assumes self.W_dec and self.pre_bias are defined
+        '''
+        with self._prepare_params(top_acts, feature_indices):
+            if torch.cuda.is_available():
+                return cast(
+                    Tensor,
+                    TritonDecoder.apply(top_indices, top_acts, self.W_dec.mT)
+                )
+            else:
+                raise ValueError("Triton decoder is not available on non cuda devices")
+
 
     def decode(self, acts : Tensor, feature_indices: Optional[slice] = None) -> Tensor:
         '''
@@ -227,30 +246,27 @@ class BaseAutoEncoder(AbstractAutoEncoder):
             if self.cfg.use_top_k:
                 non_zero_values, non_zero_indices = extract_nonzero(acts)
                 if torch.cuda.is_available():
-                    y = TritonDecoder.apply(
-                        non_zero_indices.contiguous(), 
-                        non_zero_values.to(self.cfg.dtype).contiguous(), 
-                        self.W_dec.mT.contiguous()
-                    )
-                    return y + self.pre_bias
+                    decoded =  self.kernel_decode(non_zero_indices, non_zero_values) 
                 else:
-                    return self.eager_decode(non_zero_indices, non_zero_values)
+                    decoded = self.eager_decode(non_zero_indices, non_zero_values) 
             else:
-                return acts @ self.W_dec + self.pre_bias
+                decoded = acts @ self.W_dec.mT
+
+            return decoded + self.pre_bias #apply bias
     
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):
         for dict_idx, (k, v) in tqdm(enumerate(optimizer.state.items()), desc="setting gradients to zero"):
             for v_key in ["exp_avg", "exp_avg_sq"]:
                 if dict_idx == 0:
-                    assert k.data.shape == (self.d_sae, self.cfg.d_input), f"expected shape (self.d_sae, self.cfg.d_input) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_sae, self.cfg.d_input), f"expected shape (self.cfg.d_sae, self.cfg.d_input) got {k.data.shape}"
                     v[v_key][indices, :] = 0.0
                 elif dict_idx == 1:
-                    assert k.data.shape == (self.cfg.d_input, self.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input, self.cfg.d_sae), f"expected shape (self.cfg.d_input,) got {k.data.shape}"
                     v[v_key][:, indices] = 0.0
                 elif dict_idx == 2:
-                    assert k.data.shape == (self.d_sae,), f"expected shape (self.cfg.d_input, self.d_sae) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_sae,), f"expected shape (self.cfg.d_input, self.cfg.d_sae) got {k.data.shape}"
                     v[v_key][indices] = 0.0
                 elif dict_idx == 3:
-                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.d_sae,) got {k.data.shape}"
+                    assert k.data.shape == (self.cfg.d_input,), f"expected shape (self.cfg.d_sae,) got {k.data.shape}"
                 else:
                     raise ValueError(f"Unexpected dict_idx {dict_idx}")
