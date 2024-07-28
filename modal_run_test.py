@@ -2,7 +2,7 @@ from modal import Mount, gpu
 from modal_common import app, image
 
 #mount the tests directory
-tests = Mount.from_local_dir(".", remote_path="/root/tests")
+tests = Mount.from_local_dir(".", remote_path="/root/project")
 
 #run all tests on modal
 # this enables us to run tests on a GPU 
@@ -13,7 +13,20 @@ tests = Mount.from_local_dir(".", remote_path="/root/tests")
 )
 def run_tests():
     import subprocess
-    subprocess.run(["pytest", "tests"], check=True, cwd="/root")
+    import os
+    import sys
+    # Add the project directory to the Python path
+    project_dir = "/root/project"
+    sys.path.append(project_dir)
+    # Change to the project directory
+    os.chdir(project_dir)
+
+    print("in run_tests os.listdir()", os.listdir())
+    print("in run_tests os.getcwd()", os.getcwd())
+
+    # Run the tests
+    subprocess.run(["pytest", "tests"], check=True)
+
 
 @app.local_entrypoint()
 def main():

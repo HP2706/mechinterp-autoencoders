@@ -3,7 +3,7 @@ from modal import gpu, Mount
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from benchmarks.perf import run_benchmarks, AutoEncoder, TopKAutoEncoder
+from benchmarks.perf import test
 
 @app.function(
     image=image,
@@ -19,7 +19,7 @@ def benchmark(cleanup: bool = False):
             os.system("rm -rf /root/modal_benchmark/data")
 
     os.makedirs("/root/modal_benchmark/data", exist_ok=True)
-    run_benchmarks("/root/modal_benchmark/data", [AutoEncoder, TopKAutoEncoder])
+    test()
     vol.commit()
 
 @app.local_entrypoint()
@@ -27,5 +27,5 @@ def main():
     benchmark.remote(cleanup=True)
     local_dir_path = 'benchmarks/data'
     os.makedirs(local_dir_path, exist_ok=True)
-    import subprocess
-    subprocess.run(["modal", "volume", "get", "modal_benchmark", "modal_benchmark/data", "--force"], check=True)
+    #import subprocess
+    #subprocess.run(["modal", "volume", "get", "benchmark-autoencoders", "benchmark_autoencoders/data", "--force"], check=True)

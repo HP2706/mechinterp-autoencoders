@@ -1,6 +1,11 @@
 import pytest
-from mechinterp_autoencoders.utils import extract_nonzero, generate_sparse_tensor, get_device
 import torch
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) #NOTE FOR MODAL
+
+
+from mechinterp_autoencoders.utils import extract_nonzero, generate_sparse_tensor, get_device
 from torch.nn.functional import mse_loss
 from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, GatedAutoEncoder
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
@@ -72,7 +77,7 @@ def test_generate_sparse_tensor():
     d_input = 768
     sparsity_level = 0.001
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    x = generate_sparse_tensor(batch_size, d_input, sparsity_level, device)
+    x = generate_sparse_tensor((batch_size, d_input), sparsity_level, device)
     assert x.shape == (batch_size, d_input)
     assert torch.count_nonzero(x) == int(batch_size * d_input * sparsity_level)
 

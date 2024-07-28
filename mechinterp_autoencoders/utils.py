@@ -15,19 +15,15 @@ def get_device():
     return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 def generate_sparse_tensor(
-    batch_size: int,
-    feature_dim: int,
+    size :tuple[int, int],
     sparsity: float,
     device: torch.device = torch.device('cpu'),
     dtype: torch.dtype = torch.float32
 ) -> torch.Tensor:
-    n_elements = batch_size * feature_dim
+    n_elements = size[0] * size[1]
     n_nonzero = int(n_elements * sparsity)
-    
-    x = torch.zeros(batch_size, feature_dim, device=device, dtype=dtype)
-    
+    x = torch.zeros(size, device=device, dtype=dtype)
     indices = torch.randperm(n_elements, device=device)[:n_nonzero]
-    
     # Fill the selected indices with random non-zero values
     x.view(-1)[indices] = torch.randn(n_nonzero, device=device, dtype=dtype)
     
@@ -35,70 +31,22 @@ def generate_sparse_tensor(
 
 @jaxtyped(typechecker=beartype)
 def extract_nonzero(
-    x: Float[Tensor, "batch_size seq_len"]
-) -> tuple[Float[Tensor, "batch_size a"], Int[Tensor, "batch_size a"]]:
-    batch_size, seq_len = x.shape
-    mask = (x.abs() > 1e-5).long()
-    a = int(mask.sum(1).max().item())
-    
-    torch.zeros(batch_size, a, device=x.device)
-    non_zero_idxs = torch.nonzero(mask)
-    row_counts = torch.bincount(non_zero_idxs[:, 0], minlength=batch_size)
-    padding_count = a - row_counts
-
-    # Correct way to get zero indices
-    values = torch.zeros(batch_size, a, device=x.device, dtype=x.dtype)
-    indices = torch.zeros(batch_size, a, device=x.device, dtype=torch.long)
-
-    # crazy vectorized way to get the indices
-    # what are you not willing to do to avoid a for loop in python:)
-    free_mask = (mask == 0) & (torch.arange(seq_len, device=x.device).unsqueeze(0) < padding_count.unsqueeze(1))
-    non_zero_mask = mask.bool()
-
-    indices = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch_size, -1)
-    indices = torch.where(
-        free_mask | non_zero_mask, indices, 
-        torch.zeros(batch_size, seq_len, device=x.device, dtype=torch.long)
-    )
-    indices = indices[:, :a]  #shape (batch_size, a)
-    values = x.gather(1, indices)
-
-    return values.contiguous(), indices.contiguous()
+    x : Float[Tensor, "batch_size d_sae"]
+) -> tuple[
+    Float[Tensor, "batch_size a"], 
+    Int[Tensor, "batch_size a"]
+]:
+    '''
+    takes d_sae dimensional batch and return a tensor that has as many dimensions as the maximum non_zero elements in the batch
+    this is for instance useful at inference time when the tensors are extremely sparse or late in training
+    '''
+    # Find the max number of non-zero elements in the batch
+    max_non_zero_elms = int((x.abs() > 1e-5).sum(dim=-1).max())
+    topk = torch.topk(x.abs(), k=max_non_zero_elms, dim=-1)
+    sorted_values = torch.gather(x, -1, topk.indices)
+    return sorted_values.contiguous(), topk.indices.contiguous()
 
 
-def extract_nonzero_for_loop(x):
-    batch_size, seq_len = x.shape
-    mask = (x.abs() > 1e-5).long()
-    a = mask.sum(1).max().item()
-
-    values = []
-    indices = []
-    for i in range(batch_size):
-        non_zero_idxs = torch.nonzero(mask[i]).squeeze()
-        num_non_zero = non_zero_idxs.numel()
-        
-        if non_zero_idxs.dim() == 0:
-            non_zero_idxs = non_zero_idxs.unsqueeze(0)
-        num_non_zero = non_zero_idxs.numel()
-        # Get all possible indices
-        all_indices = torch.arange(seq_len, device=x.device)
-        zero_idxs = all_indices[~torch.isin(all_indices, non_zero_idxs)]
-        # Randomly select padding indices
-        padding_idxs = zero_idxs[torch.randperm(zero_idxs.numel())[:a - num_non_zero]]
-        
-        # Combine non-zero and padding indices
-        row_indices = torch.cat([non_zero_idxs, padding_idxs]) if non_zero_idxs.numel() > 0 else padding_idxs
-        non_zero_row = x[i,row_indices]
-        values.append(non_zero_row)
-        indices.append(row_indices)
-        
-    values = torch.stack(values)
-    indices = torch.stack(indices)
-    
-    assert values.shape == (batch_size, a)
-    assert indices.shape == (batch_size, a)
-    
-    return values, indices
 
 def format_image_anthropic(img: Union[Image.Image, str]) -> dict:
     if isinstance(img, str):
