@@ -46,7 +46,7 @@ class AbstractAutoEncoder(nn.Module, ABC):
     def zero_optim_grads(self, optimizer : Optimizer, indices : torch.Tensor):...
     
     @abstractmethod
-    def forward(self, x: Float[Tensor, 'batch d_in']):
+    def forward(self, x: Float[Tensor, 'batch d_in'], method: Literal['reconstruct', 'with_loss','acts']):
         """
         Abstract forward method that must be implemented by subclasses.
         The method parameter can dictate the behavior of the forward pass.
@@ -252,7 +252,7 @@ class BaseAutoEncoder(AbstractAutoEncoder):
             if self.cfg.use_top_k:
                 non_zero_values, non_zero_indices = extract_nonzero(acts)
                 if torch.cuda.is_available():
-                    decoded =  self.kernel_decode(non_zero_indices, non_zero_values) 
+                    decoded = self.kernel_decode(non_zero_indices, non_zero_values) 
                 else:
                     decoded = self.eager_decode(non_zero_indices, non_zero_values) 
             else:

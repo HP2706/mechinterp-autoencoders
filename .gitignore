@@ -6,3 +6,4 @@ main.py
 main.ipynb
 *.html
 *.parquet
+*.png

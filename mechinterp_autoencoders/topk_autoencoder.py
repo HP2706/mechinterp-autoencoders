@@ -122,7 +122,7 @@ class TopKAutoEncoder(BaseAutoEncoder):
         self, 
         x: Tensor, 
         method: Literal['with_acts', 'with_loss', 'reconstruct'],
-        ema_frequency_counter : Optional[Tensor],
+        ema_frequency_counter : Optional[Tensor] = None,
         feature_indices: Optional[slice] = None
     ) -> Union[Tensor, dict]:
         acts, non_zero_indices = self.encode(x, feature_indices)

@@ -1,300 +1,232 @@
 import sys
 import os
 import random
-from typing import Callable
+from typing import Any, Callable, Optional, cast
 from pytest import Function
 import itertools
 from regex import F
 import tqdm
+from sae import Sae, SaeConfig
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 import torch
-import time
+import torch.nn as nn
 import pandas as pd
-import plotly.express as px
-from mechinterp_autoencoders.base_autoencoder import BaseAutoEncoder
+from mechinterp_autoencoders.base_autoencoder import BaseAutoEncoder, AutoEncoderBaseConfig
 from mechinterp_autoencoders.GatedAutoencoder import GatedAutoEncoderConfig, GatedAutoEncoder
 from mechinterp_autoencoders.autoencoder import AutoEncoder, AutoEncoderConfig
 from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoEncoderConfig
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
 from mechinterp_autoencoders.utils import generate_sparse_tensor, get_device, extract_nonzero
+from functools import wraps
+import matplotlib.pyplot as plt
+from mechinterp_autoencoders.kernels import TritonDecoder
 
-def test_autoencoder_benchmark(
-    model_cls, 
-    config_cls, 
-    dict_mult, 
-    d_input, 
-    k, 
-    sparsity_level, 
-    use_kernel, 
-    batch_size
-):
-    if model_cls.__name__ == 'TopKAutoEncoder':
-        cfg = TopKAutoEncoderConfig(
-            dict_mult=dict_mult,
-            d_input=d_input,
-            k=k,
-            k_aux=k,
-            use_kernel=use_kernel
-        )
-    elif model_cls.__name__ == 'JumpReLUAutoEncoder':
-        cfg = JumpReLUAutoEncoderConfig(
-            dict_mult=dict_mult,
-            d_input=d_input,
-            l1_coeff=0.01,
-            threshold=sparsity_level
-        )
-    elif model_cls.__name__ in ['AutoEncoder', 'GatedAutoEncoder']:
-        cfg = config_cls(
-            dict_mult=dict_mult,
-            d_input=d_input,
-            l1_coeff=0.01,
-        )
-    else:
-        raise ValueError(f'Unknown model class: {model_cls}')
-
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    model = model_cls(cfg).to(device)
-    
-    total_time = 0
-    num_iterations = 3
-    
-    with torch.autocast(
-        device_type=device.type, 
-        dtype=torch.bfloat16 if device == 'cuda' else torch.float32
-    ):
-        gpu_memory_usage = []
-        t0 = time.time()
-        x = generate_sparse_tensor((batch_size, d_input), sparsity_level, device)
-        print(f'generate_sparse_tensor took {time.time() - t0} seconds')
-        for _ in range(num_iterations):
-            start_time = time.time()
-            if isinstance(model, TopKAutoEncoder):
-                model.forward(x, method='with_loss', ema_frequency_counter=torch.randn(d_input).to(device))
-            else:
-                model.forward(x, method='with_loss')
-            
-            gpu_memory_usage.append(torch.cuda.memory_allocated(device))
-            end_time = time.time()
-            total_time += end_time - start_time
-    
-    avg_time = total_time / num_iterations
-    avg_gpu_memory_usage = sum(gpu_memory_usage) / num_iterations
-
-    assert True
-    return {
-        'model': model_cls.__name__,
-        'dict_mult': dict_mult,
-        'd_input': d_input,
-        'k': k,
-        'sparsity_level': sparsity_level,
-        'use_kernel': use_kernel,
-        'batch_size': batch_size,
-        'avg_time': avg_time,
-        'avg_gpu_memory_usage': avg_gpu_memory_usage
-    }
-
-def visualize_and_save(df: pd.DataFrame, save_path: str):
-    
-    #NOTE DONT CHANGE THIS PATH
-    os.makedirs(save_path, exist_ok=True)
-    df.to_parquet(f"{save_path}/benchmark_results.parquet")
-    print(f"saving to {save_path}/benchmark_results.parquet")
-    # Group by all parameters except d_input and avg_time
-    grouping_cols = ['model', 'dict_mult', 'k', 'sparsity_level', 'batch_size', 'use_kernel']
-    
-    # Apply negative reciprocal transformation to avg_time
-    df['avg_time'] = df['avg_time'] * 1000
-    df['log_avg_time'] = np.log10(df['avg_time'])
-    for use_kernel in [True, False]:
-        fig = px.line(df, x='dict_mult', y='log_avg_time',
-            color=df.apply(lambda row: f"{row['model']} ({'with' if row['use_kernel'] else 'without'} kernel)", axis=1),
-            line_dash='d_input', symbol='k',
-            facet_col='sparsity_level', facet_row='batch_size',
-            hover_data=grouping_cols + ['avg_time'],
-            title=('Performance Curves by Model and Input Dimension (Transformed Scale)'),
-            height=1000, 
-            width=1200
-        )
-        
-        # Update y-axis to show original values
-        max_time = df['log_avg_time'].max()
-        tick_values = [0.001, 0.01, 0.1, min(1, max_time)]
-        fig.update_layout(yaxis=dict(
-            tickmode='array',
-            tickvals=[-1/t for t in tick_values],
-            ticktext=[f'{t:.3f}' for t in tick_values],
-            title='log(avg_time) (milliseconds)'
-        ))
-
-        fig.write_html(f'{save_path}/performance_curves{"with_kernel" if use_kernel else ""}.html')
-        fig.show()
-
-def get_params(
-    models: list[type[BaseAutoEncoder]],
-    local_test: bool = False
-) -> list[list[dict]]:
-
-    cfg_dict = {
-        AutoEncoder: AutoEncoderConfig,
-        GatedAutoEncoder: GatedAutoEncoderConfig,
-        TopKAutoEncoder: TopKAutoEncoderConfig,
-        JumpReLUAutoEncoder: JumpReLUAutoEncoderConfig
-    }
-
-    model_cfgs = [
-        (model, cfg_dict[model])
-        for model in models
-    ]
-    
-    if local_test:
-        param_values = [
-            model_cfgs,
-            [1],  # dict_mults
-            [768],  # d_inputs
-            [8],  # ks
-            [0.001],  # sparsity_levels
-            [False],  # use_kernels
-            [10]  # batch_sizes
-        ]
-    else:
-        param_values = [
-            model_cfgs,
-            [16, 32, 64],  # dict_mults
-            [768],  # d_inputs
-            [8, 16, 32],  # ks
-            [0.1, 0.001, 0.0001, 0.00001],  # sparsity_levels
-            [True, False],  # use_kernels
-            [1024, 2048]  # batch_sizes
-        ]
-
-    param_names = ['model_config', 'dict_mult', 'd_input', 'k', 'sparsity_level', 'use_kernel', 'batch_size']
-
+def shape_params(params: dict[str, list]) -> list[dict[str, Any]]:
     all_params = []
-    for values in itertools.product(*param_values):
-        param_dict = dict(zip(param_names, values))
-        param_dict['model_cls'], param_dict['config_cls'] = param_dict.pop('model_config')
+    for values in itertools.product(*params.values()):
+        param_dict = dict(zip(params.keys(), values))
         all_params.append(param_dict)
-
-    random.shuffle(all_params)
-    all_params = [list(all_params)[i:i+10] for i in range(0, len(all_params), 10)]
     return all_params
 
-def benchmark_decode(save_path: str, decode_funcs: dict[str, callable]):
+def benchmark(func=None, *, n_runs=2, with_memory=True):
+    def decorator(f):
+        @wraps(f)
+        def wrapper(*args, **kwargs):
+            torch.cuda.empty_cache()
+            
+            total_time = 0
+            results = []
+            
+            for i in range(n_runs+1):
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                
+                start.record()
+                result = f(*args, **kwargs)
+                end.record()
+                
+                torch.cuda.synchronize()
+                elapsed_time = start.elapsed_time(end)
+                if i == 0:
+                    #warmup first round doesnt count
+                    total_time += elapsed_time
+                    results.append(result)
+
+                torch.cuda.empty_cache()
+
+            avg_time = total_time / n_runs
+
+            if with_memory:
+                memory_allocated = torch.cuda.memory_allocated()
+                return results[-1], avg_time, memory_allocated
+            return results[-1], avg_time
+
+        return wrapper
+    
+    if func is None:
+        return decorator
+    else:
+        return decorator(func)
+
+@benchmark(with_memory=False)
+@torch.compile
+def extract_nonzero_1(x):
+    max_non_zero_elms = int((x != 0).any(dim=0).sum())
+    _, top_indices = x.abs().topk(max_non_zero_elms, sorted=False)
+    top_acts = x.gather(dim=-1, index=top_indices)
+
+@benchmark(with_memory=False)
+@torch.compile
+def extract_nonzero_2(x):
+    max_non_zero_elms = int((x != 0).sum(dim=-1).max())
+    _, top_indices = x.abs().topk(max_non_zero_elms, sorted=False)
+    top_acts = x.gather(dim=-1, index=top_indices)
+
+@benchmark(with_memory=False)
+@torch.compile
+def extract_nonzero_3(x):
+    _, top_indices = x.abs().topk(64, sorted=False)
+    return x.gather(dim=-1, index=top_indices)
+
+@benchmark(with_memory=False)
+@torch.compile
+def fixed_extract_nonzero(x):
+    return torch.topk(x, 64, dim=1, sorted=False)
+
+def benchmark_nonzero(dim_range, dict_mult=64, num_runs=10):
+    results = {
+        'dim': [],
+        'extract_nonzero_1': [],
+        'extract_nonzero_2': [],
+        'extract_nonzero_3': [],
+        'fixed_extract_nonzero': []
+    }
+
+    for d in dim_range:
+        times = {k: [] for k in results.keys() if k != 'dim'}
+
+        for _ in range(num_runs):
+            x = generate_sparse_tensor((8, d*dict_mult), 0.00001, device=get_device())
+            W_dec = torch.nn.Parameter(torch.randn(dict_mult*d, 128, device=get_device()).contiguous())
+
+            _, times['extract_nonzero_1'].append(extract_nonzero_1(x)[1])
+            _, times['extract_nonzero_2'].append(extract_nonzero_2(x)[1])
+            _, times['extract_nonzero_3'].append(extract_nonzero_3(x)[1])
+            _, times['fixed_extract_nonzero'].append(fixed_extract_nonzero(x)[1])
+            torch.cuda.empty_cache()
+
+        results['dim'].append(d)
+        for k, v in times.items():
+            results[k].append(np.mean(v))
+
+    return pd.DataFrame(results)
+
+def benchmark_models(
+    save_path: str,
+    models: list[tuple[type[BaseAutoEncoder], AutoEncoderBaseConfig]],
+):
     results = []
-    
-    dict_mults = [32, 64, 128, 256]
-    d_inputs = [768]
-    sparsity_levels = [0.001, 0.0001]
-    batch_sizes = [1024]
-    
-    device = get_device()
-    params = itertools.product(dict_mults, d_inputs, sparsity_levels, batch_sizes)
-    
-    for dict_mult, d_input, sparsity_level, batch_size in tqdm.tqdm(list(params)):
-        d_sae = d_input * dict_mult
-        x = generate_sparse_tensor((batch_size, d_sae), sparsity_level, device)
-        print("non-zero elms", torch.count_nonzero(x).item())
 
-        autoencoder = AutoEncoder(
-            AutoEncoderConfig(
-                dict_mult=dict_mult, 
-                d_input=d_input, 
-                l1_coeff=0.01
-            )
-        ).to(device)
+    for model_cls, config in models:
+        interval_dicts = {
+            'd_input': [768],
+            'dict_mult': [16],
+            'sparsity_level': [0.0001],
+            'batch_size': [128, 256],
+            'use_top_k': [True, False],
+            'use_torch_compile': [True, False]
+        }
+        
+        for params in tqdm.tqdm(shape_params(interval_dicts)):
+            config.dict_mult = params['dict_mult']
+            config.d_input = params['d_input']
+            config.use_top_k = params['use_top_k']
 
-        for decode_name, decode_func in decode_funcs.items():
+            model = model_cls(config).to(get_device())
+            model = torch.compile(model) if params['use_torch_compile'] else model
+            model = cast(BaseAutoEncoder, model)
 
-            decode_times = []
-            for _ in range(2):  # Perform each measurement twice
-                t0 = time.time()
-                x_recons = decode_func(x, autoencoder)
-                decode_time = time.time() - t0
-                decode_times.append(decode_time)
+            @benchmark(with_memory=True)
+            def benchmark_func(x : torch.Tensor):
+                return model.forward(x, method='reconstruct')
             
-            avg_decode_time = sum(decode_times) / len(decode_times)
-            
+            x = generate_sparse_tensor((params['batch_size'], params['d_input']), params['sparsity_level'], device=get_device())
+            result, time, memory = benchmark_func(x)
             results.append({
-                'dict_mult': dict_mult,
-                'd_input': d_input,
-                'sparsity_level': sparsity_level,
-                'batch_size': batch_size,
-                'decode_method': decode_name,
-                'decode_time': avg_decode_time
+                'model': model.__class__.__name__,
+                **params,
+                'avg_time': time,
+                'avg_gpu_memory_usage': memory
             })
-            
-            print(f'\nAverage time for {decode_name} decode, {dict_mult} dict_mult, {d_input} d_input, {sparsity_level} sparsity, {batch_size} batch_size: {avg_decode_time:.4f} seconds\n\n')
 
     df = pd.DataFrame(results)
     os.makedirs(save_path, exist_ok=True)
-    df.to_parquet(f"{save_path}/decode_benchmark_results.parquet")
-    print(f"Saved results to {save_path}/decode_benchmark_results.parquet")
+    df.to_parquet(f"{save_path}/benchmark_results.parquet")
+    print(f"Saving to {save_path}/benchmark_results.parquet")
 
-    # Visualize results
-    fig = px.line(df, x='dict_mult', y='decode_time', color='decode_method',
-                  facet_col='sparsity_level', facet_row='batch_size',
-                  hover_data=['d_input', 'dict_mult'],
-                  title='Decode Performance by Method and Parameters',
-                  labels={'decode_time': 'Decode Time (seconds)'},
-                  height=800, width=1200)
+    df['avg_time_ms'] = df['avg_time'] * 1000
+    df['log_avg_time'] = np.log10(df['avg_time_ms'])
+    return df
+
+def benchmark_decode(dim_range , dict_mult=64, num_runs=10):
+    #benchmark decode with backward pass
+    @benchmark(with_memory=False, n_runs=5)
+    def kernel_decode(top_vals, top_idx, y, d):
+        W_dec = nn.Parameter(torch.randn(dict_mult*d, d, device=get_device()).contiguous())
+        out = TritonDecoder.apply(top_idx, top_vals, W_dec.mT)
+        mse = (out - y).pow(2).mean()
+        mse.backward()
+
+    @benchmark(with_memory=False, n_runs=5)
+    def base_decode(x, y, d : int):
+        W_dec = nn.Parameter(torch.randn(dict_mult*d, d, device=get_device()).contiguous())
+        out = x @ W_dec
+        mse = (out - y).pow(2).mean()
+        mse.backward()
     
-    fig.write_html(f'{save_path}/decode_performance_curves.html')
-    fig.show()
-
-def benchmark_get_nonzero(non_zero_fns: dict[str, Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]]):
-    dict_mults = [1024, 2048]
-    d_inputs = [3072]
-    sparsity_levels = [0.0001]
-    batch_sizes = [1024, 2048, 4096, 8192]
-
-    for fn_name, fn in non_zero_fns.items():
-        for dict_mult, d_input, sparsity_level, batch_size in itertools.product(dict_mults, d_inputs, sparsity_levels, batch_sizes):
-            d_sae = d_input * dict_mult
-            x = generate_sparse_tensor((batch_size, d_sae), sparsity_level, get_device())
-            t0 = time.perf_counter()
-            fn(x)
-            print(f'{fn_name} took {time.perf_counter() - t0} for {batch_size} batch_size, {d_input} d_input, {dict_mult} dict_mult, {k} k, {sparsity_level} sparsity')
-
-
-def run_benchmarks(
-    save_path: str,
-    models: list[type[BaseAutoEncoder]],
-    local_test: bool = False
-):
-    results = []
-    all_params = get_params(models, local_test)
-    for param_list in tqdm.tqdm(all_params):
-        #we use a list to get better sense of progress
-        for params in param_list:
-            result = test_autoencoder_benchmark(**params)
-            results.append(result)
-
-    visualize_and_save(pd.DataFrame(results), save_path)
-
-def test():
-    from mechinterp_autoencoders.utils import generate_sparse_tensor
-    def eager_decode(x, autoencoder : AutoEncoder):
-        top_vals, top_idx = extract_nonzero(x)
-        return autoencoder.eager_decode(top_idx, top_vals)
-
-    def kernel_decode(x, autoencoder : AutoEncoder):
-        top_vals, top_idx = torch.topk(x, k=10, dim=1)
-        return autoencoder.kernel_decode(top_idx, top_vals)
-
-    def base_decode(x, autoencoder : AutoEncoder):
-        return x @ autoencoder.W_dec
-
-    decode_funcs = {
-        #'eager': eager_decode, 
-        'base': base_decode,
-        'kernel': kernel_decode
+    results = {
+        'dim': [],
+        'base_decode': [],
+        'kernel_decode': []
     }
+    for d in dim_range:
+        x = generate_sparse_tensor((8, d*dict_mult), 0.00001, device=get_device())
+        y = generate_sparse_tensor((8, d), 0.00001, device=get_device())
+        _, base_time = base_decode(x, y, d)
+        top_vals, top_idx = torch.compile(extract_nonzero)(x)
+        _, kernel_time = kernel_decode(top_vals, top_idx, y, d)
 
-    #benchmark_decode('benchmarks/data', decode_funcs)
-    run_benchmarks('benchmarks/data', [AutoEncoder, TopKAutoEncoder])
+        results['dim'].append(d)
+        results['base_decode'].append(base_time)
+        results['kernel_decode'].append(kernel_time)
+    
+    return pd.DataFrame(results)
+
+
+def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
+    plt.figure(figsize=(10, 6))
+    
+    for column in df.columns:
+        if column != 'dim':
+            plt.plot(df['dim'][1:], df[column][1:], label=column.capitalize())
+    
+    plt.xlabel('Dimension')
+    plt.ylabel('Time (ms)')
+    plt.title('Performance Comparison get nonzero')
+    plt.legend()
+    plt.grid(True)
+    if save_path:
+        if os.path.exists(save_path):
+            os.remove(save_path)
+        plt.savefig(save_path)
+    plt.show()
+    
+def test():
+
+    df = benchmark_decode([256, 512, 1024, 2048, 4096, 8192])
+    visualize(df, 'benchmarks/data/decode.png')
 
 if __name__ == '__main__':
-    #os.makedirs('benchmarks/data', exist_ok=True)
     test()

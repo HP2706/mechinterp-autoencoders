@@ -26,10 +26,8 @@ def generate_sparse_tensor(
     indices = torch.randperm(n_elements, device=device)[:n_nonzero]
     # Fill the selected indices with random non-zero values
     x.view(-1)[indices] = torch.randn(n_nonzero, device=device, dtype=dtype)
-    
     return x
 
-@jaxtyped(typechecker=beartype)
 def extract_nonzero(
     x : Float[Tensor, "batch_size d_sae"]
 ) -> tuple[
@@ -41,10 +39,10 @@ def extract_nonzero(
     this is for instance useful at inference time when the tensors are extremely sparse or late in training
     '''
     # Find the max number of non-zero elements in the batch
-    max_non_zero_elms = int((x.abs() > 1e-5).sum(dim=-1).max())
-    topk = torch.topk(x.abs(), k=max_non_zero_elms, dim=-1)
-    sorted_values = torch.gather(x, -1, topk.indices)
-    return sorted_values.contiguous(), topk.indices.contiguous()
+    max_non_zero_elms = int((x != 0).sum(dim=-1).max())
+    _, top_indices = x.abs().topk(max_non_zero_elms, sorted=False)
+    top_acts = x.gather(dim=-1, index=top_indices)
+    return top_acts.contiguous(), top_indices.contiguous()
 
 
 
@@ -84,12 +82,3 @@ def format_image_openai(img: Union[Image.Image, str]) -> dict:
                 "url": f"data:image/jpeg;base64,{base64_image}"
             }
         }
-
-def time_decorator(func):
-    @functools.wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.time()
-        result = func(*args, **kwargs)
-        print(f"Time taken for {func.__name__} is {time.time() - start}")
-        return result
-    return wrapper
