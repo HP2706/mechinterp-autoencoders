@@ -31,7 +31,6 @@ class TopKActivationFn(nn.Module):
         self.k_aux = k_aux
         self.postact_fn = postact_fn
 
-    @jaxtyped(typechecker=beartype)
     def forward(
         self, 
         x: Float[Tensor, "batch d_in"]
@@ -43,7 +42,6 @@ class TopKActivationFn(nn.Module):
         result.scatter_(-1, topk.indices, values)
         return result, topk.indices
 
-    @jaxtyped(typechecker=beartype)
     def forward_aux(
         self, 
         x: Float[Tensor, "batch d_in"], 
@@ -75,7 +73,6 @@ class TopKAutoEncoder(BaseAutoEncoder):
         self.activation = TopKActivationFn(k=cfg.k, k_aux=cfg.k_aux)
         self.to(self.cfg.dtype)
 
-    @jaxtyped(typechecker=beartype)
     def encode_pre_act(
         self,
         x: Float[Tensor, "batch d_in"],
@@ -86,7 +83,6 @@ class TopKAutoEncoder(BaseAutoEncoder):
             x = x - self.pre_bias
             return x @ self.W_enc + self.b_enc
 
-    @jaxtyped(typechecker=beartype)
     def encode(
         self, 
         x: Float[Tensor, "batch d_in"],
@@ -100,7 +96,6 @@ class TopKAutoEncoder(BaseAutoEncoder):
             acts = self.encode_pre_act(x)
             return self.activation.forward(acts)
 
-    @jaxtyped(typechecker=beartype)
     def decode(
         self, 
         acts: Float[Tensor, "batch d_sae"],

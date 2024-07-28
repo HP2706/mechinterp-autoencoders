@@ -123,68 +123,71 @@ def benchmark_nonzero(dim_range, dict_mult=64, num_runs=10):
 
     return pd.DataFrame(results)
 
+@benchmark(with_memory=True)
+def benchmark_model(model: BaseAutoEncoder, x: torch.Tensor):
+    return model.forward(x, method='reconstruct')
+
 def benchmark_models(
     save_path: str,
     models: list[tuple[type[BaseAutoEncoder], AutoEncoderBaseConfig]],
+    interval_dicts: dict[str, list],
+    num_runs: int = 5
 ):
-    results = []
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+    results = {
+        'dim': [],
+    }
+    for model_cls, _ in models:
+        results[f'{model_cls.__name__}_time'] = []
+        #results[f'{model_cls.__name__}_memory'] = []
 
-    for model_cls, config in models:
-        interval_dicts = {
-            'd_input': [768],
-            'dict_mult': [16],
-            'sparsity_level': [0.0001],
-            'batch_size': [128, 256],
-            'use_top_k': [True, False],
-            'use_torch_compile': [True, False]
-        }
-        
-        for params in tqdm.tqdm(shape_params(interval_dicts)):
+    for model_cls, config in tqdm.tqdm(models, desc="Models"):
+        for params in tqdm.tqdm(shape_params(interval_dicts), desc="Params", leave=False):
             config.dict_mult = params['dict_mult']
-            config.d_input = params['d_input']
+            config.d_input = params['dim']
             config.use_top_k = params['use_top_k']
 
             model = model_cls(config).to(get_device())
+            original_class_name = model.__class__.__name__
             model = torch.compile(model) if params['use_torch_compile'] else model
             model = cast(BaseAutoEncoder, model)
 
-            @benchmark(with_memory=True)
-            def benchmark_func(x : torch.Tensor):
-                return model.forward(x, method='reconstruct')
+            x = generate_sparse_tensor((params['batch_size'], params['dim']), params['sparsity_level'], device=get_device())
             
-            x = generate_sparse_tensor((params['batch_size'], params['d_input']), params['sparsity_level'], device=get_device())
-            result, time, memory = benchmark_func(x)
-            results.append({
-                'model': model.__class__.__name__,
-                **params,
-                'avg_time': time,
-                'avg_gpu_memory_usage': memory
-            })
+            _, time, memory = benchmark_model(model, x)
 
+            results[f'{original_class_name}_time'].append(time)
+            #results[f'{original_class_name}_memory'].append(memory)
+            results['dim'].append(params['dim'])
+ 
+    print('results', results)
     df = pd.DataFrame(results)
     os.makedirs(save_path, exist_ok=True)
     df.to_parquet(f"{save_path}/benchmark_results.parquet")
     print(f"Saving to {save_path}/benchmark_results.parquet")
-
-    df['avg_time_ms'] = df['avg_time'] * 1000
-    df['log_avg_time'] = np.log10(df['avg_time_ms'])
     return df
 
-def benchmark_decode(dim_range , dict_mult=64, num_runs=10):
+def benchmark_decode(dim_range , dict_mult=64, num_runs=5):
     #benchmark decode with backward pass
-    @benchmark(with_memory=False, n_runs=5)
-    def kernel_decode(top_vals, top_idx, y, d):
+    @benchmark(with_memory=False, n_runs=num_runs)
+    def kernel_decode(x : torch.Tensor, d : int, k : Optional[int] = None, y : Optional[torch.Tensor] = None):
         W_dec = nn.Parameter(torch.randn(dict_mult*d, d, device=get_device()).contiguous())
+        top_vals, top_idx = torch.compile(extract_nonzero)(x, k)
         out = TritonDecoder.apply(top_idx, top_vals, W_dec.mT)
-        mse = (out - y).pow(2).mean()
-        mse.backward()
+        if y is not None:
+            mse = (out - y).pow(2).mean()
+            mse.backward()
+        return out
 
     @benchmark(with_memory=False, n_runs=5)
-    def base_decode(x, y, d : int):
+    def base_decode(x : torch.Tensor, d : int, y : Optional[torch.Tensor] = None):
         W_dec = nn.Parameter(torch.randn(dict_mult*d, d, device=get_device()).contiguous())
         out = x @ W_dec
-        mse = (out - y).pow(2).mean()
-        mse.backward()
+        if y is not None:
+            mse = (out - y).pow(2).mean()
+            mse.backward()
+        return out
     
     results = {
         'dim': [],
@@ -193,14 +196,14 @@ def benchmark_decode(dim_range , dict_mult=64, num_runs=10):
     }
     for d in dim_range:
         x = generate_sparse_tensor((8, d*dict_mult), 0.00001, device=get_device())
-        y = generate_sparse_tensor((8, d), 0.00001, device=get_device())
-        _, base_time = base_decode(x, y, d)
-        top_vals, top_idx = torch.compile(extract_nonzero)(x)
-        _, kernel_time = kernel_decode(top_vals, top_idx, y, d)
+        _, base_time = base_decode(x, d)
+        _, unknown_k_time = kernel_decode(x, d)
+        _, known_k_time = kernel_decode(x, d, k=32)
 
         results['dim'].append(d)
         results['base_decode'].append(base_time)
-        results['kernel_decode'].append(kernel_time)
+        results['kernel_unknown_k_decode'].append(unknown_k_time)
+        results['kernel_known_k_decode'].append(known_k_time)
     
     return pd.DataFrame(results)
 
@@ -225,8 +228,27 @@ def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
     
 def test():
 
-    df = benchmark_decode([256, 512, 1024, 2048, 4096, 8192])
+
+    df = benchmark_decode([256, 512, 1024, 2048])
     visualize(df, 'benchmarks/data/decode.png')
+
+    interval_dicts = {
+        'dim': [32, 64, 128],
+        'dict_mult': [2],
+        'sparsity_level': [0.0001],
+        'batch_size': [8],
+        'use_top_k': [True],
+        'use_torch_compile': [True]
+    }
+
+    df = benchmark_models(
+        save_path='benchmarks/data',
+        models=[
+            (AutoEncoder, AutoEncoderConfig(dict_mult=16, d_input=768, l1_coeff=0.0001))
+        ],
+        interval_dicts=interval_dicts
+    )
+    visualize(df, 'benchmarks/data/autoencoder.png')
 
 if __name__ == '__main__':
     test()

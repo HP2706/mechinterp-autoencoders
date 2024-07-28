@@ -204,7 +204,6 @@ class BaseAutoEncoder(AbstractAutoEncoder):
                 self.W_dec = original_W_dec
 
     # inspired by https://github.com/EleutherAI/sae/blob/main/sae/utils.py#L94
-    @jaxtyped(typechecker=beartype)
     def eager_decode(
         self, 
         top_indices : Int[Tensor, 'batch k'],
@@ -220,7 +219,6 @@ class BaseAutoEncoder(AbstractAutoEncoder):
             assert buf.shape == (top_acts.shape[0], self.cfg.d_sae), f"expected shape (top_acts.shape[0]/batch, self.cfg.d_sae) got {buf.shape}"
             return acts @ self.W_dec
         
-    @jaxtyped(typechecker=beartype)
     def kernel_decode(
         self, 
         top_indices : Int[Tensor, 'batch k'], 
@@ -239,7 +237,6 @@ class BaseAutoEncoder(AbstractAutoEncoder):
             else:
                 raise ValueError("Triton decoder is not available on non cuda devices")
 
-    @jaxtyped(typechecker=beartype)
     def decode(
         self, 
         acts : Float[Tensor, 'batch d_sae'], 

@@ -67,7 +67,6 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
         self.jump_relu = JumpReLUModule(threshold, self.cfg.bandwidth)
         self.to(self.cfg.dtype)
 
-    @jaxtyped(typechecker=beartype)
     def encode_pre_act(
         self,
         x : Float[Tensor, "batch d_input"],
@@ -78,7 +77,6 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
                 x = x - self.pre_bias
             return x @ self.W_enc + self.b_enc
         
-    @jaxtyped(typechecker=beartype)
     def encode(
         self,
         x : Float[Tensor, "batch d_input"],
@@ -86,7 +84,6 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
     ) -> Float[Tensor, "batch d_sae"]:
         return torch.relu(self.encode_pre_act(x, feature_indices))
 
-    @jaxtyped(typechecker=beartype)
     def forward(
         self,
         x : Float[Tensor, "batch d_input"],

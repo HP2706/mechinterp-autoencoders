@@ -24,7 +24,6 @@ class AutoEncoder(BaseAutoEncoder):
         self.l1_coeff = cfg.l1_coeff
         self.to(self.cfg.device) # move to device
 
-    @jaxtyped(typechecker=beartype)
     def encode(
         self, 
         x: Float[Tensor, "batch_size d_input"], 

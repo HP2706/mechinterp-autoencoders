@@ -67,8 +67,7 @@ class GatedAutoEncoder(BaseAutoEncoder):
                 self.W_dec = original_W_dec
                 self.b_gate = original_b_gate
                 self.b_mag = original_b_mag
-    
-    @jaxtyped(typechecker=beartype)
+
     def encode(
         self, 
         x: Float[Tensor, "batch d_input"], 
@@ -86,8 +85,6 @@ class GatedAutoEncoder(BaseAutoEncoder):
             acts = active_features * feature_magnitudes
         return acts, gate_center
     
-
-    @jaxtyped(typechecker=beartype)
     def forward(
         self, 
         x: Float[Tensor, "batch d_input"], 

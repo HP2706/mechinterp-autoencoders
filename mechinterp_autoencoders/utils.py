@@ -1,6 +1,6 @@
 import functools
 import time
-from typing import Union
+from typing import Optional, Union
 from PIL import Image
 import io
 import base64
@@ -29,7 +29,8 @@ def generate_sparse_tensor(
     return x
 
 def extract_nonzero(
-    x : Float[Tensor, "batch_size d_sae"]
+    x : Float[Tensor, "batch_size d_sae"],
+    k : Optional[int] = None
 ) -> tuple[
     Float[Tensor, "batch_size a"], 
     Int[Tensor, "batch_size a"]
@@ -39,10 +40,14 @@ def extract_nonzero(
     this is for instance useful at inference time when the tensors are extremely sparse or late in training
     '''
     # Find the max number of non-zero elements in the batch
-    max_non_zero_elms = int((x != 0).sum(dim=-1).max())
-    _, top_indices = x.abs().topk(max_non_zero_elms, sorted=False)
-    top_acts = x.gather(dim=-1, index=top_indices)
-    return top_acts.contiguous(), top_indices.contiguous()
+    if k:
+        top_vals, top_indices = torch.topk(x, k=k, dim=-1)
+        return top_vals.contiguous(), top_indices.contiguous()
+    else:
+        max_non_zero_elms = max(1, int((x != 0).sum(dim=-1).max()))
+        _, top_indices = x.abs().topk(max_non_zero_elms, sorted=False)
+        top_acts = x.gather(dim=-1, index=top_indices)
+        return top_acts.contiguous(), top_indices.contiguous()
 
 
 
