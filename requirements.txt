@@ -4,13 +4,8 @@ jaxtyping
 pytest
 beartype
 tqdm
-pydantic
 Pillow
 requests
-openai
-anthropic
-litellm
-instructor
 pandas
 matplotlib
 pyarrow
