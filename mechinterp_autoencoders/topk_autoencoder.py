@@ -16,7 +16,6 @@ if torch.cuda.is_available():
 class TopKAutoEncoderConfig(AutoEncoderBaseConfig):
     k: int
     k_aux: int     
-    use_kernel : bool #use triton kernels
 
 #based on https://cdn.openai.com/papers/sparse-autoencoders.pdf
 class TopKActivationFn(nn.Module):

@@ -1,6 +1,6 @@
 import sys
 import os
-from typing import Any, Optional, cast
+from typing import Any, List, Literal, Optional, cast
 import itertools
 import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -50,7 +50,6 @@ def benchmark(func=None, *, n_runs=2, with_memory=True):
                     #warmup first round doesnt count
                     total_time += elapsed_time
                     results.append(result)
-
                 torch.cuda.empty_cache()
 
             avg_time = total_time / n_runs
@@ -120,57 +119,68 @@ def benchmark_nonzero(dim_range, dict_mult=64, num_runs=10):
 
     return pd.DataFrame(results)
 
-@benchmark(with_memory=True)
-def benchmark_model(model: BaseAutoEncoder, x: torch.Tensor):
-    return model.forward(x, method='reconstruct')
 
 def benchmark_models(
     save_path: str,
     models: list[tuple[type[BaseAutoEncoder], AutoEncoderBaseConfig]],
     interval_dicts: dict[str, list],
-    num_runs: int = 5
+    num_runs: int = 3
 ):
     import torch._dynamo
     torch._dynamo.config.suppress_errors = True
-    results = {
-        'dim': [],
-    }
-    for model_cls, _ in models:
-        results[f'{model_cls.__name__}_time'] = []
-        #results[f'{model_cls.__name__}_memory'] = []
+
+    @benchmark(with_memory=True, n_runs=num_runs)
+    def benchmark_model(
+        model: BaseAutoEncoder, 
+        x: torch.Tensor, 
+        method : Literal['reconstruct', 'with_loss']
+    ):
+        return model.forward(x, method=method)
+
+    all_results = []
 
     for model_cls, config in tqdm.tqdm(models, desc="Models"):
+        model_name = model_cls.__name__
+        data = {}
         for params in tqdm.tqdm(shape_params(interval_dicts), desc="Params", leave=False):
+            
+            #set config NOTE this is bad
             config.dict_mult = params['dict_mult']
             config.d_input = params['dim']
             config.use_kernel = params['use_kernel']
 
             model = model_cls(config).to(get_device())
-            original_class_name = model.__class__.__name__
             model = torch.compile(model) if params['use_torch_compile'] else model
             model = cast(BaseAutoEncoder, model)
 
-            x = generate_sparse_tensor((params['batch_size'], params['dim']), params['sparsity_level'], device=get_device())
+            x = generate_sparse_tensor(
+                (params['batch_size'], params['dim']), 
+                params['sparsity_level'], 
+                device=get_device()
+            )
             
-            _, time, memory = benchmark_model(model, x)
+            _, time, memory = benchmark_model(model, x, method=params['method'])
 
-            results[f'{original_class_name}_time'].append(time)
-            #results[f'{original_class_name}_memory'].append(memory)
-            results['dim'].append(params['dim'])
- 
-    print('results', results)
-    df = pd.DataFrame(results)
+            # Combine all parameters, results, and model info into a single dictionary
+            result = {
+                'model': model_name,
+                'time': time,
+                **params  
+            }
+            all_results.append(result)
+
+    df = pd.DataFrame(all_results)
+    
     os.makedirs(save_path, exist_ok=True)
     df.to_parquet(f"{save_path}/benchmark_results.parquet")
-    print(f"Saving to {save_path}/benchmark_results.parquet")
     return df
 
-def benchmark_decode(dim_range , dict_mult=64, num_runs=5):
+def benchmark_decode(dim_range : List[int] , dict_mult : int = 64, num_runs : int = 5):
     #benchmark decode with backward pass
     @benchmark(with_memory=False, n_runs=num_runs)
     def kernel_decode(x : torch.Tensor, d : int, k : Optional[int] = None, y : Optional[torch.Tensor] = None):
         W_dec = nn.Parameter(torch.randn(dict_mult*d, d, device=get_device()).contiguous())
-        top_vals, top_idx = torch.compile(extract_nonzero)(x, k)
+        top_vals, top_idx = extract_nonzero(x, k)
         out = TritonDecoder.apply(top_idx, top_vals, W_dec.mT)
         if y is not None:
             mse = (out - y).pow(2).mean()
@@ -192,25 +202,29 @@ def benchmark_decode(dim_range , dict_mult=64, num_runs=5):
         'kernel_unknown_k_decode': [],
         'kernel_known_k_decode': [],
     }
-    for d in dim_range:
+    for d in tqdm.tqdm(dim_range, desc="Dimensions"):
+        print(f"Benchmarking dimension {d}")
         x = generate_sparse_tensor((8, d*dict_mult), 0.00001, device=get_device())
         _, base_time = base_decode(x, d)
         _, unknown_k_time = kernel_decode(x, d)
         _, known_k_time = kernel_decode(x, d, k=32)
 
-        results['dim'].append(d)
+        results['dim'].append(d*dict_mult)
         results['base_decode'].append(base_time)
         results['kernel_unknown_k_decode'].append(unknown_k_time)
         results['kernel_known_k_decode'].append(known_k_time)
     
     return pd.DataFrame(results)
 
-def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
+def visualize(
+    df: pd.DataFrame, save_path: Optional[str] = None):
     plt.figure(figsize=(10, 6))
     
     for column in df.columns:
         if column != 'dim':
-            plt.plot(df['dim'][1:], df[column][1:], label=column.capitalize())
+            # Convert boolean values to integers (0 and 1)
+            y_values = df[column][1:].astype(int) if df[column].dtype == bool else df[column][1:]
+            plt.plot(df['dim'][1:], y_values, label=column.capitalize())
     
     plt.xlabel('Dimension')
     plt.ylabel('Time (ms)')
@@ -220,5 +234,6 @@ def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
     if save_path:
         if os.path.exists(save_path):
             os.remove(save_path)
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
     plt.show()

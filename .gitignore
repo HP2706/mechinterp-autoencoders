@@ -7,3 +7,4 @@ main.ipynb
 *.html
 *.parquet
 *.png
+run_benchmark.py

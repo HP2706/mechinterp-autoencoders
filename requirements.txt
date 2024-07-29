@@ -4,6 +4,7 @@ jaxtyping
 pytest
 beartype
 tqdm
+pydantic
 Pillow
 requests
 pandas

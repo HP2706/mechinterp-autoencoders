@@ -36,11 +36,19 @@ def extract_nonzero(
     Int[Tensor, "batch_size a"]
 ]:
     '''
-    takes d_sae dimensional batch and return a tensor that has as many dimensions as the maximum non_zero elements in the batch
-    this is for instance useful at inference time when the tensors are extremely sparse or late in training
+    Args:
+        x: Tensor of shape (batch_size, d_sae)
+        k: Number of non-zero elements to extract
+    Returns:
+        top_vals: Tensor of shape (batch_size, a)
+        top_indices: Tensor of shape (batch_size, a)
+    
+    if k is not none topk is used, else, k=maximum number of non zeros per batch.
+    this massively speeds up inference 
     '''
     # Find the max number of non-zero elements in the batch
     if k:
+        #this is a lot faster when k is know in advance
         top_vals, top_indices = torch.topk(x, k=k, dim=-1)
         return top_vals.contiguous(), top_indices.contiguous()
     else:
