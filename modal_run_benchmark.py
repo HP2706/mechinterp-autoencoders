@@ -3,7 +3,7 @@ from modal import gpu, Mount
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from benchmarks.perf import test
+from benchmarks.run_benchmark import test
 
 @app.function(
     image=image,
@@ -13,10 +13,9 @@ from benchmarks.perf import test
     _allow_background_volume_commits=True
 )
 def benchmark(cleanup: bool = False):  
-    if cleanup:
-        if os.path.exists("/root/modal_benchmark/data"):
-            print("removing /root/modal_benchmark/data")
-            os.system("rm -rf /root/modal_benchmark/data")
+    if cleanup and os.path.exists("/root/modal_benchmark/data"):
+        print("removing /root/modal_benchmark/data")
+        os.system("rm -rf /root/modal_benchmark/data")
 
     os.makedirs("/root/modal_benchmark/data", exist_ok=True)
     test()

@@ -25,7 +25,7 @@ class AutoEncoderBaseConfig(BaseModel):
     dtype: torch.dtype = torch.float32
     device: torch.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     tie_w_dec: bool = True #whether to tie encoder decoder weights at initialization
-    use_top_k: bool = True #uses top k eager decoding
+    use_kernel: bool = True #uses top k eager decoding
     use_pre_enc_bias: bool = True #uses a pre-bias for the encoder
     class Config:
         arbitrary_types_allowed = True
@@ -246,7 +246,7 @@ class BaseAutoEncoder(AbstractAutoEncoder):
         Decode method assumes self.W_dec and self.pre_bias are defined
         '''
         with self._prepare_params(acts, feature_indices):
-            if self.cfg.use_top_k:
+            if self.cfg.use_kernel:
                 non_zero_values, non_zero_indices = extract_nonzero(acts)
                 if torch.cuda.is_available():
                     decoded = self.kernel_decode(non_zero_indices, non_zero_values) 

@@ -47,7 +47,7 @@ _JumpReLUConfig = JumpReLUAutoEncoderConfig(
     ]
 )
 def test_forward_backward(model, method):
-    if model.cfg.use_top_k:
+    if model.cfg.use_kernel:
         #we enfore sparsity by setting 90% of the values to zero
         x = torch.zeros(10, 10, device=get_device())
         indices = torch.randint(0, 10, (2,), device=get_device())

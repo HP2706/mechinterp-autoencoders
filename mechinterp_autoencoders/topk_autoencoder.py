@@ -3,7 +3,7 @@ from contextlib import contextmanager
 import torch.nn as nn
 from torch import Tensor
 from torch.optim import Optimizer
-from typing import Callable, Optional, Union, Literal
+from typing import Callable, Optional, Union, Literal, overload
 from tqdm import tqdm
 from jaxtyping import Float, Int, jaxtyped
 from beartype import beartype
@@ -113,6 +113,37 @@ class TopKAutoEncoder(BaseAutoEncoder):
                 #same thing just in pytorch
                 return self.eager_decode(non_zero_indices, top_k_acts) + self.pre_bias
 
+
+    @overload
+    def forward(
+        self,
+        x: Tensor,
+        method: Literal['with_acts'],
+        ema_frequency_counter: None = None,
+        feature_indices: Optional[slice] = None
+    ) -> Tensor:
+        ...
+
+    @overload
+    def forward(
+        self,
+        x: Tensor,
+        method: Literal['with_loss'],
+        ema_frequency_counter: Tensor,
+        feature_indices: Optional[slice] = None
+    ) -> dict:
+        ...
+
+    @overload
+    def forward(
+        self,
+        x: Tensor,
+        method: Literal['reconstruct'],
+        ema_frequency_counter: None = None,
+        feature_indices: Optional[slice] = None
+    ) -> Tensor:
+        ...
+
     def forward(
         self, 
         x: Tensor, 
@@ -127,7 +158,9 @@ class TopKAutoEncoder(BaseAutoEncoder):
         x_reconstruct = self.decode(acts, non_zero_indices, feature_indices)
 
         if method == 'with_loss':
+            assert ema_frequency_counter is not None, "ema_frequency_counter must be provided for with_loss method"
             assert ema_frequency_counter.device == x.device, f"ema_frequency_counter device {ema_frequency_counter.device} != x device {x.device}"
+
             l2_loss = normalized_mse(x_reconstruct, x)
             aux_acts, indices = self.activation.forward_aux(acts, ema_frequency_counter)
             e = x - x_reconstruct

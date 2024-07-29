@@ -12,5 +12,5 @@ anthropic
 litellm
 instructor
 pandas
-plotly
+matplotlib
 pyarrow

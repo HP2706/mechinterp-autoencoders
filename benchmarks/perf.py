@@ -1,12 +1,8 @@
 import sys
 import os
-import random
-from typing import Any, Callable, Optional, cast
-from pytest import Function
+from typing import Any, Optional, cast
 import itertools
-from regex import F
 import tqdm
-from sae import Sae, SaeConfig
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
@@ -21,7 +17,8 @@ from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEn
 from mechinterp_autoencoders.utils import generate_sparse_tensor, get_device, extract_nonzero
 from functools import wraps
 import matplotlib.pyplot as plt
-from mechinterp_autoencoders.kernels import TritonDecoder
+if torch.cuda.is_available():
+    from mechinterp_autoencoders.kernels import TritonDecoder
 
 def shape_params(params: dict[str, list]) -> list[dict[str, Any]]:
     all_params = []
@@ -146,7 +143,7 @@ def benchmark_models(
         for params in tqdm.tqdm(shape_params(interval_dicts), desc="Params", leave=False):
             config.dict_mult = params['dict_mult']
             config.d_input = params['dim']
-            config.use_top_k = params['use_top_k']
+            config.use_kernel = params['use_kernel']
 
             model = model_cls(config).to(get_device())
             original_class_name = model.__class__.__name__
@@ -192,7 +189,8 @@ def benchmark_decode(dim_range , dict_mult=64, num_runs=5):
     results = {
         'dim': [],
         'base_decode': [],
-        'kernel_decode': []
+        'kernel_unknown_k_decode': [],
+        'kernel_known_k_decode': [],
     }
     for d in dim_range:
         x = generate_sparse_tensor((8, d*dict_mult), 0.00001, device=get_device())
@@ -206,7 +204,6 @@ def benchmark_decode(dim_range , dict_mult=64, num_runs=5):
         results['kernel_known_k_decode'].append(known_k_time)
     
     return pd.DataFrame(results)
-
 
 def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
     plt.figure(figsize=(10, 6))
@@ -225,30 +222,3 @@ def visualize(df: pd.DataFrame, save_path: Optional[str] = None):
             os.remove(save_path)
         plt.savefig(save_path)
     plt.show()
-    
-def test():
-
-
-    df = benchmark_decode([256, 512, 1024, 2048])
-    visualize(df, 'benchmarks/data/decode.png')
-
-    interval_dicts = {
-        'dim': [32, 64, 128],
-        'dict_mult': [2],
-        'sparsity_level': [0.0001],
-        'batch_size': [8],
-        'use_top_k': [True],
-        'use_torch_compile': [True]
-    }
-
-    df = benchmark_models(
-        save_path='benchmarks/data',
-        models=[
-            (AutoEncoder, AutoEncoderConfig(dict_mult=16, d_input=768, l1_coeff=0.0001))
-        ],
-        interval_dicts=interval_dicts
-    )
-    visualize(df, 'benchmarks/data/autoencoder.png')
-
-if __name__ == '__main__':
-    test()
