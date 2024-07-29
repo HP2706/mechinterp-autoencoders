@@ -62,11 +62,11 @@ class AutoEncoder(BaseAutoEncoder):
                     "acts_sum": acts.sum(1).mean(),
                     "l2_loss": l2_loss, 
                     "l_sparsity": L_sparse,
-                    "l1_loss": mean_absolute_error(x_reconstruct, x),
-                    "normalized_l1_loss": normalized_L1_loss(acts, x),
-                    "l0_norm": l0_norm(acts),
-                    "did_fire": did_fire(acts),
-                    "avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
+                    #"l1_loss": mean_absolute_error(x_reconstruct, x),
+                    #"normalized_l1_loss": normalized_L1_loss(acts, x),
+                    #"l0_norm": l0_norm(acts),
+                    #"did_fire": did_fire(acts),
+                    #"avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
                 }
             elif method == 'reconstruct':
                 return x_reconstruct

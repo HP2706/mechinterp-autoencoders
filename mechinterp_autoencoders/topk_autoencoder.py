@@ -103,7 +103,7 @@ class TopKAutoEncoder(BaseAutoEncoder):
     )-> Float[Tensor, "batch d_in"]:        
         with self._prepare_params(acts, feature_indices):
             top_k_acts = acts.gather(1, non_zero_indices).reshape(non_zero_indices.shape[0], -1)
-            if self.cfg.use_kernel and torch.cuda.is_available():
+            if torch.cuda.is_available():
                 return self.kernel_decode(
                     non_zero_indices.contiguous(), 
                     top_k_acts
@@ -175,13 +175,13 @@ class TopKAutoEncoder(BaseAutoEncoder):
                 "loss": loss, 
                 "x_reconstruct": x_reconstruct, 
                 "acts": acts, 
-                "acts_sum": acts.sum(1).mean(),
+                #"acts_sum": acts.sum(1).mean(),
                 "l2_loss": l2_loss, 
-                "l1_loss": mean_absolute_error(x_reconstruct, x),
-                "normalized_l1_loss": normalized_L1_loss(acts, x),
-                "l0_norm": l0_norm(acts),
-                "did_fire": did_fire(acts),
-                "avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
+                #"l1_loss": mean_absolute_error(x_reconstruct, x),
+                #"normalized_l1_loss": normalized_L1_loss(acts, x),
+                #"l0_norm": l0_norm(acts),
+                #"did_fire": did_fire(acts),
+                #"avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
             }
             
         elif method == 'reconstruct':

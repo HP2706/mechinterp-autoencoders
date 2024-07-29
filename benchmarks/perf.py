@@ -4,7 +4,7 @@ from typing import Any, List, Literal, Optional, cast
 import itertools
 import tqdm
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+import plotly.express as px
 import numpy as np
 import torch
 import torch.nn as nn
@@ -16,7 +16,8 @@ from mechinterp_autoencoders.jump_relu import JumpReLUAutoEncoder, JumpReLUAutoE
 from mechinterp_autoencoders.topk_autoencoder import TopKAutoEncoder, TopKAutoEncoderConfig
 from mechinterp_autoencoders.utils import generate_sparse_tensor, get_device, extract_nonzero
 from functools import wraps
-import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 if torch.cuda.is_available():
     from mechinterp_autoencoders.kernels import TritonDecoder
 
@@ -91,7 +92,12 @@ def extract_nonzero_3(x):
 def fixed_extract_nonzero(x):
     return torch.topk(x, 64, dim=1, sorted=False)
 
-def benchmark_nonzero(dim_range, dict_mult=64, num_runs=10):
+def benchmark_nonzero(
+    dim_range : List[int], 
+    dict_mult : int = 64, 
+    num_runs : int = 10,
+    save_path: Optional[str] = None
+):
     results = {
         'dim': [],
         'extract_nonzero_1': [],
@@ -117,65 +123,16 @@ def benchmark_nonzero(dim_range, dict_mult=64, num_runs=10):
         for k, v in times.items():
             results[k].append(np.mean(v))
 
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+    fig = visualize(df, save_to=f'{save_path}/benchmark_nonzero_results.png')
+    return df, fig
 
-
-def benchmark_models(
-    save_path: str,
-    models: list[tuple[type[BaseAutoEncoder], AutoEncoderBaseConfig]],
-    interval_dicts: dict[str, list],
-    num_runs: int = 3
+def benchmark_decode(
+    dim_range : List[int] , 
+    dict_mult : int = 64, 
+    num_runs : int = 5,
+    save_path: Optional[str] = None
 ):
-    import torch._dynamo
-    torch._dynamo.config.suppress_errors = True
-
-    @benchmark(with_memory=True, n_runs=num_runs)
-    def benchmark_model(
-        model: BaseAutoEncoder, 
-        x: torch.Tensor, 
-        method : Literal['reconstruct', 'with_loss']
-    ):
-        return model.forward(x, method=method)
-
-    all_results = []
-
-    for model_cls, config in tqdm.tqdm(models, desc="Models"):
-        model_name = model_cls.__name__
-        data = {}
-        for params in tqdm.tqdm(shape_params(interval_dicts), desc="Params", leave=False):
-            
-            #set config NOTE this is bad
-            config.dict_mult = params['dict_mult']
-            config.d_input = params['dim']
-            config.use_kernel = params['use_kernel']
-
-            model = model_cls(config).to(get_device())
-            model = torch.compile(model) if params['use_torch_compile'] else model
-            model = cast(BaseAutoEncoder, model)
-
-            x = generate_sparse_tensor(
-                (params['batch_size'], params['dim']), 
-                params['sparsity_level'], 
-                device=get_device()
-            )
-            
-            _, time, memory = benchmark_model(model, x, method=params['method'])
-
-            # Combine all parameters, results, and model info into a single dictionary
-            result = {
-                'model': model_name,
-                'time': time,
-                **params  
-            }
-            all_results.append(result)
-
-    df = pd.DataFrame(all_results)
-    
-    os.makedirs(save_path, exist_ok=True)
-    df.to_parquet(f"{save_path}/benchmark_results.parquet")
-    return df
-
-def benchmark_decode(dim_range : List[int] , dict_mult : int = 64, num_runs : int = 5):
     #benchmark decode with backward pass
     @benchmark(with_memory=False, n_runs=num_runs)
     def kernel_decode(x : torch.Tensor, d : int, k : Optional[int] = None, y : Optional[torch.Tensor] = None):
@@ -214,26 +171,117 @@ def benchmark_decode(dim_range : List[int] , dict_mult : int = 64, num_runs : in
         results['kernel_unknown_k_decode'].append(unknown_k_time)
         results['kernel_known_k_decode'].append(known_k_time)
     
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+    fig = visualize(df, save_to=f'{save_path}/benchmark_decode_results.png')
+    return df, fig
+
+def benchmark_models(
+    models: list[tuple[type[BaseAutoEncoder], AutoEncoderBaseConfig]],
+    interval_dicts: dict[str, list],
+    num_runs: int = 3,
+    save_path: Optional[str] = None,
+):
+    import torch._dynamo
+    torch._dynamo.config.suppress_errors = True
+
+    @benchmark(with_memory=True, n_runs=num_runs)
+    def benchmark_model(
+        model: BaseAutoEncoder, 
+        model_kwargs: dict
+    ):
+        return model.forward(**model_kwargs)
+
+    all_results = []
+
+    for model_cls, config in tqdm.tqdm(models, desc="Models"):
+        model_name = model_cls.__name__
+        data = {}
+        for params in tqdm.tqdm(shape_params(interval_dicts), desc="Params", leave=False):
+            
+            #set config NOTE this is bad
+            config.dict_mult = params['dict_mult']
+            config.d_input = params['dim']
+            if model_name != TopKAutoEncoder.__class__.__name__:
+                #topk uses kernel by default
+                config.use_kernel = params['use_kernel']
+
+            model = model_cls(config).to(get_device())
+            model = torch.compile(model) if params['use_torch_compile'] else model
+            model = cast(BaseAutoEncoder, model)
+
+            x = generate_sparse_tensor(
+                (params['batch_size'], params['dim']), 
+                params['sparsity_level'], 
+                device=get_device()
+            )
+
+            kwargs = {
+                'x': x,
+                'method': params['method']
+            }
+
+            if params['method'] == 'with_loss' and model_name == 'TopKAutoEncoder':
+
+                ema_frequency_counter = torch.randn(params['dim'], device=get_device())
+                kwargs['ema_frequency_counter'] = ema_frequency_counter
+            
+            _, time, memory = benchmark_model(model, model_kwargs=kwargs)
+
+            # Combine all parameters, results, and model info into a single dictionary
+            result = {
+                'model': model_name,
+                'time': time,
+                **params  
+            }
+            all_results.append(result)
+
+    df = pd.DataFrame(all_results)
+    grouping_cols = [key for key in df.keys() if key not in ['dim', 'time']]
+
+    #df[f'log_{x_axis}'] = df[x_axis].apply(np.log)
+    df[f'log_dim'] = df['dim'].apply(np.log)
+    fig = px.line(df, x='dim', y='time',
+            color='model', 
+            line_dash='dict_mult',
+            facet_col='sparsity_level', facet_row='batch_size',
+            hover_data=grouping_cols,
+            title=f'title')
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.write_image(f'{save_path}/benchmark_models_results.png')
+        df.to_parquet(f"{save_path}/benchmark_results.parquet")
+    return df, fig
 
 def visualize(
-    df: pd.DataFrame, save_path: Optional[str] = None):
-    plt.figure(figsize=(10, 6))
+    df: pd.DataFrame, 
+    save_to: Optional[str] = None
+):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
     
     for column in df.columns:
         if column != 'dim':
-            # Convert boolean values to integers (0 and 1)
-            y_values = df[column][1:].astype(int) if df[column].dtype == bool else df[column][1:]
-            plt.plot(df['dim'][1:], y_values, label=column.capitalize())
+            y_values = df[column][1:]
+            fig.add_trace(
+                go.Line(x=df['dim'][1:], y=y_values, name=column.capitalize(), mode='lines'),
+                secondary_y=False,
+            )
     
-    plt.xlabel('Dimension')
-    plt.ylabel('Time (ms)')
-    plt.title('Performance Comparison get nonzero')
-    plt.legend()
-    plt.grid(True)
-    if save_path:
-        if os.path.exists(save_path):
-            os.remove(save_path)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path)
-    plt.show()
+    fig.update_layout(
+        title='Performance Comparison get nonzero',
+        xaxis_title='Dimension',
+        yaxis_title='Time (ms)',
+        legend_title='Methods',
+        hovermode="x unified"
+    )
+    
+    fig.update_xaxes(type="log")
+    fig.update_yaxes(type="log")
+    
+    if save_to:
+        if os.path.exists(save_to):
+            os.remove(save_to)
+        os.makedirs(os.path.dirname(save_to), exist_ok=True)
+        fig.write_image(save_to)
+    
+    fig.show()

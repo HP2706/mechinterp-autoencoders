@@ -98,7 +98,7 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
         if method == 'with_acts':
             return acts
 
-        x_reconstruct = self.decode(acts)
+        x_reconstruct = self.decode(acts, feature_indices)
 
         if method == 'with_loss':
             reconstruction_error = x - x_reconstruct
@@ -116,7 +116,7 @@ class JumpReLUAutoEncoder(BaseAutoEncoder):
                 "x_reconstruct": x_reconstruct, 
                 "sparsity_loss": sparsity_loss,
                 "reconstruction_loss": reconstruction_loss,
-                "avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
+                #"avg_num_firing_per_neuron": avg_num_firing_per_neuron(acts)
             }
             
         elif method == 'reconstruct':

@@ -2,11 +2,13 @@ torch
 numpy
 jaxtyping
 pytest
+modal
 beartype
 tqdm
 pydantic
 Pillow
 requests
+kaleido
 pandas
 matplotlib
 pyarrow
